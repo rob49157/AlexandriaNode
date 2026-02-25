@@ -34,7 +34,7 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 ### Complete Upload Flow
 ```
 === BACKEND (file processing + storage) ===
-1. Frontend sends PDF + metadata to backend
+1. Frontend sends PDF + metadata + wallet address to backend
 2. Backend runs Layer 1 validation: file size, type, magic bytes, parseability
 3. Backend runs Layer 2 validation: ClamAV virus scan, embedded JS/attachment detection (in-process)
 4. Backend runs Layer 3 validation: SHA-256 dedup, SimHash near-dedup (in-process)
@@ -46,7 +46,7 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 9. Backend uploads encrypted PDF to Arweave via Irys → gets arweaveHash
 10. Backend encrypts symmetric key with Lit Protocol, setting access condition:
     → Lit checks Rent.sol.isRentalActive(arweaveHash, userAddress)
-11. Backend stores metadata in MongoDB (status: "pending_stake")
+11. Backend stores metadata + uploader wallet address in MongoDB (status: "pending_stake")
 12. Backend discards symmetric key and unencrypted PDF from memory
 13. Backend returns { arweaveHash, litEncryptedKeyId } to frontend
 
@@ -227,7 +227,7 @@ AlexNode/
 │   └── Event.model.js          # MongoDB schema for synced blockchain events
 │
 ├── middleware/
-│   ├── auth.middleware.js       # Wallet signature verification
+│   ├── auth.middleware.js       # Wallet address validation (format check, not signature verification)
 │   ├── upload.middleware.js     # Multer config, file size/type validation
 │   └── error.middleware.js     # Global error handler
 │
@@ -276,9 +276,9 @@ MAX_FILE_SIZE_MB=50
 ### Upload
 ```
 POST /api/upload
-  - Body: multipart/form-data (PDF file + metadata)
-  - Auth: Wallet signature
-  - Flow: validate → encrypt → store on Arweave → index in MongoDB
+  - Body: multipart/form-data (PDF file + metadata + walletAddress)
+  - Auth: None (wallet address included as metadata, real proof of ownership is on-chain staking)
+  - Flow: validate → encrypt → store on Arweave → index in MongoDB (status: pending_stake)
   - Returns: { arweaveHash, litEncryptedKeyId }
   - Frontend then handles on-chain staking and registration with returned arweaveHash
 
@@ -486,7 +486,7 @@ await litClient.saveEncryptionKey({
 - No unencrypted PDFs written to disk at any point
 - Backend has no Ethereum wallet — it never signs on-chain transactions (staking, registration, rentals)
 - Backend does have an Irys wallet key (`IRYS_WALLET_KEY`) solely for paying Arweave storage fees
-- All user-facing endpoints verify wallet signatures
+- Upload requests include wallet address as metadata (not cryptographic auth — on-chain staking is the real proof of ownership)
 - File uploads validated for size, type, and content before processing
 
 ### Irys Wallet Funding Model
