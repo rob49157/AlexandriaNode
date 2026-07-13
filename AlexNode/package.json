@@ -1,0 +1,25 @@
+{
+  "name": "alexnode",
+  "version": "1.0.0",
+  "description": "backend for alexandria project",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "keywords": [],
+  "dependencies": {
+    "arweave": "^1.15.7",
+    "@prisma/client": "^5.12.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "prisma": "^5.12.1"
+  }
+}
