@@ -13,7 +13,7 @@ The backend is the orchestration layer — it sits between the frontend, AI vali
 - **Backend Gateway (THIS REPO):** Node.js + Express (upload orchestration, Lit Protocol encryption, Arweave indexing)
 - **AI Validation:** Python + FastAPI (OCR/text extraction, content quality analysis, NLP-based checks) — separate service
 - **Blockchain:** Base Testnet / Solidity (handles $ALEX token, archivist staking, time-bound rental permissions) — `AlexandriaSmartContract` repo
-- **Storage:** Arweave via Irys (permanent encrypted file storage) + MongoDB (off-chain search indexing)
+- **Storage:** Arweave via Irys (permanent encrypted file storage) + Postgres (off-chain search indexing)
 
 ### Backend Responsibilities
 This service handles:
@@ -22,8 +22,8 @@ This service handles:
 - **Deduplication:** SHA-256 exact duplicate detection and SimHash near-duplicate fingerprinting (all in-process)
 - **Lit Protocol Encryption:** Encrypt symmetric keys with on-chain access conditions tied to Rent.sol
 - **Arweave/Irys Storage:** Upload encrypted PDFs to permanent storage, manage transaction IDs
-- **MongoDB Indexing:** Maintain searchable off-chain index of all uploads (title, author, category, arweaveHash, status)
-- **Event Listening:** Monitor on-chain events (uploads, rentals, challenges) and sync to MongoDB (read-only, no writes)
+- **Postgres Indexing:** Maintain searchable off-chain index of all uploads (title, author, category, arweaveHash, status)
+- **Event Listening:** Monitor on-chain events (uploads, rentals, challenges) and sync to Postgres (read-only, no writes)
 
 **Critical:** The backend NEVER stores unencrypted PDFs or raw symmetric keys long-term. It generates keys, encrypts, delegates to Lit/Arweave, then discards sensitive material.
 
@@ -46,7 +46,7 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 9. Backend uploads encrypted PDF to Arweave via Irys → gets arweaveHash
 10. Backend encrypts symmetric key with Lit Protocol, setting access condition:
     → Lit checks Rent.sol.isRentalActive(arweaveHash, userAddress)
-11. Backend stores metadata + uploader wallet address in MongoDB (status: "pending_stake")
+11. Backend stores metadata + uploader wallet address in Postgres (status: "pending_stake")
 12. Backend discards symmetric key and unencrypted PDF from memory
 13. Backend returns { arweaveHash, litEncryptedKeyId } to frontend
 
@@ -54,7 +54,7 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 14. Frontend calls token.approve(stakeContractAddress, stakeAmount)
 15. Frontend calls stake.stakeForUpload(arweaveHash, stakeAmount)
 16. Frontend calls library.registerUpload(arweaveHash, metadata)
-17. Backend event listener picks up on-chain events → updates MongoDB status to "pending"
+17. Backend event listener picks up on-chain events → updates Postgres status to "pending"
 ```
 
 ### Why This Split?
@@ -92,7 +92,7 @@ rent.isRentalActive(arweaveHash, renterAddress)
 
 ### Smart Contract Events the Backend Listens To
 ```
-// Sync these to MongoDB for frontend queries
+// Sync these to Postgres for frontend queries
 UploadRegistered(arweaveHash, uploader, timestamp)
 UploadStatusChanged(arweaveHash, newStatus)
 StakeDeposited(arweaveHash, staker, amount)
@@ -150,7 +150,8 @@ arweave                  — Arweave transaction queries
 @lit-protocol/constants        — Lit Protocol chain/network constants
 
 # Database
-mongoose                 — MongoDB ODM
+prisma                   — ORM + migrations (dev dependency: prisma, runtime: @prisma/client)
+@prisma/client           — Generated Prisma client for Postgres queries
 
 # File Processing & Validation
 multer                   — File upload handling (multipart/form-data)
@@ -197,7 +198,7 @@ AlexNode/
 ├── .env.example                # Template for required environment variables
 │
 ├── config/
-│   ├── db.js                   # MongoDB connection setup
+│   ├── db.js                   # Prisma client singleton (Postgres connection)
 │   ├── blockchain.js           # Ethers.js provider + read-only contract instances (no signer)
 │   ├── irys.js                 # Irys client configuration
 │   └── lit.js                  # Lit Protocol client setup
@@ -210,7 +211,7 @@ AlexNode/
 │
 ├── controllers/
 │   ├── upload.controller.js    # Upload orchestration logic
-│   ├── search.controller.js    # MongoDB search queries
+│   ├── search.controller.js    # Postgres search queries
 │   ├── rental.controller.js    # Rental status queries
 │   └── stake.controller.js     # Stake status queries
 │
@@ -220,11 +221,11 @@ AlexNode/
 │   ├── lit.service.js          # Lit Protocol key encryption with access conditions
 │   ├── blockchain.service.js   # Read-only smart contract queries (status checks)
 │   ├── validation.service.js   # ClamAV scanning, SHA-256/SimHash dedup, calls AI service for content analysis
-│   └── eventListener.service.js # Listens to on-chain events, syncs MongoDB
+│   └── eventListener.service.js # Listens to on-chain events, syncs to Postgres via Prisma
 │
-├── models/
-│   ├── Upload.model.js         # MongoDB schema for upload metadata
-│   └── Event.model.js          # MongoDB schema for synced blockchain events
+├── prisma/
+│   ├── schema.prisma           # Prisma models: Upload, Event (source of truth for DB shape)
+│   └── migrations/             # Generated SQL migrations
 │
 ├── middleware/
 │   ├── auth.middleware.js       # Wallet address validation (format check, not signature verification)
@@ -246,8 +247,8 @@ AlexNode/
 PORT=3001
 NODE_ENV=development
 
-# MongoDB
-MONGODB_URI=mongodb://localhost:27017/alexandria
+# Database (Postgres via Prisma — Neon in this project)
+DATABASE_URL=postgresql://user:password@host/alexandria
 
 # Blockchain (Base Testnet / Sepolia) — read-only, for event listening and status queries
 BASE_TESTNET_RPC_URL=https://sepolia.base.org
@@ -278,7 +279,7 @@ MAX_FILE_SIZE_MB=50
 POST /api/upload
   - Body: multipart/form-data (PDF file + metadata + walletAddress)
   - Auth: None (wallet address included as metadata, real proof of ownership is on-chain staking)
-  - Flow: validate → encrypt → store on Arweave → index in MongoDB (status: pending_stake)
+  - Flow: validate → encrypt → store on Arweave → index in Postgres (status: pending_stake)
   - Returns: { arweaveHash, litEncryptedKeyId }
   - Frontend then handles on-chain staking and registration with returned arweaveHash
 
@@ -289,7 +290,7 @@ GET /api/upload/:arweaveHash
 ### Search
 ```
 GET /api/search?q=<query>&category=<cat>&page=<n>
-  - Searches MongoDB index
+  - Searches Postgres index
   - Returns: Paginated list of approved uploads matching query
 ```
 
@@ -352,7 +353,7 @@ Performed in `validation.service.js` using built-in crypto and SimHash:
 Check                         Why                                         Action on Fail
 ─────────────────────────────────────────────────────────────────────────────────────────
 SHA-256 hash                  Exact duplicate detection — reject if       Reject with 409
-                              hash already exists in MongoDB
+                              hash already exists in Postgres
 SimHash fingerprint           Near-duplicate detection — flag if          Flag for librarian
                               similarity score > threshold                review
 ```
@@ -453,32 +454,37 @@ PDF arrives at POST /api/upload
 
 ## Encryption Flow (Backend Responsibility)
 
+**Decision:** The backend encrypts using the **Lit SDK's `encryptFile`** (current Lit API), NOT a hand-rolled AES layer. Lit performs envelope encryption internally — it generates the symmetric key, AES-encrypts the file, and ties the key to the threshold network via the access-control conditions. We never hold or discard a raw symmetric key ourselves; we only persist the returned `ciphertext` + `dataToEncryptHash`. Decryption happens in the reader's browser against the Lit network — the backend is never in the decryption path.
+
+> Note: `saveEncryptionKey` / manually returning a `symmetricKey` is the deprecated v1/v2 Lit API. Code against the current `encryptFile` / `decryptToFile` API and verify signatures against Lit's live docs before implementing.
+
 ### At Upload Time
 ```javascript
-// 1. Generate symmetric key
-const symmetricKey = crypto.randomBytes(32);
+// Access control: Lit releases the key only when Rent.sol says the rental is active
+const accessControlConditions = [{
+  contractAddress: RENT_CONTRACT_ADDRESS,
+  standardContractType: "custom",
+  chain: "baseSepolia",
+  method: "isRentalActive",
+  parameters: [arweaveHash, ":userAddress"],
+  returnValueTest: { comparator: "=", value: "true" }
+}];
 
-// 2. Encrypt PDF
-const iv = crypto.randomBytes(12);
-const cipher = crypto.createCipheriv('aes-256-gcm', symmetricKey, iv);
-const encryptedPDF = Buffer.concat([cipher.update(pdfBuffer), cipher.final()]);
-const authTag = cipher.getAuthTag();
+// 1. Encrypt the validated PDF with Lit (envelope AES happens inside the SDK)
+const { ciphertext, dataToEncryptHash } = await litNodeClient.encryptFile({
+  accessControlConditions,
+  file: new Blob([pdfBuffer]),
+});
+// NOTE: accessControlConditions reference arweaveHash, so if Lit requires the
+// hash up front you may need to derive/reserve the Arweave txid before encrypting,
+// or bind the condition to a placeholder and finalize on upload — confirm ordering
+// against the Irys/Lit APIs during implementation.
 
-// 3. Upload encrypted PDF + iv + authTag to Arweave via Irys
+// 2. Upload ciphertext + dataToEncryptHash to Arweave via Irys → arweaveHash
 const arweaveHash = await irys.upload(encryptedPayload);
 
-// 4. Encrypt symmetric key with Lit Protocol
-await litClient.saveEncryptionKey({
-  accessControlConditions: [{
-    contractAddress: RENT_CONTRACT_ADDRESS,
-    method: "isRentalActive",
-    parameters: [arweaveHash, ":userAddress"],
-    returnValueTest: { comparator: "=", value: "true" }
-  }],
-  symmetricKey: symmetricKey
-});
-
-// 5. DISCARD symmetricKey from memory — never store it
+// 3. Persist arweaveHash + dataToEncryptHash (litEncryptedKeyId) in Postgres
+//    No raw symmetric key is ever held by the backend — nothing to discard.
 ```
 
 ### Security Rules
@@ -496,53 +502,58 @@ await litClient.saveEncryptionKey({
 - The treasury wallet stays offline and never touches the backend server
 - Monitor Irys wallet balance and alert when it needs a top-up
 
-## MongoDB Schemas
+## Prisma Schema (Postgres)
 
-### Upload Document
-```javascript
-{
-  arweaveHash: String,          // Primary identifier, indexed
-  title: String,                // Searchable, text-indexed
-  author: String,               // Searchable, text-indexed
-  category: String,             // Filterable
-  description: String,          // Searchable
-  uploader: String,             // Wallet address
-  uploadTimestamp: Date,
-  status: String,               // "pending" | "challenged" | "approved" | "rejected"
-  fileSize: Number,             // Bytes
-  sha256Hash: String,           // For duplicate detection reference
-  simHash: String,              // For near-duplicate detection reference
-  litEncryptedKeyId: String,    // Reference to Lit Protocol encrypted key
-  onChainTxHash: String         // Transaction hash of on-chain registration
+The source of truth is `prisma/schema.prisma`. Run `npx prisma migrate dev` after editing.
+
+### Upload model
+```prisma
+model Upload {
+  arweaveHash       String   @id // Primary key (original identifier)
+  title             String
+  author            String
+  category          String
+  description       String
+  uploader          String   // Wallet address
+  uploadTimestamp   DateTime @default(now())
+  status            String   // "pending" | "challenged" | "approved" | "rejected"
+  fileSize          Int      // Bytes
+  sha256Hash        String   @unique // Exact duplicate detection
+  simHash           String   // Near-duplicate detection reference
+  litEncryptedKeyId String   // Reference to Lit Protocol encrypted key
+  onChainTxHash     String?  // On-chain registration tx hash (optional initially)
+
+  @@index([title, author]) // Search queries
 }
 ```
 
-### Synced Event Document
-```javascript
-{
-  eventName: String,            // e.g., "BookRented", "StakeDeposited"
-  arweaveHash: String,
-  args: Object,                 // Event arguments
-  blockNumber: Number,
-  transactionHash: String,
-  timestamp: Date
+### Event model (synced blockchain events)
+```prisma
+model Event {
+  id              Int      @id @default(autoincrement())
+  eventName       String   // e.g., "BookRented", "StakeDeposited"
+  arweaveHash     String
+  args            Json     // Event arguments as JSON
+  blockNumber     Int
+  transactionHash String
+  timestamp       DateTime
 }
 ```
 
 ## Testing Approach
 
-- **Unit tests:** Test encryption service, validation calls, and MongoDB operations in isolation
+- **Unit tests:** Test encryption service, validation calls, and Postgres operations in isolation
 - **Integration tests:** Test full upload flow with mocked external services (Arweave, Lit)
-- **Event listener tests:** Test that on-chain event syncing correctly updates MongoDB
+- **Event listener tests:** Test that on-chain event syncing correctly updates Postgres
 - **Never test with real funds or mainnet contracts**
 
 ## Critical Design Constraints
 
 ### What the Backend Does
-- Orchestrates the upload pipeline (validate → encrypt → store on Arweave → index in MongoDB)
+- Orchestrates the upload pipeline (validate → encrypt → store on Arweave → index in Postgres)
 - Returns arweaveHash to frontend for on-chain staking/registration
 - Provides search/query API for the frontend
-- Listens to on-chain events (read-only) and syncs state to MongoDB
+- Listens to on-chain events (read-only) and syncs state to Postgres
 - Generates and encrypts symmetric keys (then discards them)
 
 ### What the Backend Does NOT Do
@@ -571,7 +582,7 @@ The current architecture is **intentionally centralized for the PoC**. The backe
 ### What's Centralized (PoC)
 - **Upload pipeline:** Single backend server validates, encrypts, and uploads to Arweave
 - **Storage funding:** Single Irys wallet funded by project treasury pays for all Arweave uploads
-- **Search index:** MongoDB on the backend server — if the server goes down, search is unavailable (though all data still exists on Arweave and on-chain)
+- **Search index:** Postgres on the backend server — if the server goes down, search is unavailable (though all data still exists on Arweave and on-chain)
 - **Validation:** Backend decides what passes validation — single authority on content quality
 
 ### Phase 1: Archivist-Funded Storage
@@ -582,11 +593,11 @@ Move Arweave storage costs from the project to the archivists themselves:
 - Archivists pay for storage as part of their upload cost (alongside staking)
 
 ### Phase 2: Decentralized Indexing
-Replace the centralized MongoDB index:
+Replace the centralized Postgres index:
 - Use **The Graph** to index on-chain events (uploads, rentals, challenges) into a decentralized subgraph
 - Frontend queries the subgraph directly instead of the backend's `/api/search` endpoint
 - On-chain metadata (title, author, category) stored in smart contract events, indexed by The Graph
-- MongoDB becomes optional (local cache for performance, not the source of truth)
+- Postgres becomes optional (local cache for performance, not the source of truth)
 
 ### Phase 3: Distributed Validation
 Remove the single-server validation bottleneck:
