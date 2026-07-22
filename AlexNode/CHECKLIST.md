@@ -38,14 +38,14 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 - [x] **Test:** POST reaches controller (202); no-file → 400; oversized → 413; GET stub → 501; unknown route → 404
 
 ## Phase 2 — Layer 1 + Layer 5 validation *(no external services)*
-- [ ] `services/validation.service.js` scaffold + standard reject shape `{ valid, stage, reason, message }`
-- [ ] Layer 1: file size, extension `.pdf`, MIME type
-- [ ] Layer 1: magic bytes `%PDF-` via `file-type`
-- [ ] Layer 1: parseability + page count > 0 via `pdf-parse`
-- [ ] Layer 5: metadata required-field checks (title, author, category from allowlist, description length)
-- [ ] Layer 5: sanitize all text fields via `sanitize-html`
-- [ ] `middleware/auth.middleware.js` — wallet address format check (not signature)
-- [ ] **Test:** valid PDF passes; renamed exe, empty PDF, missing metadata all rejected with correct stage/reason
+- [x] `services/validation.service.js` scaffold + standard reject shape `{ valid, stage, reason, message }` (+ internal `httpStatus`)
+- [x] Layer 1: file size, extension `.pdf`, MIME type
+- [x] Layer 1: magic bytes via `file-type` (v21, ESM — loaded via dynamic `import()`)
+- [x] Layer 1: parseability + page count > 0 via `pdf-parse` (v2 `PDFParse` class; also catches encrypted PDFs early)
+- [x] Layer 5: metadata required-field checks (title, author, category from allowlist, description length)
+- [x] Layer 5: sanitize all text fields via `sanitize-html` (strip HTML + control chars, collapse whitespace)
+- [x] `middleware/auth.middleware.js` — wallet address format check (runs after multer; normalizes to lowercase)
+- [x] **Test:** 13/13 service cases pass — valid PDF passes; renamed exe/png, corrupted PDF, empty file, wrong ext/mime, missing/bad metadata all rejected with correct stage/reason; wallet + full flow verified via server
 
 ## Phase 3 — Encryption *(pure crypto / Lit SDK)*
 - [ ] Install `@lit-protocol/lit-node-client`, `@lit-protocol/constants`

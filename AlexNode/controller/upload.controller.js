@@ -1,38 +1,42 @@
-const { MAX_FILE_SIZE_MB } = require('../middleware/upload.middleware');
+const { validateUpload } = require('../services/validation.service');
 
 // POST /api/upload
-// Orchestration entry point for the upload pipeline. For Phase 1 this just
-// confirms the file + metadata reached the controller. Real validation (Layers
-// 1-5), encryption, Arweave storage, and Postgres persistence land in later phases.
+// Orchestration entry point for the upload pipeline.
+// Phase 2: runs Layer 1 (file basics) + Layer 5 (metadata) validation.
+// Later phases add encryption (3), dedup (4), and Arweave/Postgres (5).
 async function createUpload(req, res, next) {
   try {
     if (!req.file) {
       return res.status(400).json({
         valid: false,
-        stage: 'file_upload',
+        stage: 'file_basics',
         reason: 'missing_file',
         message: 'No PDF file received. Send it as multipart/form-data under the "file" field.',
       });
     }
 
-    const { title, author, category, description, walletAddress } = req.body;
+    // Layers 1 + 5. Returns the first failing check, or a success object with
+    // sanitized metadata + page count.
+    const result = await validateUpload(req.file, req.body);
+    if (!result.valid) {
+      const { httpStatus = 400, valid, stage, reason, message } = result;
+      return res.status(httpStatus).json({ valid, stage, reason, message });
+    }
 
-    // TODO Phase 2: run validation.service Layer 1 + Layer 5 here.
     // TODO Phase 3: Lit encryptFile.
     // TODO Phase 4: SHA-256 / SimHash dedup.
     // TODO Phase 5: Irys upload + Postgres persist, then return { arweaveHash, litEncryptedKeyId }.
-    const stubValidation = { valid: true, stage: null, reason: null, message: 'stub: validation not yet implemented' };
-
     return res.status(202).json({
+      valid: true,
       received: true,
-      validation: stubValidation,
+      pageCount: result.pageCount,
       file: {
         originalName: req.file.originalname,
         mimeType: req.file.mimetype,
         sizeBytes: req.file.size,
-        maxSizeMb: MAX_FILE_SIZE_MB,
       },
-      metadata: { title, author, category, description, walletAddress },
+      metadata: result.metadata,
+      walletAddress: req.walletAddress,
     });
   } catch (err) {
     return next(err);
