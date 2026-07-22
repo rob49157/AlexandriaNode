@@ -30,12 +30,12 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
   - ⚠️ `.env` (real Neon DB password) is in git history — **rotate that Neon credential**
 
 ## Phase 1 — Upload endpoint skeleton *(no external services)*
-- [ ] `middleware/upload.middleware.js` — multer in-memory storage + size cap (`MAX_FILE_SIZE_MB`)
-- [ ] `routes/upload.routes.js` — define `POST /api/upload`, `GET /api/upload/:arweaveHash`
-- [ ] `controller/upload.controller.js` — orchestration entry point (stub validation result initially)
-- [ ] Mount router in `index.js` under `/api`
-- [ ] `middleware/error.middleware.js` — global error handler
-- [ ] **Test:** POST a file end-to-end, confirm it reaches the controller
+- [x] `middleware/upload.middleware.js` — multer in-memory storage + size cap (`MAX_FILE_SIZE_MB`)
+- [x] `routes/upload.routes.js` — define `POST /api/upload`, `GET /api/upload/:arweaveHash`
+- [x] `controller/upload.controller.js` — orchestration entry point (stub validation result initially)
+- [x] Mount router in `index.js` under `/api`
+- [x] `middleware/error.middleware.js` — global error handler (+ `notFound` 404; translates multer `LIMIT_FILE_SIZE` → 413)
+- [x] **Test:** POST reaches controller (202); no-file → 400; oversized → 413; GET stub → 501; unknown route → 404
 
 ## Phase 2 — Layer 1 + Layer 5 validation *(no external services)*
 - [ ] `services/validation.service.js` scaffold + standard reject shape `{ valid, stage, reason, message }`

@@ -6,6 +6,8 @@ const cors = require('cors');
 const helmet = require('helmet');
 
 const prisma = require('./config/db');
+const uploadRoutes = require('./routes/upload.routes');
+const { notFound, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -24,6 +26,13 @@ app.get('/', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', service: 'alexandria-backend', time: new Date().toISOString() });
 });
+
+// API routes
+app.use('/api', uploadRoutes);
+
+// 404 + global error handler — must be registered last, after all routes.
+app.use(notFound);
+app.use(errorHandler);
 
 // Connect to Postgres, then start the HTTP server
 async function start() {
