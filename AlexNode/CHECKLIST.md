@@ -48,10 +48,12 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 - [x] **Test:** 13/13 service cases pass — valid PDF passes; renamed exe/png, corrupted PDF, empty file, wrong ext/mime, missing/bad metadata all rejected with correct stage/reason; wallet + full flow verified via server
 
 ## Phase 3 — Encryption *(pure crypto / Lit SDK)*
-- [ ] Install `@lit-protocol/lit-node-client`, `@lit-protocol/constants`
-- [ ] `config/lit.js` — Lit node client setup (network from `LIT_NETWORK`)
-- [ ] `controller/litProtocol.js` (or `services/lit.service.js`) — `encryptFile` with `isRentalActive` access condition → returns `{ ciphertext, dataToEncryptHash }`
-- [ ] **Test:** encrypt a sample buffer, confirm ciphertext + hash returned (decryption path tested later with frontend/Rent.sol)
+- [x] Install `@lit-protocol/lit-node-client`, `@lit-protocol/constants` — **pinned to 7.4.0 (Datil line)**; network chosen: `datil-dev`. (Naga is still `8.0.0-alpha`; revisit when frontend integrates.)
+- [x] `config/lit.js` — `LitNodeClientNodeJs` singleton, lazy connect, network from `LIT_NETWORK` (default `datil-dev`)
+- [x] `controller/litProtocol.js` — `encryptPdf` / `encryptForRental` using v7 `client.encrypt({ accessControlConditions, dataToEncrypt })` (no `encryptFile` helper in v7) with `isRentalActive` access condition → returns `{ ciphertext, dataToEncryptHash }`
+- [~] **Test:** code complete + API verified against installed `.d.ts`; modules load, client instantiates, ACC built, reaches network layer. **Live connect+encrypt NOT verified** — dev sandbox blocks egress to `*.litprotocol.com`. Run `node tests/encryption.manual.js` on a machine with open internet to confirm.
+  - ⚠️ Lit SDK pulls a heavy transitive tree → `npm audit` reports ~37 vulns (mostly old `@walletconnect`/`ethers@5` deps). Inherent to the SDK; `audit fix --force` would break it. Revisit at hardening.
+  - Open question still deferred to Phase 5: `arweaveHash` isn't known until Irys upload, but the ACC references it. `buildRentalAccessControlConditions(hash)` is param-driven so Phase 5 decides ordering.
 
 ## Phase 4 — Layer 3 deduplication *(uses DB only)*
 - [ ] SHA-256 exact-duplicate check against `Upload.sha256Hash` → reject 409

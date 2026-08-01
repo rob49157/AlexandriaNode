@@ -3,6 +3,8 @@
 // here we just reject obviously malformed addresses before doing any work.
 // NOTE: for POST /api/upload the wallet arrives in the multipart body, so this
 // middleware must run AFTER multer has parsed the form.
+// TODO Phase 6: upgrade to EIP-55 checksum validation via ethers.isAddress()
+// once ethers is added for the read-only blockchain layer.
 
 const ETH_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 
