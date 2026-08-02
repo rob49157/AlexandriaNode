@@ -20,7 +20,7 @@ This service handles:
 - **Upload Orchestration:** Receive PDFs from frontend, run validation, encrypt, store on Arweave, return arweaveHash to frontend
 - **Security Scanning:** ClamAV virus scanning, embedded JS/attachment detection, auto-action stripping (all in-process)
 - **Deduplication:** SHA-256 exact duplicate detection and SimHash near-duplicate fingerprinting (all in-process)
-- **Lit Protocol Encryption:** Encrypt symmetric keys with on-chain access conditions tied to Rent.sol
+- **Lit Protocol Encryption:** Two-layer envelope encryption — AES-256-GCM locally for the PDF, then Lit Chipotle v3 PKP encryption for the symmetric key via REST API
 - **Arweave/Irys Storage:** Upload encrypted PDFs to permanent storage, manage transaction IDs
 - **Postgres Indexing:** Maintain searchable off-chain index of all uploads (title, author, category, arweaveHash, status)
 - **Event Listening:** Monitor on-chain events (uploads, rentals, challenges) and sync to Postgres (read-only, no writes)
@@ -103,24 +103,14 @@ UploadChallenged(arweaveHash, challenger, reason)
 ChallengeResolved(arweaveHash, approved)
 ```
 
-### Lit Protocol Access Conditions
-When encrypting a symmetric key, the backend sets this access condition:
-```javascript
-const accessControlConditions = [
-  {
-    contractAddress: RENT_CONTRACT_ADDRESS,
-    standardContractType: "custom",
-    chain: "baseSepolia",
-    method: "isRentalActive",
-    parameters: [arweaveHash, ":userAddress"],
-    returnValueTest: {
-      comparator: "=",
-      value: "true"
-    }
-  }
-];
-```
-This means Lit Protocol will only release the decryption key if `Rent.sol.isRentalActive()` returns true for the requesting user.
+### Lit Protocol Encryption (Chipotle v3)
+The backend uses **two-layer envelope encryption** via the Lit Chipotle v3 REST API:
+1. **Layer 1 (Local):** Generate a random AES-256 symmetric key, encrypt the PDF with AES-256-GCM
+2. **Layer 2 (Lit TEE):** Encrypt the 32-byte symmetric key via `POST /core/v1/lit_action` using a PKP (Programmable Key Pair) inside a Trusted Execution Environment
+
+Access control is enforced at **decryption time** by Lit Actions — immutable JavaScript pinned to IPFS that runs inside the TEE. The decryption Lit Action (Phase 5+) will call `Rent.sol.isRentalActive(arweaveHash, userAddress)` before releasing the symmetric key. The backend is never in the decryption path.
+
+The old JSON-based `accessControlConditions` are deprecated (Datil network shut down Feb 2026).
 
 ## Environment & Tooling
 
@@ -145,9 +135,9 @@ ethers                   — Smart contract event listening and read calls (no w
 @irys/sdk                — Arweave uploads via Irys
 arweave                  — Arweave transaction queries
 
-# Encryption
-@lit-protocol/lit-node-client  — Lit Protocol SDK for key encryption
-@lit-protocol/constants        — Lit Protocol chain/network constants
+# Encryption (Lit Chipotle v3 — REST API, no heavy SDK)
+# Uses native Node.js crypto for AES-256-GCM and fetch() for Lit REST API
+# No @lit-protocol npm packages needed — direct HTTP calls to api.chipotle.litprotocol.com
 
 # Database
 prisma                   — ORM + migrations (dev dependency: prisma, runtime: @prisma/client)
@@ -201,7 +191,7 @@ AlexNode/
 │   ├── db.js                   # Prisma client singleton (Postgres connection)
 │   ├── blockchain.js           # Ethers.js provider + read-only contract instances (no signer)
 │   ├── irys.js                 # Irys client configuration
-│   └── lit.js                  # Lit Protocol client setup
+│   └── lit.js                  # Lit Chipotle v3 REST API client (stateless, no SDK)
 │
 ├── routes/
 │   ├── upload.routes.js        # POST /upload, GET /upload/:hash
@@ -218,7 +208,7 @@ AlexNode/
 ├── services/
 │   ├── encryption.service.js   # AES-256-GCM encrypt/decrypt, key generation
 │   ├── arweave.service.js      # Irys upload, Arweave fetch
-│   ├── lit.service.js          # Lit Protocol key encryption with access conditions
+│   ├── lit.service.js          # Lit Chipotle v3 PKP encryption of symmetric keys via REST API
 │   ├── blockchain.service.js   # Read-only smart contract queries (status checks)
 │   ├── validation.service.js   # ClamAV scanning, SHA-256/SimHash dedup, calls AI service for content analysis
 │   └── eventListener.service.js # Listens to on-chain events, syncs to Postgres via Prisma
@@ -262,8 +252,10 @@ PAYMENT_CONTRACT_ADDRESS=
 IRYS_NODE_URL=https://node2.irys.xyz
 IRYS_WALLET_KEY=                    # Dedicated storage wallet, funded by project treasury
 
-# Lit Protocol
-LIT_NETWORK=cayenne               # or habanero for production
+# Lit Protocol — Chipotle v3 REST API
+LIT_API_KEY=                        # from dashboard.chipotle.litprotocol.com
+LIT_PKP_ID=                         # PKP wallet ID minted via dashboard or API
+LIT_API_URL=https://api.chipotle.litprotocol.com/core/v1
 
 # AI Validation Service
 VALIDATION_SERVICE_URL=http://localhost:8000
@@ -454,37 +446,33 @@ PDF arrives at POST /api/upload
 
 ## Encryption Flow (Backend Responsibility)
 
-**Decision:** The backend encrypts using the **Lit SDK's `encryptFile`** (current Lit API), NOT a hand-rolled AES layer. Lit performs envelope encryption internally — it generates the symmetric key, AES-encrypts the file, and ties the key to the threshold network via the access-control conditions. We never hold or discard a raw symmetric key ourselves; we only persist the returned `ciphertext` + `dataToEncryptHash`. Decryption happens in the reader's browser against the Lit network — the backend is never in the decryption path.
+**Decision:** The backend uses **two-layer envelope encryption** via native Node.js `crypto` (AES-256-GCM) and the Lit Chipotle v3 REST API. This replaces the old Lit SDK v7 `encryptFile` (Datil network, shut down Feb 2026).
 
-> Note: `saveEncryptionKey` / manually returning a `symmetricKey` is the deprecated v1/v2 Lit API. Code against the current `encryptFile` / `decryptToFile` API and verify signatures against Lit's live docs before implementing.
+- **Layer 1:** AES-256-GCM encrypts the raw PDF with a locally-generated random symmetric key (fast, no network)
+- **Layer 2:** The 32-byte symmetric key is encrypted by a PKP inside a Lit TEE via `POST /core/v1/lit_action` (small network call)
+- **Access control** is NOT embedded at encryption time. It is enforced at decryption time by a Lit Action (Phase 5+).
+
+The backend NEVER stores unencrypted PDFs or raw symmetric keys. Keys are zeroed from memory immediately after encryption.
 
 ### At Upload Time
 ```javascript
-// Access control: Lit releases the key only when Rent.sol says the rental is active
-const accessControlConditions = [{
-  contractAddress: RENT_CONTRACT_ADDRESS,
-  standardContractType: "custom",
-  chain: "baseSepolia",
-  method: "isRentalActive",
-  parameters: [arweaveHash, ":userAddress"],
-  returnValueTest: { comparator: "=", value: "true" }
-}];
+const crypto = require('crypto');
 
-// 1. Encrypt the validated PDF with Lit (envelope AES happens inside the SDK)
-const { ciphertext, dataToEncryptHash } = await litNodeClient.encryptFile({
-  accessControlConditions,
-  file: new Blob([pdfBuffer]),
-});
-// NOTE: accessControlConditions reference arweaveHash, so if Lit requires the
-// hash up front you may need to derive/reserve the Arweave txid before encrypting,
-// or bind the condition to a placeholder and finalize on upload — confirm ordering
-// against the Irys/Lit APIs during implementation.
+// Layer 1: Local AES-256-GCM
+const symmetricKey = crypto.randomBytes(32);
+const iv = crypto.randomBytes(12);
+const cipher = crypto.createCipheriv('aes-256-gcm', symmetricKey, iv);
+const encryptedPdf = Buffer.concat([cipher.update(pdfBuffer), cipher.final()]);
+const authTag = cipher.getAuthTag();
 
-// 2. Upload ciphertext + dataToEncryptHash to Arweave via Irys → arweaveHash
-const arweaveHash = await irys.upload(encryptedPayload);
+// Layer 2: Encrypt the symmetric key via Lit PKP in TEE
+const { encryptedSymmetricKey, dataToEncryptHash } = await encryptKeyWithLit(symmetricKey);
 
-// 3. Persist arweaveHash + dataToEncryptHash (litEncryptedKeyId) in Postgres
-//    No raw symmetric key is ever held by the backend — nothing to discard.
+// Zero the key immediately
+symmetricKey.fill(0);
+
+// Upload encryptedPdf + iv + authTag to Arweave via Irys → arweaveHash
+// Persist encryptedSymmetricKey + dataToEncryptHash (litEncryptedKeyId) in Postgres
 ```
 
 ### Security Rules
