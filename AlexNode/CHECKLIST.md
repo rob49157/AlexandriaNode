@@ -4,7 +4,7 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 
 ## Locked Decisions
 - **Database:** Prisma + Postgres (Neon) — NOT MongoDB/Mongoose.
-- **Encryption:** Backend encrypts validated PDFs via the **Lit SDK `encryptFile`** (current API), not hand-rolled AES. Access control tied to `Rent.sol.isRentalActive`. Backend never in the decryption path.
+- **Encryption:** Two-layer envelope encryption: backend encrypts validated PDFs using **local AES-256-GCM**, then encrypts the 32-byte symmetric key via **Lit Protocol Chipotle v3 REST API** (PKP encryption in TEE via Lit Actions). Access control gating is enforced at decryption time via Lit Actions. Backend is never in the decryption path.
 - **Encryption stays backend-side for the PoC** — the validation pipeline needs plaintext. Browser-side encryption is a later phase (needs decentralized validation first).
 - **Open question (Phase 5):** access condition references `arweaveHash`, but we encrypt before Irys mints it. Reserve/derive txid first, or bind a placeholder and finalize on upload.
 
@@ -16,6 +16,8 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 - [x] Prisma + Postgres wired: `config/db.js` (client singleton), `prisma/schema.prisma` (`Upload`, `Event` models), migrations
 - [x] CLAUDE.md reconciled to Prisma + Lit SDK reality
 - [x] Empty stubs present: `controller/arweave.js`, `controller/litProtocol.js`
+- [x] Phase 3 complete: Lit Protocol Chipotle v3 REST API migration + two-layer AES+PKP envelope encryption (`tests/encryption.manual.js` PASSED ✓)
+- [x] Phase 4 complete: Layer 2 security scanning (structural PDF exploit detection + ClamAV) + Layer 3 deduplication (SHA-256 + 64-bit SimHash) — `securityAndDedup.test.js` 25/25 PASSED ✓
 
 ---
 
@@ -53,20 +55,22 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 - [x] `controller/litProtocol.js` — Two-layer envelope encryption: AES-256-GCM locally for the PDF + Lit PKP encryption for the symmetric key via `POST /core/v1/lit_action`. Returns `{ encryptedPdf, iv, authTag, encryptedSymmetricKey, dataToEncryptHash }`.
 - [x] **Test:** Run `node tests/encryption.manual.js` — verified AES-256-GCM roundtrip locally + Lit PKP encryption via Chipotle v3 REST API (RESULT: OK ✓).
 
-## Phase 4 — Layer 3 deduplication *(uses DB only)*
-- [ ] SHA-256 exact-duplicate check against `Upload.sha256Hash` → reject 409
-- [ ] SimHash near-duplicate fingerprint via `simhash-js` → flag for review over threshold
-- [ ] **Test:** re-uploading same file → 409; near-dup flagged
+## Phase 4 — Layer 2 Security Scanning + Layer 3 Deduplication *(In-Process & DB)*
+- [x] Layer 2: Structural security scan — detect embedded scripts (`/JS`, `/JavaScript`), auto-actions (`/OpenAction`, `/AA`), and process execution (`/Launch`) → reject `stage: "security_scan"`
+- [x] Layer 2: Structural security scan — detect hidden attachments (`/EmbeddedFiles`, `/EF`), form submission (`/SubmitForm`), and password-protected (`/Encrypt`) PDFs → reject `stage: "security_scan"`
+- [x] Layer 2: ClamAV virus scan integration (daemon connection with graceful `ECONNREFUSED` fallback in dev)
+- [x] Layer 3: SHA-256 exact-duplicate check against `Upload.sha256Hash` → reject 409 Conflict
+- [x] Layer 3: 64-bit SimHash near-duplicate fingerprinting (Hamming distance ≤ 3 = near-dup flag)
+- [x] Layer 3: Banded LSH prefilter — `simHash` split into 4 indexed 16-bit columns (`simHashBand0..3`); near-dup lookup matches "any band equal" instead of scanning every row. Lossless for distance ≤ 3 by the pigeonhole principle; `SIMHASH_THRESHOLD > 3` falls back to a full scan with a startup warning.
+- [x] **Test:** `securityAndDedup.test.js` — 39/39 passed ✓ (structural scan, ClamAV fallback, SHA-256, SimHash distance, band split, 5000-trial pigeonhole recall, malformed-hash rejection)
+- [x] **Verified at scale:** 20k-row seeded table → planner uses `BitmapOr` over all four band indexes; 3 candidates instead of 20,000 (99.98% reduction), 0.07ms vs 259ms for the old full scan.
 
 ## Phase 5 — External integrations *(need infra/keys)*
 - [ ] `config/irys.js` — Irys client (`IRYS_WALLET_KEY`, `IRYS_NODE_URL`)
 - [ ] `controller/arweave.js` — upload encrypted payload → `arweaveHash`; fetch helper
 - [ ] Resolve `arweaveHash`-before-encrypt ordering (see Open Question)
-- [ ] Layer 2: ClamAV virus scan (`clamscan`) — needs the daemon
-- [ ] Layer 2: embedded JS / attachment / auto-action (`/OpenAction`, `/AA`, `/Launch`) detection → strip or reject
-- [ ] Layer 2: encrypted/password-protected PDF detection → reject
 - [ ] Layer 4: AI content analysis via `axios` POST to `VALIDATION_SERVICE_URL` (OCR, quality) — needs Python service
-- [ ] Persist full `Upload` row to Postgres (`status: "pending_stake"`)
+- [ ] Persist full `Upload` row to Postgres (`status: "pending_stake"`) — **must** spread `result.simHashBands` into the Prisma `create` payload alongside `simHash`, or the row stays invisible to the banded-LSH near-dup prefilter
 - [ ] Discard raw PDF from memory; return `{ arweaveHash, litEncryptedKeyId }`
 - [ ] **Test:** full upload flow with mocked Irys/Lit/AI
 

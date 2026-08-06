@@ -23,7 +23,22 @@ model Upload {
   litEncryptedKeyId String   // Reference to Lit Protocol encrypted key
   onChainTxHash     String?  // Transaction hash of on-chain registration (optional initially)
 
+  // Banded LSH prefilter for near-duplicate lookup. Each column holds one
+  // 16-bit slice of simHash, most-significant first. A candidate must match at
+  // least one band, which is a lossless filter for Hamming distance <= 3.
+  // Column count is tied to BAND_COUNT in services/simhash.service.js — adding
+  // a band here requires changing that constant (and vice versa).
+  simHashBand0      Int      @default(0)
+  simHashBand1      Int      @default(0)
+  simHashBand2      Int      @default(0)
+  simHashBand3      Int      @default(0)
+
   @@index([title, author]) // Index for search queries
+  // One index per band so Postgres can bitmap-OR the four equality lookups.
+  @@index([simHashBand0])
+  @@index([simHashBand1])
+  @@index([simHashBand2])
+  @@index([simHashBand3])
 }
 
 // Replaces MongoDB Synced Event Schema

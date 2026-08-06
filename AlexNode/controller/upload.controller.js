@@ -2,8 +2,8 @@ const { validateUpload } = require('../services/validation.service');
 
 // POST /api/upload
 // Orchestration entry point for the upload pipeline.
-// Phase 2: runs Layer 1 (file basics) + Layer 5 (metadata) validation.
-// Later phases add encryption (3), dedup (4), and Arweave/Postgres (5).
+// Runs: Layer 1 (file basics) → Layer 2 (security) → Layer 3 (dedup) → Layer 5 (metadata).
+// Later phases add encryption (already built), Arweave/Irys upload, and Postgres persistence.
 async function createUpload(req, res, next) {
   try {
     if (!req.file) {
@@ -15,17 +15,15 @@ async function createUpload(req, res, next) {
       });
     }
 
-    // Layers 1 + 5. Returns the first failing check, or a success object with
-    // sanitized metadata + page count.
+    // Layers 1 + 2 + 3 + 5. Returns the first failing check, or a success
+    // object with sanitized metadata, page count, hashes, and dedup flags.
     const result = await validateUpload(req.file, req.body);
     if (!result.valid) {
       const { httpStatus = 400, valid, stage, reason, message } = result;
       return res.status(httpStatus).json({ valid, stage, reason, message });
     }
 
-    // TODO Phase 3: Lit encryptFile.
-    // TODO Phase 4: SHA-256 / SimHash dedup.
-    // TODO Phase 5: Irys upload + Postgres persist, then return { arweaveHash, litEncryptedKeyId }.
+    // TODO Phase 5: Lit encryptPdf → Irys upload → Postgres persist → return { arweaveHash, litEncryptedKeyId }.
     return res.status(202).json({
       valid: true,
       received: true,
@@ -37,6 +35,11 @@ async function createUpload(req, res, next) {
       },
       metadata: result.metadata,
       walletAddress: req.walletAddress,
+      sha256Hash: result.sha256Hash,
+      simHash: result.simHash,
+      isNearDuplicate: result.isNearDuplicate,
+      nearDuplicateMatches: result.nearDuplicateMatches,
+      clamavSkipped: result.clamavSkipped,
     });
   } catch (err) {
     return next(err);

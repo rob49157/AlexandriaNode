@@ -1,4 +1,6 @@
 const sanitizeHtml = require('sanitize-html');
+const { validateLayer2 } = require('./securityScan.service');
+const { validateLayer3 } = require('./dedup.service');
 
 // pdf-parse v2 exposes a PDFParse class (+ typed exceptions) via its CJS build.
 const { PDFParse, PasswordException, InvalidPDFException } = require('pdf-parse');
@@ -143,11 +145,21 @@ function validateLayer5(rawMetadata = {}) {
 }
 
 // --- Orchestrator: run available layers in fail-fast order -
-// Phase 2 = Layer 1 + Layer 5. Layers 2/3/4 land in later phases.
+// Pipeline: Layer 1 (file basics) → Layer 2 (security) → Layer 3 (dedup) → Layer 5 (metadata).
 async function validateUpload(file, rawMetadata) {
+  // Layer 1: File basics (size, extension, MIME, magic bytes, parseability)
   const layer1 = await validateLayer1(file);
   if (!layer1.valid) return layer1;
 
+  // Layer 2: Security scanning (structural exploit detection + ClamAV)
+  const layer2 = await validateLayer2(file.buffer);
+  if (!layer2.valid) return layer2;
+
+  // Layer 3: Deduplication (SHA-256 exact + SimHash near-duplicate)
+  const layer3 = await validateLayer3(file.buffer, layer1.text || '');
+  if (!layer3.valid) return layer3;
+
+  // Layer 5: Metadata validation + sanitization
   const layer5 = validateLayer5(rawMetadata);
   if (!layer5.valid) return layer5;
 
@@ -155,6 +167,13 @@ async function validateUpload(file, rawMetadata) {
     valid: true,
     pageCount: layer1.pageCount,
     metadata: layer5.metadata,
+    sha256Hash: layer3.sha256Hash,
+    simHash: layer3.simHash,
+    // Indexed LSH band columns — spread into the Prisma create payload alongside simHash.
+    simHashBands: layer3.simHashBands,
+    isNearDuplicate: layer3.isNearDuplicate,
+    nearDuplicateMatches: layer3.nearDuplicateMatches,
+    clamavSkipped: layer2.clamavSkipped || false,
   };
 }
 
