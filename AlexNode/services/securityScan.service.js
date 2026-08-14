@@ -77,12 +77,7 @@ const DANGEROUS_PATTERNS = [
 // PDF parser — the dictionary keys are plaintext in uncompressed objects and
 // in the cross-reference table / trailer.
 
-/**
- * Scan a PDF buffer for dangerous structural patterns.
- *
- * @param {Buffer} pdfBuffer — raw PDF bytes (from multer memoryStorage)
- * @returns {{ valid: boolean, stage?: string, reason?: string, message?: string, threats?: string[] }}
- */
+// Scan a PDF buffer for dangerous structural patterns.
 function scanPdfStructure(pdfBuffer) {
   if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
     return reject('invalid_input', 'No PDF buffer provided for security scanning.');
@@ -109,12 +104,7 @@ function scanPdfStructure(pdfBuffer) {
 // pdf-parse already catches PasswordException in Layer 1.
 // This is a belt-and-suspenders check on the raw bytes for /Encrypt dictionary.
 
-/**
- * Check if a PDF is encrypted/password-protected via the /Encrypt trailer entry.
- *
- * @param {Buffer} pdfBuffer
- * @returns {{ valid: boolean, stage?: string, reason?: string, message?: string }}
- */
+// Check if a PDF is encrypted/password-protected via the /Encrypt trailer entry.
 function checkEncrypted(pdfBuffer) {
   const content = pdfBuffer.toString('latin1');
   if (/\/Encrypt\b/.test(content)) {
@@ -137,12 +127,7 @@ const CLAMAV_HOST = process.env.CLAMAV_HOST || '127.0.0.1';
 const CLAMAV_PORT = parseInt(process.env.CLAMAV_PORT, 10) || 3310;
 const CLAMAV_TIMEOUT = parseInt(process.env.CLAMAV_TIMEOUT, 10) || 30000;
 
-/**
- * Scan a buffer for viruses using ClamAV daemon (clamd).
- *
- * @param {Buffer} buffer — file bytes to scan
- * @returns {Promise<{ valid: boolean, stage?: string, reason?: string, message?: string, skipped?: boolean }>}
- */
+// Scan a buffer for viruses using ClamAV daemon (clamd).
 async function scanWithClamAV(buffer) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -206,15 +191,8 @@ async function scanWithClamAV(buffer) {
 
 // --- Combined Layer 2 security scan ---
 
-/**
- * Run the full Layer 2 security scan pipeline.
- *
- * Order: structural scan → encrypted check → ClamAV virus scan.
- * Fails fast on the first threat detected.
- *
- * @param {Buffer} pdfBuffer
- * @returns {Promise<{ valid: boolean, clamavSkipped?: boolean }>}
- */
+// Run the full Layer 2 security scan pipeline:
+// Order: structural scan → encrypted check → ClamAV virus scan (fails fast on first threat).
 async function validateLayer2(pdfBuffer) {
   // 1. Structural pattern scan (fast, no I/O)
   const structResult = scanPdfStructure(pdfBuffer);

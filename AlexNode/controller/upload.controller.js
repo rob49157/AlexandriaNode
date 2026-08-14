@@ -1,9 +1,29 @@
 const { validateUpload } = require('../services/validation.service');
+const { aesEncryptPdf, sealKey } = require('./litProtocol');
+const { prepareUpload, commitUpload, buildTags } = require('./arweave');
+const prisma = require('../config/db');
 
 // POST /api/upload
 // Orchestration entry point for the upload pipeline.
-// Runs: Layer 1 (file basics) → Layer 2 (security) → Layer 3 (dedup) → Layer 5 (metadata).
-// Later phases add encryption (already built), Arweave/Irys upload, and Postgres persistence.
+//
+// Validation: Layer 1 (file basics) → Layer 2 (security) → Layer 3 (dedup) → Layer 5 (metadata).
+// (Layer 4, AI content analysis, is a separate service and not wired up yet.)
+//
+// Then: encrypt → sign → seal → upload → persist.
+//
+// ─── Why this order ─────────────────────────────────────────────────────────
+// Everything that can fail cheaply is made to fail BEFORE the one step that
+// costs money and cannot be undone (the Irys push):
+//
+//   validate           4xx, nothing spent
+//   AES encrypt        local
+//   sign Irys tx       local, free — but yields the arweaveHash
+//   seal key           network; failing here still costs nothing
+//   push to Arweave    $$, permanent, irreversible
+//   persist to Postgres
+//
+// Sealing before pushing is the point. Reversed, a Lit failure would leave
+// permanently paid-for bytes that nobody could ever decrypt.
 async function createUpload(req, res, next) {
   try {
     if (!req.file) {
@@ -23,22 +43,146 @@ async function createUpload(req, res, next) {
       return res.status(httpStatus).json({ valid, stage, reason, message });
     }
 
-    // TODO Phase 5: Lit encryptPdf → Irys upload → Postgres persist → return { arweaveHash, litEncryptedKeyId }.
-    return res.status(202).json({
+    const fileSize = req.file.size;
+
+    // --- Encrypt (Layer 1 of the envelope) --------------------------------
+    // symmetricKey is live from here until it is zeroed below.
+    const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(req.file.buffer);
+
+    // The plaintext PDF has served its purpose. Drop it as early as possible —
+    // CLAUDE.md forbids unencrypted PDFs living any longer than necessary, and
+    // this also releases the larger of the two buffers before the network waits.
+    req.file.buffer.fill(0);
+    req.file.buffer = null;
+
+    let arweaveHash;
+    let litEncryptedKeyId;
+    let litDataToEncryptHash;
+
+    try {
+      // --- Sign locally to learn the arweaveHash --------------------------
+      // Free and offline. A data item's id is sha256 of its signature, so it is
+      // fully determined at signing time — no placeholder txid needed.
+      const tags = buildTags({
+        iv,
+        authTag,
+        metadata: result.metadata,
+        uploader: req.walletAddress,
+        sha256Hash: result.sha256Hash,
+      });
+
+      let tx;
+      try {
+        ({ arweaveHash, tx } = await prepareUpload(ciphertext, tags));
+      } catch (err) {
+        console.error('[upload] Irys transaction preparation failed:', err.message);
+        return res.status(502).json({
+          valid: false,
+          stage: 'storage',
+          reason: 'irys_unavailable',
+          message: 'Could not prepare the Arweave upload. Nothing was stored — please retry.',
+        });
+      }
+
+      // --- Seal the key, bound to that hash (Layer 2 of the envelope) -----
+      try {
+        ({
+          encryptedSymmetricKey: litEncryptedKeyId,
+          dataToEncryptHash: litDataToEncryptHash,
+        } = await sealKey(symmetricKey, arweaveHash));
+      } catch (err) {
+        console.error('[upload] Lit key sealing failed:', err.message);
+        return res.status(502).json({
+          valid: false,
+          stage: 'encryption',
+          reason: 'lit_unavailable',
+          message: 'Could not encrypt the file key. Nothing was stored — please retry.',
+        });
+      }
+
+      // --- Push the bytes. Paid and irreversible from here on. ------------
+      try {
+        await commitUpload(tx, arweaveHash);
+      } catch (err) {
+        console.error('[upload] Irys upload failed:', err.message);
+        return res.status(502).json({
+          valid: false,
+          stage: 'storage',
+          reason: 'arweave_upload_failed',
+          message: 'Could not store the file on Arweave. Nothing was persisted — please retry.',
+        });
+      }
+    } finally {
+      // Zero the symmetric key regardless of which branch we left through.
+      symmetricKey.fill(0);
+    }
+
+    // --- Persist ---------------------------------------------------------
+    const nearest = (result.nearDuplicateMatches || [])[0];
+
+    try {
+      await prisma.upload.create({
+        data: {
+          arweaveHash,
+          title: result.metadata.title,
+          author: result.metadata.author,
+          category: result.metadata.category,
+          description: result.metadata.description,
+          uploader: req.walletAddress,
+          status: 'pending_stake',
+          fileSize,
+          pageCount: result.pageCount,
+          sha256Hash: result.sha256Hash,
+          simHash: result.simHash,
+          // MUST travel with simHash — without these indexed band columns the
+          // row is invisible to the banded-LSH near-duplicate prefilter forever.
+          // It fails silently, not loudly. See services/dedup.service.js.
+          ...result.simHashBands,
+          litEncryptedKeyId,
+          litDataToEncryptHash,
+          encryptionIv: iv.toString('base64'),
+          encryptionAuthTag: authTag.toString('base64'),
+          isNearDuplicate: Boolean(result.isNearDuplicate),
+          nearDuplicateOf: nearest ? nearest.arweaveHash : null,
+        },
+      });
+    } catch (err) {
+      // The only lossy case: storage is paid for and permanent, but the index
+      // row is missing. No funds lost and no state corruption — but the row has
+      // to be reconstructable by hand, so log everything needed to rebuild it.
+      console.error(
+        '[upload] [ORPHAN] Arweave upload succeeded but the Postgres row failed to write. ' +
+          'Recover with: ' +
+          JSON.stringify({
+            arweaveHash,
+            litEncryptedKeyId,
+            litDataToEncryptHash,
+            uploader: req.walletAddress,
+            sha256Hash: result.sha256Hash,
+            encryptionIv: iv.toString('base64'),
+            encryptionAuthTag: authTag.toString('base64'),
+          }),
+        err
+      );
+
+      return res.status(500).json({
+        valid: false,
+        stage: 'persistence',
+        reason: 'index_write_failed',
+        message:
+          'The file was stored on Arweave but could not be indexed. Keep this arweaveHash — ' +
+          'the upload can be recovered and staked with it.',
+        arweaveHash,
+      });
+    }
+
+    return res.status(201).json({
       valid: true,
-      received: true,
-      pageCount: result.pageCount,
-      file: {
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        sizeBytes: req.file.size,
-      },
-      metadata: result.metadata,
-      walletAddress: req.walletAddress,
-      sha256Hash: result.sha256Hash,
-      simHash: result.simHash,
-      isNearDuplicate: result.isNearDuplicate,
-      nearDuplicateMatches: result.nearDuplicateMatches,
+      arweaveHash,
+      litEncryptedKeyId,
+      status: 'pending_stake',
+      isNearDuplicate: Boolean(result.isNearDuplicate),
+      nearDuplicateMatches: result.nearDuplicateMatches || [],
       clamavSkipped: result.clamavSkipped,
     });
   } catch (err) {

@@ -16,12 +16,33 @@ model Upload {
   description       String
   uploader          String   // Wallet address
   uploadTimestamp   DateTime @default(now())
-  status            String   // "pending" | "challenged" | "approved" | "rejected"
-  fileSize          Int      // Bytes
+  // "pending_stake" on creation — the file is on Arweave but the archivist has
+  // not yet staked/registered on-chain. The event listener (Phase 6) advances it
+  // to "pending" once UploadRegistered fires.
+  status            String   // "pending_stake" | "pending" | "challenged" | "approved" | "rejected"
+  fileSize          Int      // Bytes (of the original PDF, not the ciphertext)
+  pageCount         Int?     // From Layer 1 pdf-parse
   sha256Hash        String   @unique // Unique index for exact duplicate detection
   simHash           String   // For near-duplicate detection reference
-  litEncryptedKeyId String   // Reference to Lit Protocol encrypted key
+  // The PKP-sealed symmetric key. This is the actual ciphertext handed to the
+  // decryption Lit Action — lose it and the file is unrecoverable, so it is
+  // persisted rather than merely referenced.
+  litEncryptedKeyId String
+  // Lit's integrity hash for the sealed payload; the decrypt call needs it
+  // alongside the ciphertext above.
+  litDataToEncryptHash String?
   onChainTxHash     String?  // Transaction hash of on-chain registration (optional initially)
+
+  // AES-256-GCM decryption parameters. Also written to the Arweave tags, which
+  // are the authoritative copy — these exist so the read path can serve them
+  // without a gateway round-trip. Without them the ciphertext is unrecoverable.
+  encryptionIv      String   // base64, 12 bytes
+  encryptionAuthTag String   // base64, 16 bytes
+
+  // Layer 3 near-duplicate outcome. Soft flag — never blocks an upload, but
+  // surfaces the row for librarian review.
+  isNearDuplicate   Boolean  @default(false)
+  nearDuplicateOf   String?  // arweaveHash of the closest match, if any
 
   // Banded LSH prefilter for near-duplicate lookup. Each column holds one
   // 16-bit slice of simHash, most-significant first. A candidate must match at

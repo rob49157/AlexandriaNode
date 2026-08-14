@@ -14,7 +14,10 @@
 require('dotenv').config();
 
 const { LIT_API_URL, LIT_API_KEY, LIT_PKP_ID } = require('../config/lit');
-const { generateSymmetricKey, aesEncrypt, encryptKeyWithLit, encryptPdf } = require('../controller/litProtocol');
+const { generateSymmetricKey, aesEncrypt, sealKey, encryptPdf } = require('../controller/litProtocol');
+
+// Stand-in for a real Irys tx id — sealKey binds the key to it.
+const FAKE_ARWEAVE_HASH = 'wKrH0V1ULRvKtBTAM7VuVDvJxaN8kQrPFuGDf1RYkZ4';
 
 // ── Pre-flight checks ────────────────────────────────────────────────────────
 
@@ -80,7 +83,7 @@ const guard = setTimeout(() => {
     console.log('Encrypting 32-byte symmetric key via Lit Action ...');
 
     const t0 = Date.now();
-    const { encryptedSymmetricKey, dataToEncryptHash } = await encryptKeyWithLit(key);
+    const { encryptedSymmetricKey, dataToEncryptHash } = await sealKey(key, FAKE_ARWEAVE_HASH);
     console.log(`Done in ${Date.now() - t0}ms`);
 
     console.log(`Encrypted key (head): ${String(encryptedSymmetricKey).slice(0, 48)}...`);
@@ -93,7 +96,7 @@ const guard = setTimeout(() => {
     // --- Full pipeline test ---
     console.log('\n--- Full Pipeline: encryptPdf() ---');
     const t1 = Date.now();
-    const result = await encryptPdf(pdf);
+    const result = await encryptPdf(pdf, FAKE_ARWEAVE_HASH);
     console.log(`Full pipeline done in ${Date.now() - t1}ms`);
     console.log(`encryptedPdf length:        ${result.encryptedPdf.length} (base64)`);
     console.log(`iv:                         ${result.iv}`);

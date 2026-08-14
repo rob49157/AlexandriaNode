@@ -454,26 +454,40 @@ PDF arrives at POST /api/upload
 
 The backend NEVER stores unencrypted PDFs or raw symmetric keys. Keys are zeroed from memory immediately after encryption.
 
+#### The sealed payload is an envelope, not a bare key
+The decryption Lit Action gates on `Rent.isRentalActive(arweaveHash, user)`. If that `arweaveHash` were a caller-supplied parameter, the gate would be trivially bypassable: rent one cheap book, then submit *that* hash alongside a *different* book's ciphertext — the TEE cannot tell they don't correspond.
+
+So the hash is sealed **inside** the ciphertext as `{ v, k, arweaveHash }`. The decryption Action reads it out of the decrypted plaintext and gates on that value, which the caller cannot forge.
+
+This is why encryption is split into two calls (`aesEncryptPdf` → `sealKey`): the `arweaveHash` only exists once the Irys data item is signed, which happens between them.
+
+**The decrypt half is not built yet, and the guarantee is worthless without it.** The decryption Lit Action must read `arweaveHash` from the decrypted envelope and gate on that — never on a `js_param`. See **[`KEY-BINDING.md`](KEY-BINDING.md)** for the exploit, a runnable demo, and a reviewer checklist.
+
 ### At Upload Time
 ```javascript
-const crypto = require('crypto');
+const { aesEncryptPdf, sealKey } = require('./controller/litProtocol');
+const { prepareUpload, commitUpload, buildTags } = require('./controller/arweave');
 
-// Layer 1: Local AES-256-GCM
-const symmetricKey = crypto.randomBytes(32);
-const iv = crypto.randomBytes(12);
-const cipher = crypto.createCipheriv('aes-256-gcm', symmetricKey, iv);
-const encryptedPdf = Buffer.concat([cipher.update(pdfBuffer), cipher.final()]);
-const authTag = cipher.getAuthTag();
+// Layer 1: Local AES-256-GCM (raw Buffer — base64 would cost 33% more on Arweave)
+const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(pdfBuffer);
 
-// Layer 2: Encrypt the symmetric key via Lit PKP in TEE
-const { encryptedSymmetricKey, dataToEncryptHash } = await encryptKeyWithLit(symmetricKey);
+// Sign the Irys data item locally — free, offline, and yields the arweaveHash
+// (a data item's id is sha256 of its signature, so it's known before upload).
+const { arweaveHash, tx } = await prepareUpload(ciphertext, buildTags({ ... }));
 
-// Zero the key immediately
+// Layer 2: Seal the key BOUND to that hash, still before spending anything
+const { encryptedSymmetricKey, dataToEncryptHash } = await sealKey(symmetricKey, arweaveHash);
 symmetricKey.fill(0);
 
-// Upload encryptedPdf + iv + authTag to Arweave via Irys → arweaveHash
+// Only now push bytes — the paid, irreversible step
+await commitUpload(tx, arweaveHash);
+
 // Persist encryptedSymmetricKey + dataToEncryptHash (litEncryptedKeyId) in Postgres
 ```
+
+**Order matters.** Sealing before pushing means a Lit failure costs nothing. Reversed, it would leave permanently paid-for bytes that nobody can ever decrypt.
+
+⚠️ **Arweave id encoding:** `@irys/bundles` exposes `DataItem.id` as **base58** (44 chars), but gateways, upload receipts, and on-chain consumers all use **base64url** (43 chars) — and its own getter/setter disagree (`get id` encodes base58, `set id` decodes base64url). Always derive the hash as base64url of `tx.rawId`; `controller/arweave.js` does this via `transactionId()`.
 
 ### Security Rules
 - Symmetric keys exist in memory only during the upload transaction

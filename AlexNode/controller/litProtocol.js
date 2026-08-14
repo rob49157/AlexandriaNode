@@ -15,6 +15,19 @@
 //   • encryptedPdf + iv + authTag  → stored on Arweave via Irys
 //   • encryptedSymmetricKey + dataToEncryptHash → persisted to Postgres
 //     (dataToEncryptHash is the "litEncryptedKeyId" referenced elsewhere)
+//
+// ─── Why the sealed payload is an envelope, not a bare key ───────────────────
+// The decryption Lit Action must gate on Rent.isRentalActive(arweaveHash, user).
+// If that arweaveHash arrives as a caller-supplied js_param, the gate is
+// trivially bypassed: rent one cheap book, then submit *that* hash alongside a
+// *different* book's ciphertext. The TEE has no way to tell they don't match.
+//
+// So the hash is sealed *inside* the ciphertext, as { v, k, arweaveHash }. The
+// decryption Action reads it out of the decrypted plaintext and gates on that
+// value, which the caller cannot forge.
+//
+// This is why encryption is split into two calls: the arweaveHash only exists
+// once the Irys data item is signed, which happens between them.
 
 const crypto = require('crypto');
 const { litApiCall, LIT_PKP_ID } = require('../config/lit');
@@ -64,33 +77,59 @@ const LIT_ENCRYPT_ACTION_CODE = [
   '}',
 ].join('\n');
 
+// Envelope format version. Bump if the sealed JSON shape ever changes, so a
+// future decryption Lit Action can tell old payloads from new ones.
+const ENVELOPE_VERSION = 1;
+
 /**
- * Encrypt the symmetric key via Lit Chipotle REST API.
+ * Build the plaintext that gets sealed by the PKP.
+ *
+ * Binds the symmetric key to the specific Arweave object it decrypts, so the
+ * decryption Lit Action can read the hash from inside the ciphertext instead of
+ * trusting a caller-supplied parameter. See the header note.
+ *
+ * @param {Buffer} symmetricKey — 32-byte AES key
+ * @param {string} arweaveHash  — the object this key unlocks
+ * @returns {string} JSON string
+ */
+function buildKeyEnvelope(symmetricKey, arweaveHash) {
+  return JSON.stringify({
+    v: ENVELOPE_VERSION,
+    k: symmetricKey.toString('base64'),
+    arweaveHash,
+  });
+}
+
+/**
+ * Seal the symmetric key (bound to its arweaveHash) via the Lit Chipotle REST API.
  *
  * Calls POST /lit_action with inline JS that invokes Lit.Actions.Encrypt
  * inside the TEE using the configured PKP.
  *
  * @param {Buffer} symmetricKey  — 32-byte AES key to protect
+ * @param {string} arweaveHash   — Arweave tx id this key decrypts; sealed into the payload
  * @returns {Promise<{ encryptedSymmetricKey: string, dataToEncryptHash: string }>}
  */
-async function encryptKeyWithLit(symmetricKey) {
+async function sealKey(symmetricKey, arweaveHash) {
   if (!LIT_PKP_ID) {
     throw new Error(
       'LIT_PKP_ID is not set. Mint a PKP at dashboard.chipotle.litprotocol.com and add it to .env.'
     );
   }
   if (!Buffer.isBuffer(symmetricKey) || symmetricKey.length !== 32) {
-    throw new Error('encryptKeyWithLit requires a 32-byte Buffer.');
+    throw new Error('sealKey requires a 32-byte Buffer.');
+  }
+  if (typeof arweaveHash !== 'string' || !arweaveHash) {
+    throw new Error('sealKey requires the arweaveHash the key is bound to.');
   }
 
-  // Encode key as base64 for JSON transport into the Lit Action
-  const keyBase64 = symmetricKey.toString('base64');
+  const envelope = buildKeyEnvelope(symmetricKey, arweaveHash);
 
   const litResponse = await litApiCall('/lit_action', {
     code: LIT_ENCRYPT_ACTION_CODE,
     js_params: {
       pkpId: LIT_PKP_ID,
-      message: keyBase64,
+      message: envelope,
     },
   });
 
@@ -119,8 +158,10 @@ async function encryptKeyWithLit(symmetricKey) {
   }
 
   if (!dataToEncryptHash) {
-    // SHA-256 hash of the symmetric key payload (litEncryptedKeyId)
-    dataToEncryptHash = crypto.createHash('sha256').update(symmetricKey).digest('hex');
+    // Fall back to hashing the sealed envelope, not the raw key — this value is
+    // persisted to Postgres as litEncryptedKeyId, and a digest of secret key
+    // material has no business living in the database.
+    dataToEncryptHash = crypto.createHash('sha256').update(envelope).digest('hex');
   }
 
   if (!encryptedSymmetricKey || !dataToEncryptHash) {
@@ -137,13 +178,44 @@ async function encryptKeyWithLit(symmetricKey) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Encrypt a PDF buffer using two-layer envelope encryption.
+ * Layer 1 only: AES-256-GCM encrypt the PDF and hand back the live key.
  *
- * 1. Generate random AES-256 key
- * 2. AES-256-GCM encrypt the PDF locally (fast, no network)
- * 3. Encrypt the AES key via Lit PKP in TEE (small network call)
+ * The caller owns the returned symmetricKey and MUST zero it (`.fill(0)`) once
+ * sealKey has consumed it. It is split out from sealKey because the upload
+ * pipeline has to sign the Irys transaction in between, to learn the arweaveHash
+ * that gets sealed alongside the key.
+ *
+ * Ciphertext comes back as a raw Buffer, not base64. Base64 would inflate the
+ * Arweave payload by 33% — 33% more cost on the one path where bytes are paid
+ * for permanently — and doubles peak RAM on an already memory-bound request.
  *
  * @param {Buffer} pdfBuffer — raw PDF bytes
+ * @returns {{ ciphertext: Buffer, iv: Buffer, authTag: Buffer, symmetricKey: Buffer }}
+ */
+function aesEncryptPdf(pdfBuffer) {
+  if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
+    throw new Error('aesEncryptPdf requires a non-empty Buffer.');
+  }
+
+  const symmetricKey = generateSymmetricKey();
+  const { ciphertext, iv, authTag } = aesEncrypt(pdfBuffer, symmetricKey);
+
+  return { ciphertext, iv, authTag, symmetricKey };
+}
+
+/**
+ * Encrypt a PDF buffer using two-layer envelope encryption, in one call.
+ *
+ * Convenience wrapper over aesEncryptPdf + sealKey for callers that already know
+ * the arweaveHash. The upload pipeline uses the two phases directly instead,
+ * because it has to sign the Irys transaction between them.
+ *
+ * arweaveHash is REQUIRED and has no default. An optional binding would be no
+ * binding at all — the whole point is that a sealed key cannot exist without
+ * naming the object it unlocks.
+ *
+ * @param {Buffer} pdfBuffer — raw PDF bytes
+ * @param {string} arweaveHash — object this key unlocks; sealed into the payload
  * @returns {Promise<{
  *   encryptedPdf: string,           // base64-encoded AES ciphertext
  *   iv: string,                      // base64-encoded 12-byte IV
@@ -152,47 +224,47 @@ async function encryptKeyWithLit(symmetricKey) {
  *   dataToEncryptHash: string        // integrity hash from Lit (= litEncryptedKeyId)
  * }>}
  */
-async function encryptPdf(pdfBuffer) {
-  if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
-    throw new Error('encryptPdf requires a non-empty Buffer.');
+async function encryptPdf(pdfBuffer, arweaveHash) {
+  const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(pdfBuffer);
+
+  try {
+    const { encryptedSymmetricKey, dataToEncryptHash } = await sealKey(symmetricKey, arweaveHash);
+
+    return {
+      encryptedPdf: ciphertext.toString('base64'),
+      iv: iv.toString('base64'),
+      authTag: authTag.toString('base64'),
+      encryptedSymmetricKey,
+      dataToEncryptHash,
+    };
+  } finally {
+    // Zero the plaintext key even if sealing threw.
+    symmetricKey.fill(0);
   }
-
-  // Layer 1: local AES-256-GCM
-  const symmetricKey = generateSymmetricKey();
-  const { ciphertext: encryptedPdfRaw, iv, authTag } = aesEncrypt(pdfBuffer, symmetricKey);
-
-  // Layer 2: Lit PKP encrypts the symmetric key
-  const { encryptedSymmetricKey, dataToEncryptHash } = await encryptKeyWithLit(symmetricKey);
-
-  // Zero out the plaintext key from memory
-  symmetricKey.fill(0);
-
-  return {
-    encryptedPdf: encryptedPdfRaw.toString('base64'),
-    iv: iv.toString('base64'),
-    authTag: authTag.toString('base64'),
-    encryptedSymmetricKey,
-    dataToEncryptHash,
-  };
 }
 
 /**
- * Convenience wrapper for the upload pipeline.
- * Kept for API compatibility — arweaveHash is no longer needed at encrypt time
- * (access control moved to the decryption Lit Action in Phase 5+).
+ * @deprecated Use aesEncryptPdf + sealKey (or encryptPdf) instead.
+ *
+ * Superseded once the arweaveHash became part of the sealed payload: this
+ * signature implies the hash is optional, which is exactly the assumption the
+ * envelope binding exists to remove.
  *
  * @param {Buffer} pdfBuffer
- * @param {string} _arweaveHash — unused in Chipotle (kept for call-site compat)
+ * @param {string} arweaveHash
  * @returns {Promise<object>}
  */
-async function encryptForRental(pdfBuffer, _arweaveHash) {
-  return encryptPdf(pdfBuffer);
+async function encryptForRental(pdfBuffer, arweaveHash) {
+  return encryptPdf(pdfBuffer, arweaveHash);
 }
 
 module.exports = {
   generateSymmetricKey,
   aesEncrypt,
-  encryptKeyWithLit,
+  aesEncryptPdf,
+  sealKey,
+  buildKeyEnvelope,
   encryptPdf,
   encryptForRental,
+  ENVELOPE_VERSION,
 };
