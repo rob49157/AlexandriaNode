@@ -17,6 +17,7 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 - [x] CLAUDE.md reconciled to Prisma + Lit SDK reality
 - [x] Empty stubs present: `controller/arweave.js`, `controller/litProtocol.js`
 - [x] Phase 3 complete: Lit Protocol Chipotle v3 REST API migration + two-layer AES+PKP envelope encryption (`tests/encryption.manual.js` PASSED ✓)
+- [x] Phase 6a complete: Postgres read paths — `GET /api/upload/:hash` + `GET /api/search` (`readPaths.test.js` 45/45 PASSED ✓)
 - [x] Phase 4 complete: Layer 2 security scanning (structural PDF exploit detection + ClamAV) + Layer 3 deduplication (SHA-256 + 64-bit SimHash) — `securityAndDedup.test.js` 25/25 PASSED ✓
 
 ---
@@ -103,14 +104,30 @@ Pipeline order is deliberate: `validate → AES → sign → seal → push → p
 >
 > 📄 **Full write-up: [`KEY-BINDING.md`](KEY-BINDING.md)** — the exploit, a runnable demo (`node tests/keyBinding.demo.js`), mitigations, rejected alternatives, and a reviewer checklist. Hand this to the Action author.
 
-## Phase 6 — Read paths + event listener
-- [ ] `GET /api/upload/:arweaveHash` — metadata lookup
-- [ ] `routes/search.routes.js` + `controller/search.controller.js` — `GET /api/search?q=&category=&page=`
+## Phase 6a — Postgres read paths *(no external services)*
+- [x] `GET /api/upload/:arweaveHash` — metadata lookup. Validates the hash shape (43-char base64url) before querying, so junk in the URL is a cheap 400. Returns rows in **any** status — an archivist who closed the browser mid-flow has only the hash to resume staking with.
+- [x] `isValidArweaveHash` added to `controller/arweave.js` — rejects the 44-char base58 form, keeping the id-encoding trap enforced on the read side too
+- [x] `routes/search.routes.js` + `controller/search.controller.js` — `GET /api/search?q=&category=&status=&page=&limit=`
+  - `q` matches title **OR** author, case-insensitive `contains`; omitting it browses the catalogue
+  - `category` validated against `ALLOWED_CATEGORIES` (imported, not re-declared); `status` against `SEARCH_STATUSES`
+  - Pagination: `page` 1-based, `limit` default 20 / max 100; `count` + page run in one `$transaction` so `total` can't disagree with the page under a concurrent write
+  - Response: `{ results, page, limit, total, totalPages, hasMore, query }`
+- [x] Public projection: both endpoints go through `PUBLIC_UPLOAD_SELECT` + `toPublicUpload`. Key material (`litEncryptedKeyId`, `litDataToEncryptHash`, `encryptionIv`, `encryptionAuthTag`) and dedup internals (`sha256Hash`, `simHash`, `simHashBand*`) are excluded **at the Prisma `select`**, so a later serializer edit can't start leaking a column the query never fetched.
+- [x] **Test:** `readPaths.test.js` — 45/45 passed ✓ (shape, 404, four malformed-hash forms, pending_stake visibility, q/category/status filters, ordering, pagination arithmetic, param validation, projection + `$transaction` assertions)
+- [x] **Verified live:** server boots against Neon, all six endpoint cases return the right status and body
+
+### Decisions worth revisiting before launch
+- **Search defaults to `status=approved`,** but any status is reachable via `?status=`. Right for the PoC (nothing reaches `approved` until the event listener exists, so dev needs `?status=pending_stake`), and it powers an archivist's "my uploads" view. If unvetted books must never be enumerable by the public, restrict the override — it is one allowlist in `search.controller.js`.
+- **Decryption payload has no route yet.** `litEncryptedKeyId` + `litDataToEncryptHash` + `encryptionIv` + `encryptionAuthTag` are deliberately withheld from these public endpoints. They belong on a rental-gated route in 6b, served together as one complete payload.
+- **`contains` can't use the `@@index([title, author])` index** — a leading-wildcard `LIKE` forces a sequential scan. Fine at PoC row counts; needs a `pg_trgm` GIN index or Postgres full-text search before the catalogue grows.
+
+## Phase 6b — On-chain reads + event listener *(BLOCKED: needs contract ABIs + deployed addresses)*
 - [ ] `routes/rental.routes.js` — `GET /api/rental/status/:hash/:address` (on-chain read)
 - [ ] `routes/stake.routes.js` — `GET /api/stake/status/:hash` (on-chain read)
 - [ ] `config/blockchain.js` — ethers read-only provider + contract instances (no signer)
 - [ ] `services/blockchain.service.js` — read-only status queries
 - [ ] `services/eventListener.service.js` — listen to on-chain events, sync to `Event` table + update `Upload.status`
+- [ ] Rental-gated decrypt-params route (serves the sealed key + IV + auth tag once `isRentalActive` passes)
 - [ ] **Test:** event sync updates Postgres; status endpoints return live on-chain state
 
 ## Cross-cutting

@@ -1,6 +1,6 @@
 const { validateUpload } = require('../services/validation.service');
 const { aesEncryptPdf, sealKey } = require('./litProtocol');
-const { prepareUpload, commitUpload, buildTags } = require('./arweave');
+const { prepareUpload, commitUpload, buildTags, isValidArweaveHash } = require('./arweave');
 const prisma = require('../config/db');
 
 // POST /api/upload
@@ -190,18 +190,97 @@ async function createUpload(req, res, next) {
   }
 }
 
+// ─── Public read shape ───────────────────────────────────────────────────────
+// Read endpoints are unauthenticated, so the row is projected down to the
+// fields a catalogue browser needs. What is deliberately left out:
+//
+//   litEncryptedKeyId / litDataToEncryptHash
+//       The sealed key envelope — exactly the ciphertext an attacker needs in
+//       hand before a Lit Action gate is the only thing left between them and
+//       the book. The gate is meant to hold on its own, but there is no reason
+//       to hand out the material for free. It belongs behind the rental-gated
+//       decrypt-params route (Phase 6b), not here.
+//
+//   encryptionIv / encryptionAuthTag
+//       Useless without the key above, and already public in the Arweave tags.
+//       Shipped alongside the sealed key on that same rental-gated route, so
+//       the frontend gets one complete decryption payload instead of two halves.
+//
+//   sha256Hash / simHash / simHashBand0..3
+//       Dedup internals. Publishing sha256Hash in particular turns this route
+//       into an oracle for "does Alexandria already hold this exact file?",
+//       which is a probe worth denying.
+function toPublicUpload(row) {
+  return {
+    arweaveHash: row.arweaveHash,
+    title: row.title,
+    author: row.author,
+    category: row.category,
+    description: row.description,
+    uploader: row.uploader,
+    uploadTimestamp: row.uploadTimestamp,
+    status: row.status,
+    fileSize: row.fileSize,
+    pageCount: row.pageCount ?? null,
+    isNearDuplicate: Boolean(row.isNearDuplicate),
+    nearDuplicateOf: row.nearDuplicateOf ?? null,
+    onChainTxHash: row.onChainTxHash ?? null,
+  };
+}
+
+// The columns toPublicUpload reads. Passed to Prisma as an explicit `select` so
+// key material never leaves Postgres in the first place — a later edit to the
+// serializer cannot accidentally start leaking a field the query never fetched.
+const PUBLIC_UPLOAD_SELECT = {
+  arweaveHash: true,
+  title: true,
+  author: true,
+  category: true,
+  description: true,
+  uploader: true,
+  uploadTimestamp: true,
+  status: true,
+  fileSize: true,
+  pageCount: true,
+  isNearDuplicate: true,
+  nearDuplicateOf: true,
+  onChainTxHash: true,
+};
+
 // GET /api/upload/:arweaveHash
-// Metadata lookup. Real implementation queries Postgres (Phase 6). Stubbed for now.
+// Metadata lookup for a single upload, by transaction ID.
+//
+// Returns rows in any status, including "pending_stake" — an archivist who
+// closed the browser mid-flow needs to look their hash back up to finish
+// staking, and they only have the hash to go on. Search is the surface that
+// filters by status; this one is a direct lookup of a known identifier.
 async function getUpload(req, res, next) {
   try {
     const { arweaveHash } = req.params;
-    return res.status(501).json({
-      message: 'Not implemented yet — upload metadata lookup lands in Phase 6.',
-      arweaveHash,
+
+    if (!isValidArweaveHash(arweaveHash)) {
+      return res.status(400).json({
+        error: 'invalid_hash',
+        message: 'arweaveHash must be a 43-character base64url transaction ID.',
+      });
+    }
+
+    const row = await prisma.upload.findUnique({
+      where: { arweaveHash },
+      select: PUBLIC_UPLOAD_SELECT,
     });
+
+    if (!row) {
+      return res.status(404).json({
+        error: 'not_found',
+        message: `No upload indexed for ${arweaveHash}.`,
+      });
+    }
+
+    return res.json(toPublicUpload(row));
   } catch (err) {
     return next(err);
   }
 }
 
-module.exports = { createUpload, getUpload };
+module.exports = { createUpload, getUpload, toPublicUpload, PUBLIC_UPLOAD_SELECT };

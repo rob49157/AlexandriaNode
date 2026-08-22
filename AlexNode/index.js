@@ -7,6 +7,7 @@ const helmet = require('helmet');
 
 const prisma = require('./config/db');
 const uploadRoutes = require('./routes/upload.routes');
+const searchRoutes = require('./routes/search.routes');
 const { notFound, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
@@ -29,6 +30,7 @@ app.get('/api/health', (req, res) => {
 
 // API routes
 app.use('/api', uploadRoutes);
+app.use('/api', searchRoutes);
 
 // 404 + global error handler — must be registered last, after all routes.
 app.use(notFound);

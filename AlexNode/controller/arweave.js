@@ -49,6 +49,25 @@ function transactionId(tx) {
   return toBase64Url(tx.rawId);
 }
 
+// A transaction ID is 32 bytes rendered as unpadded base64url — always exactly
+// 43 characters. Read paths check this before touching the database so that
+// junk in a URL path is a cheap 400 rather than a query.
+const ARWEAVE_HASH_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * Is this string shaped like an Arweave/Irys transaction ID?
+ *
+ * Format only — says nothing about whether the transaction exists. Note that a
+ * base58 `tx.id` is 44 chars and fails this check, which is the intent: see the
+ * encoding trap above.
+ *
+ * @param {string} hash
+ * @returns {boolean}
+ */
+function isValidArweaveHash(hash) {
+  return typeof hash === 'string' && ARWEAVE_HASH_PATTERN.test(hash);
+}
+
 function tag(name, value) {
   return { name, value: String(value ?? '').slice(0, MAX_TAG_VALUE) };
 }
@@ -163,4 +182,5 @@ module.exports = {
   buildTags,
   transactionId,
   toBase64Url,
+  isValidArweaveHash,
 };
