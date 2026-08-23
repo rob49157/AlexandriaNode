@@ -73,9 +73,45 @@ stub('../config/db', {
       db.rows.push(data);
       return data;
     },
+    updateMany: async ({ where, data }) => {
+      const matched = db.rows.filter((r) =>
+        Object.entries(where).every(([k, v]) => r[k] === v)
+      );
+      matched.forEach((r) => Object.assign(r, data));
+      return { count: matched.length };
+    },
   },
   $connect: async () => {},
   $disconnect: async () => {},
+});
+
+// --- Fake on-chain registration ---
+//
+// ⚠️ This stub is load-bearing. Without it, createUpload calls the REAL
+// registration service, which — once BACKEND_PRIVATE_KEY exists — signs real
+// transactions against the live AlexandriaLibrary. That happened: a single test
+// run wrote six junk hashes into the registry permanently, because
+// registerUpload has no delete.
+//
+// config/blockchain.js now refuses to produce a signer from a test entrypoint as
+// a second line of defence, but stub the boundary here anyway — a test should
+// not depend on a guard elsewhere to avoid spending money.
+const registration = { calls: [], result: null };
+
+stub('../services/registration.service', {
+  registerOnChain: async (arweaveHash, uploader, meta) => {
+    registration.calls.push({ arweaveHash, uploader, meta });
+    return (
+      registration.result || {
+        registered: true,
+        reason: null,
+        message: 'Registered on-chain.',
+        txHash: `0x${'d'.repeat(64)}`,
+      }
+    );
+  },
+  preflight: async () => ({ ready: true, address: `0x${'c'.repeat(40)}` }),
+  buildMetadata: (m) => JSON.stringify({ t: m.title, a: m.author, c: m.category }),
 });
 
 // --- Fake Lit ---
@@ -266,9 +302,25 @@ const tagValue = (name) => (irys.lastTags.find((t) => t.name === name) || {}).va
   assert(okRes.statusCode === 201, `Successful upload returns 201 (got ${okRes.statusCode})`);
   assert(Boolean(okRes.body && okRes.body.arweaveHash), 'Response carries arweaveHash');
   assert(Boolean(okRes.body && okRes.body.litEncryptedKeyId), 'Response carries litEncryptedKeyId');
-  assert(okRes.body.status === 'pending_stake', 'Status is pending_stake');
+  // The row is created as "pending_stake" and only advances once registration
+  // lands — the stub reports success, so the response reports "pending".
+  assert(okRes.body.status === 'pending', 'Status is pending after successful registration');
+  assert(db.rows[0].status === 'pending', 'The indexed row is advanced to pending too');
   assert(irys.committed === 1, 'Exactly one Arweave push occurred');
   assert(db.rows.length === 1, 'Exactly one Postgres row written');
+
+  // The ARCHIVIST must be recorded on-chain, not the backend — stake.stake()
+  // requires getUploader(hash) == msg.sender, so getting this wrong would make
+  // the upload permanently unstakeable.
+  assert(registration.calls.length === 1, 'Registration attempted exactly once');
+  assert(
+    registration.calls[0].uploader === '0x1234567890abcdef1234567890abcdef12345678',
+    'Registration records the ARCHIVIST as uploader, not the backend'
+  );
+  assert(
+    registration.calls[0].arweaveHash === okRes.body.arweaveHash,
+    'Registration is called with the arweaveHash that was just uploaded'
+  );
 
   // ── 2. Band columns persisted ────────────────────────────────────────────
   console.log('\n=== Banded-LSH columns ===\n');
@@ -426,6 +478,47 @@ const tagValue = (name) => (irys.lastTags.find((t) => t.name === name) || {}).va
   assert(
     db.rows[0].nearDuplicateOf === 'NeighbourHash000000000000000000000000000000',
     'Row records which upload it resembles'
+  );
+
+  // ── On-chain registration failure ────────────────────────────────────────
+  // By the time registration runs, the Arweave bytes are paid for and permanent.
+  // A chain failure must therefore never turn a successful upload into an error.
+  console.log('\n=== Registration failure is non-fatal ===\n');
+  resetState();
+  registration.result = {
+    registered: false,
+    reason: 'not_authorized',
+    message: 'backend is not an authorized caller',
+    txHash: null,
+  };
+
+  const unregRes = await runUpload(mockReq(pdf));
+  assert(unregRes.statusCode === 201, 'A registration failure still returns 201 — the upload did succeed');
+  assert(unregRes.body.status === 'pending_stake', 'A failed registration leaves the row at pending_stake');
+  assert(
+    unregRes.body.registration.reason === 'not_authorized',
+    'The response names why registration did not happen'
+  );
+  assert(db.rows.length === 1, 'The upload is still indexed despite the chain failure');
+  assert(
+    Boolean(unregRes.body.arweaveHash),
+    'The arweaveHash is still returned, so registration can be retried later'
+  );
+  registration.result = null;
+
+  // ── Guard: tests must never sign a real transaction ──────────────────────
+  // This is the regression test for an actual incident — running this suite
+  // with a live BACKEND_PRIVATE_KEY wrote six junk hashes into AlexandriaLibrary
+  // permanently, because registerUpload has no delete.
+  console.log('\n=== Chain-write guard ===\n');
+  const realChainConfig = require('../config/blockchain');
+  assert(
+    realChainConfig.chainWritesBlocked() !== null,
+    'config/blockchain refuses to sign from a test entrypoint'
+  );
+  assert(
+    realChainConfig.getSigner() === null,
+    'getSigner() returns null under a test entrypoint even with a real key present'
   );
 
   // ── Summary ──────────────────────────────────────────────────────────────

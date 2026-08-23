@@ -10,6 +10,18 @@ generator client {
 // Replaces MongoDB Upload Schema
 model Upload {
   arweaveHash       String   @id // Primary Key (mapped to original identifier)
+  // keccak256(utf8(arweaveHash)), 0x-prefixed hex.
+  //
+  // Every book-scoped contract event declares `string indexed arweaveHash`.
+  // Solidity cannot fit a variable-length string into a 32-byte log topic, so it
+  // emits the keccak256 digest and drops the plaintext — the hash is genuinely
+  // not in the log. keccak256 is one-way, so the event listener cannot decode it;
+  // it has to match forwards, from a hash it already knows to the topic it would
+  // produce. This column is that join key, written at upload time.
+  //
+  // Nullable only so the column could be added to an existing table; every row
+  // this backend writes populates it. See config/blockchain.js topicForHash().
+  arweaveHashTopic  String?  @unique
   title             String
   author            String
   category          String
@@ -62,13 +74,47 @@ model Upload {
   @@index([simHashBand3])
 }
 
-// Replaces MongoDB Synced Event Schema
+// On-chain events, mirrored into Postgres by services/eventListener.service.js.
+//
+// Append-only audit log. The chain stays the source of truth — this table exists
+// so the frontend can read history without an archive node, and so a status the
+// listener applied to Upload can be traced back to the log that caused it.
 model Event {
   id              Int      @id @default(autoincrement())
-  eventName       String   // e.g., "BookRented", "StakeDeposited"
-  arweaveHash     String
-  args            Json     // Event arguments stored as JSON object
+  eventName       String   // "UploadRegistered", "Staked", "BookRented", ...
+  contract        String   // "library" | "stake" | "rent"
+
+  // Plaintext hash when the listener could resolve the topic to a known book,
+  // null when it could not. Nullable because the log only carries the digest:
+  // an event for a book registered outside this backend is still worth
+  // recording, and can be resolved later once the hash is known.
+  arweaveHash     String?
+  // The keccak256 topic exactly as emitted. Always present for book-scoped
+  // events, and the only durable link back to the log when arweaveHash is null.
+  arweaveHashTopic String?
+
+  args            Json     // Decoded, non-indexed event arguments
   blockNumber     Int
+  logIndex        Int
   transactionHash String
   timestamp       DateTime
+
+  // Idempotency. A restarted listener re-scans an overlapping block range on
+  // purpose, and a chain reorg can re-deliver logs; (txHash, logIndex) uniquely
+  // identifies a log, so re-processing upserts instead of duplicating.
+  @@unique([transactionHash, logIndex])
+  @@index([arweaveHash])
+  @@index([arweaveHashTopic])
+  @@index([blockNumber])
+}
+
+// Listener cursor — how far the event listener has caught up.
+//
+// A separate table rather than max(Event.blockNumber) because blocks containing
+// no Alexandria events still count as processed. Deriving the cursor from the
+// last *stored* event would re-scan every quiet block on every restart.
+model SyncState {
+  id                 String   @id // "chain-84532"
+  lastProcessedBlock Int
+  updatedAt          DateTime @updatedAt
 }

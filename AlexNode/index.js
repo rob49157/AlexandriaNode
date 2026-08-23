@@ -8,6 +8,10 @@ const helmet = require('helmet');
 const prisma = require('./config/db');
 const uploadRoutes = require('./routes/upload.routes');
 const searchRoutes = require('./routes/search.routes');
+const rentalRoutes = require('./routes/rental.routes');
+const stakeRoutes = require('./routes/stake.routes');
+const chainRoutes = require('./routes/chain.routes');
+const eventListener = require('./services/eventListener.service');
 const { notFound, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
@@ -31,6 +35,9 @@ app.get('/api/health', (req, res) => {
 // API routes
 app.use('/api', uploadRoutes);
 app.use('/api', searchRoutes);
+app.use('/api', rentalRoutes);
+app.use('/api', stakeRoutes);
+app.use('/api', chainRoutes);
 
 // 404 + global error handler — must be registered last, after all routes.
 app.use(notFound);
@@ -50,9 +57,26 @@ async function start() {
     console.log(`Server is successfully running on http://localhost:${port}`);
   });
 
-  // Graceful shutdown: close the HTTP server and the Prisma connection
+  // On-chain event listener. Started after the server is up and never awaited:
+  // a cold backfill walks millions of blocks, and the API must serve traffic
+  // throughout. Set EVENT_LISTENER_ENABLED=false to run the API without it
+  // (offline development, or when the RPC quota matters more than fresh status).
+  const listenerEnabled = process.env.EVENT_LISTENER_ENABLED !== 'false';
+  if (listenerEnabled) {
+    try {
+      eventListener.start();
+    } catch (err) {
+      // A misconfigured listener must not stop the API from serving reads.
+      console.error('[events] listener failed to start:', err.message);
+    }
+  } else {
+    console.log('[events] listener disabled (EVENT_LISTENER_ENABLED=false)');
+  }
+
+  // Graceful shutdown: stop the listener, close the HTTP server and Prisma
   const shutdown = async (signal) => {
     console.log(`\n${signal} received, shutting down gracefully...`);
+    eventListener.stop();
     server.close(async () => {
       await prisma.$disconnect();
       console.log('HTTP server closed and database disconnected');

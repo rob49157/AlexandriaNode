@@ -1,6 +1,8 @@
 const { validateUpload } = require('../services/validation.service');
 const { aesEncryptPdf, sealKey } = require('./litProtocol');
 const { prepareUpload, commitUpload, buildTags, isValidArweaveHash } = require('./arweave');
+const { topicForHash } = require('../config/blockchain');
+const { registerOnChain, preflight } = require('../services/registration.service');
 const prisma = require('../config/db');
 
 // POST /api/upload
@@ -124,6 +126,12 @@ async function createUpload(req, res, next) {
       await prisma.upload.create({
         data: {
           arweaveHash,
+          // The only key the event listener can join on. Contract events index
+          // arweaveHash as a `string`, which Solidity stores as a keccak256
+          // topic with the plaintext discarded — so events are matched forwards
+          // from this column, never decoded backwards from the log. Omitting it
+          // makes the row permanently invisible to on-chain status sync.
+          arweaveHashTopic: topicForHash(arweaveHash),
           title: result.metadata.title,
           author: result.metadata.author,
           category: result.metadata.category,
@@ -176,11 +184,49 @@ async function createUpload(req, res, next) {
       });
     }
 
+    // --- Register on-chain ------------------------------------------------
+    // Deliberately after the index row exists and deliberately non-fatal. The
+    // bytes are already paid for and permanent, so a chain failure here must
+    // not turn a successful upload into an error response — it leaves the row
+    // at "pending_stake", which is the same recoverable state as an archivist
+    // who closed the browser mid-flow. `registration` in the response tells the
+    // frontend whether to show "staking available" or "registration pending".
+    const registration = await registerOnChain(arweaveHash, req.walletAddress, result.metadata);
+
+    if (registration.registered && registration.txHash) {
+      // Advance immediately rather than waiting up to a poll interval for the
+      // event listener. The listener's own update is guarded on
+      // status: 'pending_stake', so it degrades to a no-op instead of fighting
+      // this write.
+      try {
+        await prisma.upload.updateMany({
+          where: { arweaveHash, status: 'pending_stake' },
+          data: { status: 'pending', onChainTxHash: registration.txHash },
+        });
+      } catch (err) {
+        // Cosmetic only — the listener will apply the same change on its next
+        // pass from the UploadRegistered event.
+        console.warn(`[upload] could not record registration tx for ${arweaveHash}: ${err.message}`);
+      }
+    }
+
     return res.status(201).json({
       valid: true,
       arweaveHash,
       litEncryptedKeyId,
-      status: 'pending_stake',
+      status: registration.registered && registration.txHash ? 'pending' : 'pending_stake',
+      registration: {
+        registered: registration.registered,
+        reason: registration.reason,
+        message: registration.message,
+        txHash: registration.txHash || null,
+      },
+      // The archivist stakes from their own wallet: stake.stake() requires
+      // getUploader(hash) == msg.sender, and registerUpload recorded them as
+      // the uploader. Registration being done is what unblocks that call.
+      nextStep: registration.registered
+        ? 'Approve $ALEX and call stake.stake(arweaveHash, amount) from your wallet.'
+        : 'Upload stored. Retry registration with POST /api/upload/:arweaveHash/register before staking.',
       isNearDuplicate: Boolean(result.isNearDuplicate),
       nearDuplicateMatches: result.nearDuplicateMatches || [],
       clamavSkipped: result.clamavSkipped,
@@ -283,4 +329,94 @@ async function getUpload(req, res, next) {
   }
 }
 
-module.exports = { createUpload, getUpload, toPublicUpload, PUBLIC_UPLOAD_SELECT };
+// POST /api/upload/:arweaveHash/register
+//
+// Retry on-chain registration for an upload that is stored and indexed but never
+// made it onto the library contract — the backend was unauthorized, out of gas,
+// or the RPC was down when the upload landed.
+//
+// Safe to call repeatedly: registerOnChain checks uploadExists() first, so a
+// retry after a timed-out-but-landed transaction reports already_registered
+// instead of reverting on the duplicate.
+//
+// No auth beyond the hash. Registering someone's already-stored upload is not an
+// attack — the uploader address comes from the indexed row, not the caller, so
+// the worst a stranger can do is pay nothing to advance a row the archivist
+// wanted advanced anyway.
+async function retryRegistration(req, res, next) {
+  try {
+    const { arweaveHash } = req.params;
+
+    if (!isValidArweaveHash(arweaveHash)) {
+      return res.status(400).json({
+        error: 'invalid_hash',
+        message: 'arweaveHash must be a 43-character base64url transaction ID.',
+      });
+    }
+
+    const row = await prisma.upload.findUnique({
+      where: { arweaveHash },
+      select: { arweaveHash: true, uploader: true, status: true, title: true, author: true, category: true },
+    });
+
+    if (!row) {
+      return res.status(404).json({
+        error: 'not_found',
+        message: `No upload indexed for ${arweaveHash}.`,
+      });
+    }
+
+    const registration = await registerOnChain(arweaveHash, row.uploader, row);
+
+    if (!registration.registered) {
+      // 503, not 400: nothing about the request is wrong. The chain-side
+      // precondition (authorization, gas, connectivity) is not met yet.
+      return res.status(503).json({
+        registered: false,
+        arweaveHash,
+        error: registration.reason,
+        message: registration.message,
+      });
+    }
+
+    if (registration.txHash) {
+      await prisma.upload.updateMany({
+        where: { arweaveHash, status: 'pending_stake' },
+        data: { status: 'pending', onChainTxHash: registration.txHash },
+      });
+    }
+
+    return res.json({
+      registered: true,
+      arweaveHash,
+      reason: registration.reason,
+      message: registration.message,
+      txHash: registration.txHash || null,
+      status: 'pending',
+      nextStep: 'Approve $ALEX and call stake.stake(arweaveHash, amount) from your wallet.',
+    });
+  } catch (err) {
+    return next(err);
+  }
+}
+
+// GET /api/upload/registrar/status
+// Whether the backend can register uploads on-chain at all, and if not, exactly
+// who has to do what about it.
+async function getRegistrarStatus(req, res, next) {
+  try {
+    const check = await preflight();
+    return res.status(check.ready ? 200 : 503).json(check);
+  } catch (err) {
+    return next(err);
+  }
+}
+
+module.exports = {
+  createUpload,
+  getUpload,
+  retryRegistration,
+  getRegistrarStatus,
+  toPublicUpload,
+  PUBLIC_UPLOAD_SELECT,
+};

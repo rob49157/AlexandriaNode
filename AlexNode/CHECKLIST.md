@@ -19,6 +19,7 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 - [x] Phase 3 complete: Lit Protocol Chipotle v3 REST API migration + two-layer AES+PKP envelope encryption (`tests/encryption.manual.js` PASSED ✓)
 - [x] Phase 6a complete: Postgres read paths — `GET /api/upload/:hash` + `GET /api/search` (`readPaths.test.js` 45/45 PASSED ✓)
 - [x] Phase 4 complete: Layer 2 security scanning (structural PDF exploit detection + ClamAV) + Layer 3 deduplication (SHA-256 + 64-bit SimHash) — `securityAndDedup.test.js` 25/25 PASSED ✓
+- [x] Phase 6b complete: on-chain read paths + event listener against live Base Sepolia contracts (`chainReads.test.js` 74/74 PASSED ✓) — see the open `registerUpload` authorization decision below
 
 ---
 
@@ -121,20 +122,200 @@ Pipeline order is deliberate: `validate → AES → sign → seal → push → p
 - **Decryption payload has no route yet.** `litEncryptedKeyId` + `litDataToEncryptHash` + `encryptionIv` + `encryptionAuthTag` are deliberately withheld from these public endpoints. They belong on a rental-gated route in 6b, served together as one complete payload.
 - **`contains` can't use the `@@index([title, author])` index** — a leading-wildcard `LIKE` forces a sequential scan. Fine at PoC row counts; needs a `pg_trgm` GIN index or Postgres full-text search before the catalogue grows.
 
-## Phase 6b — On-chain reads + event listener *(BLOCKED: needs contract ABIs + deployed addresses)*
-- [ ] `routes/rental.routes.js` — `GET /api/rental/status/:hash/:address` (on-chain read)
-- [ ] `routes/stake.routes.js` — `GET /api/stake/status/:hash` (on-chain read)
-- [ ] `config/blockchain.js` — ethers read-only provider + contract instances (no signer)
-- [ ] `services/blockchain.service.js` — read-only status queries
-- [ ] `services/eventListener.service.js` — listen to on-chain events, sync to `Event` table + update `Upload.status`
-- [ ] Rental-gated decrypt-params route (serves the sealed key + IV + auth tag once `isRentalActive` passes)
-- [ ] **Test:** event sync updates Postgres; status endpoints return live on-chain state
+## Phase 6b — On-chain reads + event listener *(UNBLOCKED — contracts are live on Base Sepolia)*
+
+All five contracts are deployed to **chain 84532 (Base Sepolia)** and verified live:
+
+| Contract | Address | Deployed at block |
+|---|---|---|
+| AlexandriaLibrary | `0x0b26AB8C632586E846DE87D29D665fd727bBe844` | 42758328 |
+| AlexandriaToken | `0x99C8Ab3c870AAcD75185Ee2B0c96C0Cfe85Fd605` | 42758328 |
+| AlexandriaPayment | `0xa5118F666C9A3F6FF1a8342Cd2FfC84134c8b1f8` | 42758333 |
+| AlexandriaRent | `0xe50AD653Ee690c818900091a4d69F22e484bD2cD` | 42758334 |
+| AlexandriaStake | `0xe3027D298450695d9c4eD9A071D34e2921fc567C` | 42758660 |
+
+- [x] `npm i ethers` (v6.17) — read-only, no signer anywhere in the backend
+- [x] `scripts/sync-abis.js` + committed `abis/*.json` — ABI, address, and deployment block pulled from the AlexandriaSmartContract Ignition deployment. Committed on purpose: the backend must build without a sibling checkout, and a silently-changing ABI is worse than one that shows up in a diff.
+- [x] `config/blockchain.js` — provider + read-only contract instances. Multi-URL `FallbackProvider` (quorum 1) because the official `sepolia.base.org` endpoint returns *"no backend is currently healthy"* often enough to make status endpoints flap; `base-sepolia-rpc.publicnode.com` is tried first. Env addresses override `abis/`, and a mismatch is logged loudly rather than silently preferred.
+- [x] `services/blockchain.service.js` — read-only queries with revert translation (see the three on-chain gotchas below)
+- [x] `routes/rental.routes.js` — `GET /api/rental/status/:hash/:address`, `GET /api/rental/book/:hash`
+- [x] `routes/stake.routes.js` — `GET /api/stake/status/:hash` (on-chain stake + challenge, joined against the index with an `inSync` flag)
+- [x] `routes/chain.routes.js` — `GET /api/chain/status` (listener cursor, distance from head, last error; 503 when stalled). Without it, "the listener died" and "nobody staked today" look identical.
+- [x] `services/eventListener.service.js` — backfill + poll, idempotent, cursor-persisted
+- [x] Rental-gated decrypt-params route — `GET /api/rental/decrypt-params/:hash/:address`
+- [x] `middleware/auth.middleware.js` — cleared its own "Phase 6" TODO: now EIP-55 checksum validation via `ethers.isAddress()`, so a mistyped address is a 400 instead of a wrong-owner row
+- [x] **Migration** `20260822120000_phase6b_chain_event_sync` — applied to Neon (both tables were empty, so the new unique constraints were free)
+- [x] **Test:** `chainReads.test.js` — 74/74 passed ✓
+- [x] **Regressions:** `readPaths` 45/45 ✓ · `securityAndDedup` 39/39 ✓ · `uploadFlow` 39/39 ✓
+- [x] **Verified live:** 3.06M-block cold backfill (42,758,328 → head) completed in ~20s, cursor committing per chunk; all endpoints returned correct status and body against real Neon + real Base Sepolia
+
+### ⚠️ The one that would have silently broken everything: `string indexed arweaveHash`
+
+Every book-scoped event declares `string indexed arweaveHash`. A log topic is a fixed 32 bytes, so Solidity stores **keccak256(utf8(hash)) and throws the plaintext away**. The hash is genuinely not in the log — ethers hands back an `Indexed` placeholder, not a string — and keccak256 is one-way, so it cannot be decoded back.
+
+A listener written the obvious way (`event.args.arweaveHash`) gets an object instead of a hash, matches nothing, and silently indexes zero books while looking perfectly healthy.
+
+Resolution therefore runs **forwards**: hash the arweaveHashes we already know and match the digest.
+1. `Upload.arweaveHashTopic` — a new indexed column written at upload time. One query per batch; covers every book this backend uploaded.
+2. `library.getUploaderHashes(uploader)` — `uploader` is an indexed *address*, so it stays readable off the log. Covers books registered without going through this backend.
+
+Unresolvable logs are still stored with `arweaveHash: null` and the raw topic kept, so they can be back-filled rather than lost.
+
+> ⚠️ `Upload.arweaveHashTopic` **must travel with every insert** — same failure mode as the SimHash band columns. Omit it and the row is permanently invisible to on-chain status sync, silently.
+
+### Three on-chain behaviours the service layer has to absorb
+- **Missing rows revert, they don't return empty.** `library.getUpload()` and `getUploadStatus()` both `require(timestamp != 0, "Upload not found")`, so "never registered" arrives as a thrown `CALL_EXCEPTION`. That is a 404, and it must never be confused with the RPC being down — a network failure returns 503, because a transient outage reported as "not registered" is a permanent-sounding lie.
+- **`isRentalActive()` is `view whenNotPaused`.** Pausing the Rent contract makes a *read-only permission check revert* rather than return false. Reported as `active: false, available: false` + HTTP 503: the caller fails closed but can tell "denied" from "cannot currently tell", so it never caches a pause as a settled no.
+- **`stake.getStakeStatus()` does the opposite** — returns a zeroed struct instead of reverting, so "never staked" is a zero timestamp, not an error.
+
+### Listener design notes
+- **Idempotent by construction.** `Event` is upserted on `(transactionHash, logIndex)`, so replaying a range is a no-op. Ranges always run oldest-first and always extend to the current safe head, so the last status write for a book is the newest one on chain.
+- **Cursor commits per chunk.** A cold start spans ~3M blocks; committing only at the end meant a crash at 99% restarted from zero and held every log in memory. `SyncState` is a separate table rather than `max(Event.blockNumber)` because quiet blocks still count as processed.
+- **Chunk size only ever shrinks.** Providers disagree on the getLogs cap (publicnode 50k, drpc ~10k), so 10k is the default and a rejection halves it for the rest of the run instead of re-failing every chunk.
+- **Only library events move `status`.** `stake.sol` and `rent.sol` route their own status changes through `library.updateUploadStatus()`, which emits `UploadStatusChanged` — so the library is the single authority and stake events are recorded as history rather than interpreted twice.
+- **3 confirmations** behind the head as a reorg buffer. `UploadRegistered` only advances a row still in `pending_stake`, so a replayed log can never drag an approved book backwards.
+
+### ⚠️ Decrypt-params is NOT the security boundary
+`GET /api/rental/decrypt-params/:hash/:address` serves the sealed key envelope + IV + auth tag. It checks `isRentalActive` first, but **`address` is an unauthenticated path parameter** — anyone can name a wallet that holds a valid rental and be served the payload.
+
+That is acceptable *only* because everything served is inert: the key is sealed inside a Lit PKP envelope, released solely by the Lit Action in the TEE, and the IV + auth tag are already public in the Arweave tags. The rental check here is defense in depth. **It would not be acceptable if this route ever returned a usable key.**
+
+Fix when it's worth building: require a signed SIWE-style message over a server-issued nonce and recover the address from the signature instead of reading it from the URL — the same upgrade `auth.middleware.js` needs.
+
+> ⚠️ **Archivists cannot rent their own books.** `Rent.rentBook()` rejects `getUploader(hash) == msg.sender` outright. The uploader is therefore let through this route explicitly (`grantedVia: "uploader"`). **The decryption Lit Action needs the same carve-out**, or an archivist will be permanently unable to open the book they uploaded.
+
+## Phase 6c — On-chain registration *(the backend's only write path)*
+
+**Decision made:** the backend registers uploads. The contracts were deployed expecting it, and an on-chain audit confirmed every other post-deployment step is already wired:
+
+```
+3a stake authorized in library   OK      3f stake authorized in payment  OK
+3c payment set in stake          OK      3g payment set in rent          OK
+3d stake set in payment          OK      4b treasury→payment allowance   OK (500k ALEX)
+3e rent authorized in payment    OK      treasury holds 1,000,000,000 ALEX
+3b BACKEND authorized in library  ← THE ONLY MISSING STEP
+```
+
+- [x] `config/blockchain.js` — optional registrar signer (`getSigner`, `getLibraryWriter`). Only AlexandriaLibrary gets a write handle; no other contract does. Asserts the derived address against `BACKEND_WALLET_ADDRESS` when set.
+- [x] `services/registration.service.js` — `registerOnChain()` + `preflight()`
+- [x] `POST /api/upload/:arweaveHash/register` — retry for uploads stored but never registered
+- [x] `GET /api/upload/registrar/status` — readiness, and exactly who must fix what
+- [x] Upload flow calls it after the index row is written, **non-fatal**
+- [x] **Test:** `chainReads.test.js` grew to 92/92 ✓ (18 new registrar assertions)
+- [x] **Verified live** against the real AlexandriaLibrary: `not_configured` with no key; key/address mismatch refuses to load the signer; an unauthorized key reports `not_authorized` and names the exact `setAuthorizedCaller` call
+
+### Registrar wallet — ✅ LIVE
+```
+Address: 0xccdC69a3020BbaEb5483B2CE20d3fA0c1204b096   (created manually in Rabby)
+State:   authorized ✓ · funded 0.01 ETH ✓ · key in .env ✓
+preflight(): { ready: true }
+```
+
+- [x] **Private key** → `BACKEND_PRIVATE_KEY` in `.env` (untracked, gitignored). Verified to derive exactly `BACKEND_WALLET_ADDRESS`.
+- [x] **Authorization** → `library.setAuthorizedCaller(0xccdC…b096, true)`
+  - tx [`0xf1b74e83…472c9f61`](https://sepolia.basescan.org/tx/0xf1b74e83b89f54d40c71a733ab379af3028ebe19f72879d5509ffdc9472c9f61), block 45866078, 47,792 gas
+  - run via `node scripts/authorize-backend.js --grant` in the `AlexandriaSmartContract` repo (new script; `--revoke` undoes it, no args = read-only status)
+  - **this completes `deployment.md` step 3b** — the last outstanding post-deploy step
+- [x] **Gas** → 0.01 Base Sepolia ETH
+
+**Verified by simulation**, not by writing junk to the permanent registry:
+`registerUpload.staticCall(...)` succeeds → a real call would land. ~308k gas,
+0.0000018 ETH each, so 0.01 ETH covers **~5,400 registrations**. On-chain metadata
+is a 58-byte JSON blob (`{"t":…,"a":…,"c":…}`).
+
+> `registerUpload` has no delete, so every test registration is permanent on-chain.
+> Simulate with `staticCall` rather than registering throwaway hashes.
+
+### ⚠️ Incident: the test suite spent real gas (2026-08-23)
+
+`uploadFlow.test.js` stubbed Postgres, Irys, Lit, and validation — **but not the
+chain**. The moment a real `BACKEND_PRIVATE_KEY` existed, one run of that suite
+signed **6 live transactions** and wrote junk hashes (uploader
+`0x1234…5678`, titles like "On the Origin of Species") into AlexandriaLibrary.
+Permanently: `registerUpload` has no delete. Cost was negligible (~0.00001 ETH,
+testnet) and those hashes will never be staked or rented, but they are there forever.
+
+Two fixes, because one was not enough:
+1. **`config/blockchain.chainWritesBlocked()`** — `getSigner()` returns null when
+   the entrypoint is a `*.test.js` file or under a `tests/` directory, or when
+   `NODE_ENV=test` / `CHAIN_WRITES_ENABLED=false`. The entrypoint check is the
+   important one: a guard that relies on every future test author remembering to
+   set a variable is a guard that eventually fails.
+2. **`uploadFlow.test.js` stubs `services/registration.service`** — a test should
+   not rely on a guard elsewhere to avoid spending money.
+
+Regression-tested both ways: the suite asserts the guard is active, and a full
+run leaves the registrar's nonce unchanged at 6.
+
+> **Rule:** any new test that touches `controller/upload.controller.js` must stub
+> `services/registration.service`, or the guard is the only thing between it and
+> a permanent on-chain write.
+
+Check status any time with `GET /api/upload/registrar/status`.
+
+⚠️ **The grant is slightly broader than "register only."** `onlyAuthorized` also
+covers `blacklistUploader()` and `updateUploadStatus()`. Still no ability to move
+funds, stake, rent, resolve challenges, pause, or transfer ownership. Revoke with
+`node scripts/authorize-backend.js --revoke`.
+
+### Why this is a narrow exception, not an abandoned principle
+The registrar key **can** call `registerUpload`. It **cannot** stake, rent, transfer $ALEX, resolve challenges, or blacklist — those are `onlyOwner` or require `msg.sender` to be the staker/renter. A compromised registrar produces spam registrations, not stolen funds. Keep it that way: never make this address a contract owner or the treasury, and keep it separate from `IRYS_WALLET_KEY`.
+
+The archivist is recorded as `uploader`, so `stake.stake()` — which requires `getUploader(hash) == msg.sender` — still has to be signed by them. Skin in the game is unchanged.
+
+### Failure handling
+Registration runs **after** the Arweave upload and the Postgres row, and never throws. By then the bytes are paid for and permanent, so a chain failure must not turn a successful upload into a 500. Each precondition is preflighted into a named reason, because each needs a different person to act on it:
+
+| reason | who fixes it |
+|---|---|
+| `not_configured` | set `BACKEND_PRIVATE_KEY` |
+| `not_authorized` | contract owner runs `setAuthorizedCaller` |
+| `insufficient_gas` | fund the registrar wallet |
+| `would_revert` | caught by `staticCall` first — no gas spent, no nonce burned |
+| `already_registered` | nothing; a retry after a timed-out-but-landed tx is safe |
+
+---
+
+### 🚨 RESOLVED — the deployed contracts contradicted the documented upload flow
+
+*Kept for the record; resolved by Phase 6c above.*
+
+`CLAUDE.md` said the frontend calls `library.registerUpload(arweaveHash, metadata)` from the archivist's own wallet, and that the backend has no Ethereum key. The deployed contract says otherwise:
+
+```solidity
+function registerUpload(string calldata arweaveHash, address uploader, string calldata metadata)
+    external onlyAuthorized whenNotPaused    // ← owner or setAuthorizedCaller() only
+```
+
+Three mismatches, in order of severity:
+1. **`onlyAuthorized`.** An ordinary archivist calling this reverts with `"Not authorized"`. Only the owner, or an address the owner explicitly authorized, can register. `deployment.md` step 3b agrees with the contract and not with CLAUDE.md: *"Authorize your backend to register uploads."*
+2. **Three parameters, not two** — `uploader` is passed explicitly, which is exactly what a backend registering *on behalf of* an archivist would need.
+3. `stake.stake()` then requires `getUploader(hash) == msg.sender`, so whoever is recorded as `uploader` must be the one who stakes. That part is consistent either way.
+
+So the contract as deployed was written for a backend that registers uploads.
+
+**Resolved as option (a): give the backend a narrowly-scoped registrar wallet.** See Phase 6c above. The alternatives considered were (b) change the contract to allow `msg.sender == uploader` and redeploy, and (c) a relayer / meta-transaction scheme — both rejected as more work for a PoC than the blast radius of a key that can only call `registerUpload` justifies.
+
+### Corrections applied to CLAUDE.md
+The event and function names in CLAUDE.md were aspirational; these are what is actually deployed:
+
+| CLAUDE.md said | Actually deployed |
+|---|---|
+| `StakeDeposited` | `Staked(string,address,uint256)` |
+| `StakeReleased` | `Unstaked(string,address,uint256)` |
+| `StakeSlashed` | `slashed(string,address,uint256)` — lower-case |
+| `UploadChallenged` | `challengeInitiated(string,address,string)` — lower-case |
+| `BookRented(hash, renter, expiryTime)` | `BookRented(string,address,uint256,uint256)` — also carries `duration` |
+| `stake.stakeForUpload(hash, amount)` | `stake.stake(hash, amount)` |
+| `library.registerUpload(hash, metadata)` | `registerUpload(hash, uploader, metadata)`, `onlyAuthorized` |
+
+A renamed event is not a cosmetic problem: `registry()` throws at startup if a watched name is missing from the ABI, precisely so a listener can never quietly stop tracking challenges while looking healthy.
 
 ## Cross-cutting
 - [ ] Jest set up; replace placeholder `test` script
 - [ ] Rejection logging (reason, uploader, timestamp) for abuse detection
 - [ ] Lint config (optional)
-- [ ] Contract ABIs + deployed addresses imported from `AlexandriaSmartContract`
+- [x] Contract ABIs + deployed addresses imported from `AlexandriaSmartContract` — `node scripts/sync-abis.js`, output committed to `abis/`
 - [ ] Irys wallet balance monitoring / low-balance alert
 
 ---

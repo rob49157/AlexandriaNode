@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository contains the **Node.js backend gateway** for Alexandria, a decentralized, censorship-resistant Web3 library designed to preserve human knowledge permanently on Arweave.
 
-The backend is the orchestration layer — it sits between the frontend, AI validation service, and decentralized storage. It never stores unencrypted content, never holds user funds, and never writes to the blockchain. All on-chain transactions (staking, registration, rentals) are signed by users directly from the frontend.
+The backend is the orchestration layer — it sits between the frontend, AI validation service, and decentralized storage. It never stores unencrypted content and never holds user funds.
+
+⚠️ **It does make exactly one kind of on-chain write: `library.registerUpload()`.** That is not a design preference — the deployed `AlexandriaLibrary.registerUpload()` is `onlyAuthorized` and takes an explicit `uploader` address, so an archivist calling it from their own wallet reverts with `"Not authorized"`. The contracts were built for a backend registrar (`deployment.md` step 3b). Everything that moves value — staking, renting, payments — is still signed by the user's own wallet, and the registrar key cannot do any of it. See **Registrar wallet** below for the exact blast radius.
 
 ### Alexandria System Architecture (Full Stack)
 - **Frontend:** React + Vite (user dashboard, in-browser PDF decryption) — `AlexandriaFrontEnd` repo
@@ -50,58 +52,158 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 12. Backend discards symmetric key and unencrypted PDF from memory
 13. Backend returns { arweaveHash, litEncryptedKeyId } to frontend
 
-=== FRONTEND (on-chain transactions, signed by archivist's wallet) ===
-14. Frontend calls token.approve(stakeContractAddress, stakeAmount)
-15. Frontend calls stake.stakeForUpload(arweaveHash, stakeAmount)
-16. Frontend calls library.registerUpload(arweaveHash, metadata)
-17. Backend event listener picks up on-chain events → updates Postgres status to "pending"
+13. Backend calls library.registerUpload(arweaveHash, archivistAddress, metadata)
+    → signed by the registrar wallet, because this function is onlyAuthorized
+    → the ARCHIVIST is recorded as `uploader`, not the backend
+    → non-fatal: on failure the row stays "pending_stake" and is retryable via
+      POST /api/upload/:arweaveHash/register
+14. Backend returns { arweaveHash, litEncryptedKeyId, registration } to frontend
+
+=== FRONTEND (value-moving transactions, signed by archivist's wallet) ===
+15. Frontend calls token.approve(stakeContractAddress, stakeAmount)
+16. Frontend calls stake.stake(arweaveHash, stakeAmount)
+    → requires getUploader(arweaveHash) == msg.sender, which step 13 satisfied
+17. Backend event listener picks up on-chain events → updates Postgres status
 ```
 
 ### Why This Split?
-- **Backend has no wallet** — no private key to compromise, no funds to drain
-- **Archivist stakes their own $ALEX** — they have real skin in the game
-- **Decentralized** — on-chain actions are always user-signed, not server-signed
-- **Orphan risk is minimal** — if archivist closes browser after step 13 but before step 16, the encrypted file sits on Arweave unregistered. No money lost, no state corruption. Archivist can retry staking later with the arweaveHash.
+- **Archivist stakes their own $ALEX** — they have real skin in the game, and
+  `stake.stake()` enforces it: only the recorded uploader can stake
+- **The registrar key moves no value** — it can call `registerUpload` and nothing
+  else. It cannot stake, rent, transfer $ALEX, resolve challenges, or blacklist.
+  A compromise means spam registrations, not stolen funds.
+- **Orphan risk is minimal** — if registration fails, the encrypted file sits on
+  Arweave unregistered at status "pending_stake". No money lost, no state
+  corruption; retry with the arweaveHash.
 
-### Smart Contract Functions (Called by Frontend, NOT Backend)
+### Registrar wallet
 ```
-// From token.sol — archivist approves staking contract to spend tokens
+Address:  0xccdC69a3020BbaEb5483B2CE20d3fA0c1204b096   (BACKEND_WALLET_ADDRESS)
+Key:      BACKEND_PRIVATE_KEY — blank keeps the backend fully read-only
+Readiness: GET /api/upload/registrar/status
+```
+Requires two one-time setup steps, both outside this repo:
+1. Owner (`0x5F47ecD28155790f1271df965373fD9aCEA643b9`) runs
+   `library.setAuthorizedCaller("0xccdC…b096", true)` — this is `deployment.md`
+   step 3b, the only post-deploy step still outstanding
+2. Fund the address with Base Sepolia ETH for gas
+
+If `BACKEND_WALLET_ADDRESS` is set, the derived address of `BACKEND_PRIVATE_KEY`
+must match it or the signer refuses to load — a wrong key otherwise produces a
+perfectly valid wallet that simply is not authorized, and every registration
+reverts with `"Not authorized"`, which looks identical to a missing step 1.
+
+### Deployed Contracts (Base Sepolia, chain 84532)
+
+ABIs, addresses, and deployment blocks are committed in `abis/*.json`, generated by
+`node scripts/sync-abis.js` from the AlexandriaSmartContract Ignition deployment.
+Re-run it after any redeploy and **review the diff** — a changed address or event
+signature means the event listener needs a second look before it is trusted.
+
+```
+AlexandriaLibrary  0x0b26AB8C632586E846DE87D29D665fd727bBe844   block 42758328
+AlexandriaToken    0x99C8Ab3c870AAcD75185Ee2B0c96C0Cfe85Fd605   block 42758328
+AlexandriaPayment  0xa5118F666C9A3F6FF1a8342Cd2FfC84134c8b1f8   block 42758333
+AlexandriaRent     0xe50AD653Ee690c818900091a4d69F22e484bD2cD   block 42758334
+AlexandriaStake    0xe3027D298450695d9c4eD9A071D34e2921fc567C   block 42758660
+```
+
+### Smart Contract Write Functions (signed by the user's wallet, NOT the backend)
+```solidity
+// token.sol — archivist approves the staking contract to spend tokens
 token.approve(stakeContractAddress, amount)
 
-// From stake.sol — archivist locks tokens for 14-day validation
-stake.stakeForUpload(arweaveHash, amount)
+// stake.sol — archivist locks tokens for the 14-day challenge window
+stake.stake(string arweaveHash, uint256 amount)        // NOT stakeForUpload
+                                                        // requires getUploader(hash) == msg.sender
 
-// From library.sol — archivist registers upload metadata on-chain
-library.registerUpload(arweaveHash, metadata)
+// library.sol — registers upload metadata on-chain
+library.registerUpload(string arweaveHash, address uploader, string metadata)
+// ⚠️ onlyAuthorized — an ordinary archivist calling this reverts "Not authorized".
+// See "Unresolved: who calls registerUpload" below. This is a live conflict with
+// the split-flow design described above; do not assume the frontend can call it.
 
-// From Rent.sol — reader rents a book (pays $ALEX)
-rent.rentBook(arweaveHash, duration)
+// Rent.sol — reader rents a book (pays $ALEX; duration must be 1, 7, or 30 days)
+rent.rentBook(string arweaveHash, uint256 duration)
+// ⚠️ reverts if getUploader(hash) == msg.sender — archivists cannot rent their own books
 ```
 
-### Smart Contract Read Functions (Backend queries for status endpoints)
+### Smart Contract Read Functions (backend queries — `services/blockchain.service.js`)
+```solidity
+library.getUpload(arweaveHash)         // ⚠️ REVERTS "Upload not found" if unregistered
+library.getUploadStatus(arweaveHash)   // ⚠️ same revert; enum Pending|Challenged|Approved|Rejected
+library.getUploaderHashes(uploader)    // every hash an address registered — no revert
+stake.getStakeStatus(arweaveHash)      // returns a ZEROED struct if unstaked — no revert
+stake.challenges(arweaveHash)          // challenger, timestamp, resolved, reason
+rent.isRentalActive(arweaveHash, renter)  // ⚠️ `view whenNotPaused` — REVERTS while paused
+rent.rentals(arweaveHash, renter)      // raw expiry timestamp; answers even while paused
 ```
-// From library.sol — query upload status
-library.getUpload(arweaveHash)
 
-// From stake.sol — query stake status
-stake.getStakeStatus(arweaveHash)
-
-// From Rent.sol — query rental status
-rent.isRentalActive(arweaveHash, renterAddress)
-```
+Three behaviours the service layer absorbs so routes never see them:
+- **Missing rows revert rather than returning empty.** "Never registered" arrives as a
+  `CALL_EXCEPTION` and must become a 404 — never confused with the RPC being down,
+  which is a 503. A transient outage reported as "not registered" is a lie that sounds
+  permanent.
+- **`isRentalActive` reverts while the Rent contract is paused.** Reported as
+  `active: false, available: false` + 503, so callers fail closed but can tell "denied"
+  from "cannot currently tell" and never cache a pause as a settled no.
+- **`getStakeStatus` does the opposite** — a zeroed struct, not a revert.
 
 ### Smart Contract Events the Backend Listens To
+Real signatures as deployed. Several differ from earlier drafts of this file
+(`StakeDeposited`, `StakeReleased`, `StakeSlashed`, `UploadChallenged` never existed),
+and two are lower-case. `services/eventListener.service.js` throws at startup if a
+watched name is missing from the ABI, so a rename fails loudly instead of silently
+indexing nothing.
+
+```solidity
+// library.sol
+UploadRegistered(string indexed arweaveHash, address indexed uploader, string metadata)
+UploadStatusChanged(string indexed arweaveHash, UploadStatus oldStatus, UploadStatus newStatus)
+AddressBlacklisted(address indexed uploader)
+
+// stake.sol
+Staked(string indexed arweaveHash, address indexed staker, uint256 amount)
+Unstaked(string indexed arweaveHash, address indexed staker, uint256 amount)
+slashed(string indexed arweaveHash, address indexed staker, uint256 amount)         // lower-case
+challengeInitiated(string indexed arweaveHash, address indexed challenger, string reason)  // lower-case
+ChallengeResolved(string indexed arweaveHash, bool approved)
+LibrarianStaked / LibrarianUnstaked / LibrarianSlashed (address-scoped)
+
+// Rent.sol
+BookRented(string indexed arweaveHash, address indexed renter, uint256 expiry, uint256 duration)
+BookPriceSet(string indexed arweaveHash, uint256 price)
+BookDelisted(string indexed arweaveHash)
 ```
-// Sync these to Postgres for frontend queries
-UploadRegistered(arweaveHash, uploader, timestamp)
-UploadStatusChanged(arweaveHash, newStatus)
-StakeDeposited(arweaveHash, staker, amount)
-StakeReleased(arweaveHash, staker, amount)
-StakeSlashed(arweaveHash, staker, amount)
-BookRented(arweaveHash, renter, expiryTime)
-UploadChallenged(arweaveHash, challenger, reason)
-ChallengeResolved(arweaveHash, approved)
-```
+
+#### ⚠️ `string indexed arweaveHash` — the hash is NOT in the log
+A log topic is a fixed 32 bytes, so Solidity stores **keccak256(utf8(arweaveHash)) and
+discards the plaintext**. ethers surfaces it as an `Indexed` placeholder, not a string,
+and keccak256 cannot be reversed. Reading `event.args.arweaveHash` gets an object that
+matches nothing — a listener written that way indexes zero books while looking healthy.
+
+Resolution runs **forwards**: hash what we already know and match the digest.
+1. `Upload.arweaveHashTopic` — indexed column written at upload time (one query per batch).
+2. `library.getUploaderHashes(uploader)` — `uploader` is an indexed *address*, so it stays
+   readable off the log; covers books registered outside this backend.
+
+`Upload.arweaveHashTopic` must be written on every insert. Omit it and the row is
+permanently invisible to status sync, silently — the same failure mode as the SimHash
+band columns.
+
+#### RESOLVED: the backend calls `registerUpload`
+`registerUpload` is `onlyAuthorized` and takes an explicit `uploader`, so it was written
+for a backend registrar and `deployment.md` step 3b agrees. Settled that way:
+`services/registration.service.js` signs it with the registrar wallet, recording the
+**archivist** as `uploader` so `stake.stake()` still has to be signed by them.
+
+Registration is opt-in (`BACKEND_PRIVATE_KEY`) and never fatal — by the time it runs the
+Arweave bytes are paid for and permanent, so a chain failure leaves the row at
+`pending_stake` with a named reason rather than failing the upload. Every precondition
+is preflighted into a specific reason, because each needs a different person to act:
+`not_configured` (missing key), `not_authorized` (owner must run `setAuthorizedCaller`),
+`insufficient_gas` (fund the wallet), `would_revert` (simulated first, so no gas or
+nonce is burned on a doomed send).
 
 ### Lit Protocol Encryption (Chipotle v3)
 The backend uses **two-layer envelope encryption** via the Lit Chipotle v3 REST API:
@@ -179,55 +281,69 @@ npm test
 npm run lint
 ```
 
-## Project Structure (Planned)
+## Project Structure (actual)
+
+Note: the directory is `controller/` (singular), and encryption/Arweave live there
+rather than in `services/`.
 
 ```
 AlexNode/
-├── index.js                    # Express app entry point, server startup
+├── index.js                    # Express app entry point, server startup, listener lifecycle
 ├── package.json
 ├── .env.example                # Template for required environment variables
 │
+├── abis/                       # Committed ABIs + addresses + deployment blocks
+│   └── {library,stake,rent,token,payment}.json
+│
+├── scripts/
+│   └── sync-abis.js            # Regenerate abis/ from the AlexandriaSmartContract deployment
+│
 ├── config/
 │   ├── db.js                   # Prisma client singleton (Postgres connection)
-│   ├── blockchain.js           # Ethers.js provider + read-only contract instances (no signer)
+│   ├── blockchain.js           # Ethers provider + read-only contract instances (NO signer)
 │   ├── irys.js                 # Irys client configuration
 │   └── lit.js                  # Lit Chipotle v3 REST API client (stateless, no SDK)
 │
 ├── routes/
 │   ├── upload.routes.js        # POST /upload, GET /upload/:hash
-│   ├── search.routes.js        # GET /search?query=...
-│   ├── rental.routes.js        # GET /rental/status/:hash/:address
-│   └── stake.routes.js         # GET /stake/status/:hash
+│   ├── search.routes.js        # GET /search?q=...
+│   ├── rental.routes.js        # GET /rental/status, /rental/book, /rental/decrypt-params
+│   ├── stake.routes.js         # GET /stake/status/:hash
+│   └── chain.routes.js         # GET /chain/status (event listener health)
 │
-├── controllers/
-│   ├── upload.controller.js    # Upload orchestration logic
+├── controller/                 # singular
+│   ├── upload.controller.js    # Upload orchestration + public read projection
 │   ├── search.controller.js    # Postgres search queries
-│   ├── rental.controller.js    # Rental status queries
-│   └── stake.controller.js     # Stake status queries
+│   ├── rental.controller.js    # Rental status + rental-gated decrypt params
+│   ├── stake.controller.js     # Stake status queries
+│   ├── chain.controller.js     # Listener health
+│   ├── arweave.js              # Irys prepare/commit, tags, hash validation
+│   └── litProtocol.js          # AES-256-GCM + Lit PKP key sealing
 │
 ├── services/
-│   ├── encryption.service.js   # AES-256-GCM encrypt/decrypt, key generation
-│   ├── arweave.service.js      # Irys upload, Arweave fetch
-│   ├── lit.service.js          # Lit Chipotle v3 PKP encryption of symmetric keys via REST API
-│   ├── blockchain.service.js   # Read-only smart contract queries (status checks)
-│   ├── validation.service.js   # ClamAV scanning, SHA-256/SimHash dedup, calls AI service for content analysis
-│   └── eventListener.service.js # Listens to on-chain events, syncs to Postgres via Prisma
+│   ├── blockchain.service.js   # Read-only contract queries + revert translation
+│   ├── eventListener.service.js # Watches on-chain events, syncs to Postgres via Prisma
+│   ├── validation.service.js   # Layer 1 + Layer 5 validation pipeline
+│   ├── securityScan.service.js # Layer 2 structural PDF scan + ClamAV
+│   ├── dedup.service.js        # Layer 3 SHA-256 + banded-LSH near-dup lookup
+│   └── simhash.service.js      # 64-bit SimHash fingerprinting
 │
 ├── prisma/
-│   ├── schema.prisma           # Prisma models: Upload, Event (source of truth for DB shape)
+│   ├── schema.prisma           # Upload, Event, SyncState (source of truth for DB shape)
 │   └── migrations/             # Generated SQL migrations
 │
 ├── middleware/
-│   ├── auth.middleware.js       # Wallet address validation (format check, not signature verification)
-│   ├── upload.middleware.js     # Multer config, file size/type validation
+│   ├── auth.middleware.js      # Wallet address format + EIP-55 checksum (not signature auth)
+│   ├── upload.middleware.js    # Multer config, file size/type validation
 │   └── error.middleware.js     # Global error handler
 │
-└── tests/
-    ├── upload.test.js
-    ├── validation.test.js          # File validation pipeline tests
-    ├── encryption.test.js
-    ├── blockchain.test.js
-    └── search.test.js
+└── tests/                      # Plain `node tests/<name>.test.js` — no runner yet
+    ├── uploadFlow.test.js      # Full upload pipeline, mocked Irys/Lit/Postgres
+    ├── securityAndDedup.test.js # Layer 2 + Layer 3
+    ├── readPaths.test.js       # GET /upload/:hash + /search
+    ├── chainReads.test.js      # On-chain reads + event listener
+    ├── encryption.manual.js    # Hits the live Lit API — run manually
+    └── keyBinding.demo.js      # Runnable exploit demo for KEY-BINDING.md
 ```
 
 ## Environment Variables
@@ -240,13 +356,25 @@ NODE_ENV=development
 # Database (Postgres via Prisma — Neon in this project)
 DATABASE_URL=postgresql://user:password@host/alexandria
 
-# Blockchain (Base Testnet / Sepolia) — read-only, for event listening and status queries
-BASE_TESTNET_RPC_URL=https://sepolia.base.org
+# Blockchain (Base Sepolia, chain 84532) — read-only, event listening + status queries
+# Comma-separated for automatic failover. sepolia.base.org intermittently returns
+# "no backend is currently healthy", so publicnode is tried first.
+BASE_TESTNET_RPC_URL=https://base-sepolia-rpc.publicnode.com,https://sepolia.base.org
+
+# Leave BLANK to use the deployed addresses committed in abis/*.json. Set one only
+# to repoint a single redeployed contract — a mismatch with abis/ is logged loudly.
 TOKEN_CONTRACT_ADDRESS=
 LIBRARY_CONTRACT_ADDRESS=
 STAKE_CONTRACT_ADDRESS=
 RENT_CONTRACT_ADDRESS=
 PAYMENT_CONTRACT_ADDRESS=
+
+# Event listener
+EVENT_LISTENER_ENABLED=true         # false = run the API without chain syncing
+CHAIN_POLL_INTERVAL_MS=12000
+CHAIN_CONFIRMATIONS=3               # reorg buffer
+CHAIN_LOG_CHUNK=10000               # getLogs span; publicnode caps at 50k, drpc ~10k
+# CHAIN_START_BLOCK=                # defaults to the earliest deployment block in abis/
 
 # Arweave / Irys
 IRYS_NODE_URL=https://node2.irys.xyz
@@ -286,18 +414,52 @@ GET /api/search?q=<query>&category=<cat>&page=<n>
   - Returns: Paginated list of approved uploads matching query
 ```
 
-### Rental Status
+### Rental (live on-chain reads — `controller/rental.controller.js`)
 ```
 GET /api/rental/status/:arweaveHash/:address
-  - Checks on-chain rental status
-  - Returns: { active: bool, expiryTime: timestamp }
+  - Live rental permission from Rent.sol. Never cached — a rental expires on a
+    wall-clock timestamp, so a cached "active" is a cached authorization.
+  - Returns: { active, expiry, expiryUnix, blacklisted, available, reason, book }
+  - 503 with active:false when the Rent contract is paused (fail closed, but the
+    caller can tell "denied" from "cannot currently tell")
+
+GET /api/rental/book/:arweaveHash
+  - Returns: { registered, onChainStatus, uploader, rentable, pricePerDay, delisted }
+
+GET /api/rental/decrypt-params/:arweaveHash/:address
+  - Rental-gated. Returns: { litEncryptedKeyId, litDataToEncryptHash,
+    encryptionIv, encryptionAuthTag, grantedVia: "rental"|"uploader" }
+  - ⚠️ NOT the security boundary. `address` is unauthenticated, so anyone can name
+    a wallet holding a valid rental. Acceptable only because everything served is
+    inert: the key is sealed in a Lit PKP envelope released solely by the Lit
+    Action in the TEE, and the IV + auth tag are already public in the Arweave
+    tags. This check is defense in depth. If this route ever returns a usable
+    key, it must first require a signed SIWE-style message.
+  - ⚠️ The uploader is allowed through without a rental, because Rent.rentBook()
+    forbids archivists from renting their own books. The decryption Lit Action
+    needs the same carve-out or archivists cannot open their own uploads.
 ```
 
 ### Stake Status
 ```
 GET /api/stake/status/:arweaveHash
-  - Checks on-chain stake status
-  - Returns: { status: "pending"|"challenged"|"approved"|"rejected", stakeAmount, stakeTime }
+  - On-chain stake + challenge state, joined against the Postgres index
+  - Returns: { status, registered, staked, stakeActive, stakeAmount,
+    stakeAmountAlex, stakeTime, challengePeriodEnds, challengePeriodOver,
+    challenge, index: { status, inSync } }
+  - `status` comes from AlexandriaLibrary (the authority stake.sol and rent.sol
+    both read). "pending_stake" exists only off-chain: bytes are on Arweave but
+    registerUpload() has not been called. `index.inSync: false` means the event
+    listener has not caught up — expected briefly, a bug if persistent.
+```
+
+### Chain / listener health
+```
+GET /api/chain/status
+  - Returns: { chainId, running, startBlock, lastProcessedBlock, headBlock,
+    confirmations, blocksBehind, caughtUp, storedEvents, lastError, contracts }
+  - 503 when the listener is stopped or its last sync failed. Without this,
+    "the listener died four hours ago" and "nobody staked today" look identical.
 ```
 
 ## Upload Validation Pipeline
@@ -492,7 +654,10 @@ await commitUpload(tx, arweaveHash);
 ### Security Rules
 - Symmetric keys exist in memory only during the upload transaction
 - No unencrypted PDFs written to disk at any point
-- Backend has no Ethereum wallet — it never signs on-chain transactions (staking, registration, rentals)
+- Backend holds exactly two keys, both low-privilege and separate:
+  `IRYS_WALLET_KEY` (pays for Arweave bytes only) and `BACKEND_PRIVATE_KEY`
+  (calls `library.registerUpload()` only). Neither can move $ALEX or stake.
+  Do not merge them into one wallet, and never give either contract ownership.
 - Backend does have an Irys wallet key (`IRYS_WALLET_KEY`) solely for paying Arweave storage fees
 - Upload requests include wallet address as metadata (not cryptographic auth — on-chain staking is the real proof of ownership)
 - File uploads validated for size, type, and content before processing
@@ -529,18 +694,43 @@ model Upload {
 }
 ```
 
+The live schema has drifted from the sketch above — `prisma/schema.prisma` is the
+source of truth. Notably `Upload` also carries `arweaveHashTopic` (keccak256 of the
+hash; the only join key from a log topic back to a row — see the indexed-string note
+above), `pageCount`, `litDataToEncryptHash`, `encryptionIv`, `encryptionAuthTag`,
+`isNearDuplicate` / `nearDuplicateOf`, and `simHashBand0..3`.
+
 ### Event model (synced blockchain events)
 ```prisma
 model Event {
-  id              Int      @id @default(autoincrement())
-  eventName       String   // e.g., "BookRented", "StakeDeposited"
-  arweaveHash     String
-  args            Json     // Event arguments as JSON
-  blockNumber     Int
-  transactionHash String
-  timestamp       DateTime
+  id               Int      @id @default(autoincrement())
+  eventName        String   // "UploadRegistered", "Staked", "BookRented", ...
+  contract         String   // "library" | "stake" | "rent"
+  arweaveHash      String?  // null when the topic could not be resolved to a known book
+  arweaveHashTopic String?  // keccak256 topic exactly as emitted
+  args             Json
+  blockNumber      Int
+  logIndex         Int
+  transactionHash  String
+  timestamp        DateTime
+
+  // Idempotency: a restarted listener re-scans an overlapping range on purpose,
+  // and a reorg can re-deliver logs. Replay upserts instead of duplicating.
+  @@unique([transactionHash, logIndex])
 }
 ```
+
+### SyncState model (listener cursor)
+```prisma
+model SyncState {
+  id                 String   @id // "chain-84532"
+  lastProcessedBlock Int
+  updatedAt          DateTime @updatedAt
+}
+```
+A separate table rather than `max(Event.blockNumber)` because quiet blocks still count
+as processed — deriving the cursor from the last stored event would re-scan every
+eventless block on every restart.
 
 ## Testing Approach
 
@@ -559,7 +749,9 @@ model Event {
 - Generates and encrypts symmetric keys (then discards them)
 
 ### What the Backend Does NOT Do
-- **Write to the blockchain** — no Ethereum wallet, no on-chain transactions (staking, registration, rentals are all frontend)
+- **Move value on-chain** — it holds a registrar key that can call
+  `library.registerUpload()` and nothing else. Staking, renting, payments, challenge
+  resolution, and blacklisting are all either user-signed or `onlyOwner`.
 - Store unencrypted PDFs or symmetric keys
 - Handle staking, registration, or rental payments (all done by frontend/user wallet)
 - Make access control decisions (Lit Protocol reads Rent.sol directly)
