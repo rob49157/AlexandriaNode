@@ -649,7 +649,22 @@ await commitUpload(tx, arweaveHash);
 
 **Order matters.** Sealing before pushing means a Lit failure costs nothing. Reversed, it would leave permanently paid-for bytes that nobody can ever decrypt.
 
-⚠️ **Arweave id encoding:** `@irys/bundles` exposes `DataItem.id` as **base58** (44 chars), but gateways, upload receipts, and on-chain consumers all use **base64url** (43 chars) — and its own getter/setter disagree (`get id` encodes base58, `set id` decodes base64url). Always derive the hash as base64url of `tx.rawId`; `controller/arweave.js` does this via `transactionId()`.
+⚠️ **Arweave id encoding.** A transaction id is **32 raw bytes** (`sha256` of the data item's signature). Everything else is a rendering of those bytes, and the two renderings in play look interchangeable but never compare equal as strings:
+
+| Encoding | Length | Alphabet | Where it appears |
+|---|---|---|---|
+| **base64url** | 43 | `A–Z a–z 0–9 - _` | gateways, Arweave tags, on-chain consumers, our DB — **the canonical form** |
+| **base58** | 44 | `A–Z a–z 0–9` minus `0 O I l`, no `-` or `_` | `DataItem.id` getter, **and Irys upload receipts** |
+
+`@irys/bundles` disagrees with itself: `get id` encodes base58 while `set id` decodes base64url.
+
+**Two rules, and the second one was learned the hard way:**
+1. Always *derive* the hash as base64url of `tx.rawId` — never read `tx.id`. `controller/arweave.js` does this via `transactionId()`.
+2. Never *compare* two ids as strings. `commitUpload` compared the base58 receipt id against our base64url hash and threw on every upload ever attempted — including correct ones. Use `sameTransactionId()`, which compares the decoded 32 bytes.
+
+> An earlier version of this file claimed upload receipts were base64url. They are not. That wrong belief was copied into the test fake, so the mock asserted the assumption instead of testing reality, and the bug survived every suite until a live upload.
+
+📄 **Full explainer: [`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md)** — what Arweave and Irys each are and how they relate, where the `arweaveHash` actually comes from (`sha256` of the data item signature, derived offline before any spend), why that determinism is what makes the key binding possible, which surface speaks which encoding, and why devnet never reaches Arweave.
 
 ### Security Rules
 - Symmetric keys exist in memory only during the upload transaction

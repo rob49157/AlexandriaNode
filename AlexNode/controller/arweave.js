@@ -49,6 +49,66 @@ function transactionId(tx) {
   return toBase64Url(tx.rawId);
 }
 
+// Bitcoin-style base58 alphabet, which is what @irys/bundles uses for its `id`
+// getter. Note the omitted characters: 0, O, I, l.
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/**
+ * Decode a 32-byte transaction id from EITHER encoding it might arrive in.
+ *
+ * This exists because the two encodings are indistinguishable at a glance and
+ * comparing them as strings silently always fails. An upload receipt comes back
+ * base58 (44 chars) while every gateway, tag, and on-chain consumer uses
+ * base64url (43) — and `@irys/bundles` disagrees with itself, since `get id`
+ * encodes base58 while `set id` decodes base64url.
+ *
+ * Comparing the decoded 32 bytes is the only comparison that is actually about
+ * identity rather than formatting.
+ *
+ * @param {string} id
+ * @returns {Buffer|null} 32 raw bytes, or null if this is not a valid id
+ */
+function decodeTransactionId(id) {
+  if (typeof id !== 'string' || id.length === 0) return null;
+
+  // base64url — 43 chars of the URL-safe alphabet.
+  if (/^[A-Za-z0-9_-]{43}$/.test(id)) {
+    const buf = Buffer.from(id.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    return buf.length === 32 ? buf : null;
+  }
+
+  // base58 — typically 43-44 chars, and its alphabet excludes -/_ entirely.
+  if (/^[1-9A-HJ-NP-Za-km-z]{43,44}$/.test(id)) {
+    let num = 0n;
+    for (const ch of id) {
+      const index = BASE58_ALPHABET.indexOf(ch);
+      if (index === -1) return null;
+      num = num * 58n + BigInt(index);
+    }
+    const out = Buffer.alloc(32);
+    for (let i = 31; i >= 0 && num > 0n; i--) {
+      out[i] = Number(num & 0xffn);
+      num >>= 8n;
+    }
+    // Anything left over did not fit in 32 bytes, so it was never a tx id.
+    return num === 0n ? out : null;
+  }
+
+  return null;
+}
+
+/**
+ * Do two transaction ids refer to the same data item, whatever their encoding?
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function sameTransactionId(a, b) {
+  const da = decodeTransactionId(a);
+  const db = decodeTransactionId(b);
+  return Boolean(da && db && da.equals(db));
+}
+
 // A transaction ID is 32 bytes rendered as unpadded base64url — always exactly
 // 43 characters. Read paths check this before touching the database so that
 // junk in a URL path is a cheap 400 rather than a query.
@@ -137,8 +197,14 @@ async function commitUpload(tx, expectedHash) {
   // The node echoes back the id it stored under. If it ever disagrees with what
   // we derived and sealed, the key envelope is bound to the wrong book and the
   // upload is unrecoverable — fail loudly rather than persist a broken row.
+  //
+  // Compare DECODED BYTES, never the strings. The receipt arrives base58 (44
+  // chars) while expectedHash is base64url (43), so a string comparison rejects
+  // every upload ever made — including correct ones. That is not hypothetical:
+  // it blocked the first real end-to-end run, and no mocked test caught it,
+  // because a fake Irys hands back whatever id the test told it to.
   if (receipt && receipt.id) {
-    if (receipt.id !== expectedHash) {
+    if (!sameTransactionId(receipt.id, expectedHash)) {
       throw new Error(
         `Irys returned id ${receipt.id} but the sealed envelope is bound to ${expectedHash}. ` +
           'Refusing to persist — the encrypted key would not match the stored file.'
@@ -183,4 +249,6 @@ module.exports = {
   transactionId,
   toBase64Url,
   isValidArweaveHash,
+  decodeTransactionId,
+  sameTransactionId,
 };

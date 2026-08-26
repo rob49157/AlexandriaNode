@@ -70,16 +70,31 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 
 ## Phase 5 — External integrations *(need infra/keys)*
 - [x] `config/irys.js` — Irys client via `@irys/upload` + `@irys/upload-ethereum` (`@irys/sdk` is deprecated/EOL). Memoized async builder, devnet by default, `getBalance()`/`getPrice()` helpers.
+  - ⚠️ **`IRYS_TOKEN` must match the chain `IRYS_RPC_URL` points at.** Irys treats `base-eth` and `ethereum` as separate tokens with separate ledgers, but they share a deposit address — so a mismatch fails in the worst possible way. Configured as `Ethereum` while pointing at Base Sepolia, `fund()` sent 0.005 ETH to Irys **on Base Sepolia**, Irys looked for that tx **on Ethereum Sepolia**, and rejected it with `400 Tx doesn't exist`. Transfer mined, irreversible, credit never issued.
+  - Recovered **only** because the deposit address is shared, so resubmitting the same tx hash under `base-eth` found it. Do not rely on that. Now defaults to `base-eth` with a validated allowlist.
+  - ⚠️ `IRYS_WALLET_KEY` is validated before use: an **address** pasted where the key goes (42 chars vs 66) is rejected by name, and `IRYS_WALLET_ADDRESS` — when set — is asserted against the derived address, so the wrong Rabby account fails at startup instead of as a confusing balance error on the first upload.
 - [x] `controller/arweave.js` — `prepareUpload` (sign locally → `arweaveHash`), `commitUpload` (push + receipt-id assertion), `fetchEncrypted`, `buildTags`
   - ⚠️ First point where file size costs real treasury money (permanent, prepaid, no delete). AES-GCM ciphertext ≈ plaintext size, so the `MAX_FILE_SIZE_MB` cap is a direct spending cap — see *Revisit at the End*.
-  - **On devnet for now** (`IRYS_NETWORK=devnet`) — free testnet tokens, ~60-day retention. Flip to `mainnet` only once the flow is proven.
+  - **On devnet for now** (`IRYS_NETWORK=devnet`) — free testnet tokens, ~60-day retention, and **devnet never reaches Arweave**. Flip to `mainnet` only once the flow is proven.
+  - ⚠️ **Before flipping to mainnet**, re-check the storage provider. Irys has launched its own L1 datachain and **deprecated the Arweave bundlers we use** — still operating, but "no longer actively supported." Decision (2026-08-25) is to stay on Arweave: permanence is Alexandria's product, Arweave is a multi-miner protocol rather than one company's chain, and if Irys vanishes we lose an on-ramp rather than the books. Mainnet is the point of no return, so confirm the bundlers still run and price **ArDrive Turbo** as the fallback. Data items are ANS-104 and ids are `sha256(signature)`, so swapping bundlers is a `config/irys.js` change that touches no stored data. Full reasoning + sources: **[`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md)**.
   - ⚠️ **Irys id encoding trap:** `@irys/bundles` exposes `DataItem.id` as base58 (44 chars); gateways and receipts use base64url (43). Its own getter/setter disagree (`get id` → base58, `set id` → base64url). `transactionId()` derives base64url from `tx.rawId`; never use `tx.id`.
 - [x] Resolve `arweaveHash`-before-encrypt ordering (see Open Question) — **resolved**, see below
 - [x] Persist full `Upload` row to Postgres (`status: "pending_stake"`) — spreads `result.simHashBands` into the Prisma `create` payload alongside `simHash`
 - [x] Discard raw PDF from memory (`req.file.buffer.fill(0)` right after AES); return `{ arweaveHash, litEncryptedKeyId }`
 - [x] **Test:** `uploadFlow.test.js` — 36/36 passed ✓ (happy path, band columns, AES roundtrip via the sealed envelope, hash binding, base64url encoding, Lit/Irys/Postgres failure paths, orphan logging, 409 dedup with zero spend, near-dup flag)
 - [x] **Regressions:** `encryption.manual.js` PASS ✓ against the live Lit API · `securityAndDedup.test.js` 39/39 ✓
-- [ ] **Live devnet smoke test — BLOCKED:** needs `IRYS_WALLET_KEY`. Create a devnet wallet, fund it from an Irys faucet, then run a real upload and confirm at `gateway.irys.xyz/<id>`.
+- [x] **Live devnet smoke test — PASSED ✓ (2026-08-25)** — `node scripts/smoke-test.js --full`, **38/38**, nothing stubbed: real Irys devnet, real Lit, real Base Sepolia, real Neon.
+  - Storage wallet `0x1F5362502766DCA949BBc121Aa0823E7931c051d`, 0.005 ETH credit (~294 MB)
+  - End-to-end book: [`FQ4e7Gt6AB4fSj65bxiyNqrn3Yn2T4nn3dJKKD7ZCx0`](https://gateway.irys.xyz/FQ4e7Gt6AB4fSj65bxiyNqrn3Yn2T4nn3dJKKD7ZCx0) · registration tx `0x0c1f87a9…9b7b1d74`
+  - Proved: ciphertext on the gateway is **byte-identical** to what was uploaded and **decrypts back to the original PDF byte for byte**; archivist recorded on-chain as `uploader`; public lookup leaks no key material; stranger refused decrypt params (403) while the uploader carve-out works; and the event listener **resolved the keccak topic back to the plaintext hash** — the first live proof of the whole indexed-string design.
+
+### Two live-only bugs the smoke test caught
+Both were invisible to every mocked suite, which is the entire argument for running this:
+
+1. **`commitUpload` rejected every correct upload.** It compared `receipt.id` (base58, 44 chars) against the derived hash (base64url, 43) *as strings*. Same 32 bytes, different alphabet — so the guard fired on every upload ever made. Mocked tests passed because a fake Irys returns whatever id the test tells it to. Fixed with `decodeTransactionId()` / `sameTransactionId()`, which compare decoded bytes. `isValidArweaveHash` still rejects base58, so the canonical read-path form is unchanged.
+2. **Irys token/chain mismatch stranded 0.005 ETH** — see the `base-eth` note under Phase 5 config below.
+
+> Irys does not charge for data items under 100 KiB, so small fixtures upload free and the credit balance legitimately does not move. Don't assert on spend for a tiny PDF.
 - [ ] Layer 4: AI content analysis via `VALIDATION_SERVICE_URL` — **deferred to the end.** `Alex-AI-Validator` is docs-only (no Python written), and may end up run by a third party. Insertion point is one call in `validateUpload`, placed *after* Layer 5 so the free local checks fail first.
 
 ### Open Question — RESOLVED
@@ -311,6 +326,165 @@ The event and function names in CLAUDE.md were aspirational; these are what is a
 
 A renamed event is not a cosmetic problem: `registry()` throws at startup if a watched name is missing from the ABI, precisely so a listener can never quietly stop tracking challenges while looking healthy.
 
+## Phase 7 — Frontend: Lit SDK integration + rental unlock 🔜 *(NEXT)*
+
+**Repo:** `AlexandriaFrontEnd` (React + Vite). Tracked here because the contract it has
+to honour is defined by this backend, and getting it wrong silently voids the key
+binding.
+
+> **Current state: the backend can lock books and nothing on earth can unlock them.**
+> Encryption, storage, registration, and serving the sealed payload are all done and
+> verified live. The decrypt half does not exist. Until it does, Alexandria stores books
+> nobody can read.
+
+### 7a — The envelope contract *(read this before writing any code)*
+
+The backend seals **an envelope, not a bare key** (`controller/litProtocol.js`):
+
+```js
+// buildKeyEnvelope() — the plaintext handed to Lit.Actions.Encrypt
+{
+  v: 1,                      // ENVELOPE_VERSION — bump if this shape changes
+  k: "<base64 32-byte AES-256 key>",
+  arweaveHash: "FQ4e7Gt6AB4fSj65bxiyNqrn3Yn2T4nn3dJKKD7ZCx0"   // 43-char base64url
+}
+```
+
+Sealed by a PKP inside a TEE via `POST /core/v1/lit_action` running:
+
+```js
+async function main({ pkpId, message }) {
+  const result = await Lit.Actions.Encrypt({ pkpId, message });
+  Lit.Actions.setResponse({ response: JSON.stringify(result) });
+}
+```
+
+Persisted as `litEncryptedKeyId` (the ciphertext) + `litDataToEncryptHash` (Lit's
+integrity hash). **Both are required to decrypt** — the ciphertext alone is not enough.
+
+### 7b — Decryption Lit Action *(the security-critical piece)*
+
+JS pinned to IPFS, executed in the Lit TEE. The backend is deliberately not in this path
+and cannot enforce any of it.
+
+- [ ] Decrypt the envelope inside the TEE, then **read `arweaveHash` out of the decrypted
+      plaintext — never from a `js_param`.** This is the entire guarantee. A caller-supplied
+      hash is trivially forgeable: rent one cheap book, submit that hash alongside a
+      different book's ciphertext, and the TEE cannot tell they don't correspond.
+      → [`KEY-BINDING.md`](KEY-BINDING.md), runnable exploit: `node tests/keyBinding.demo.js`
+- [ ] Check `v === 1` and reject unknown envelope versions rather than guessing
+- [ ] Gate on `Rent.isRentalActive(arweaveHash, userAddress)`
+      — `0xe50AD653Ee690c818900091a4d69F22e484bD2cD` on Base Sepolia (84532)
+- [ ] **Uploader carve-out.** `Rent.rentBook()` rejects `getUploader(hash) == msg.sender`,
+      so an archivist can *never* rent their own book. Without this they are permanently
+      locked out of what they uploaded. Backend already does this
+      (`grantedVia: "uploader"`); the Action must match or the two disagree.
+- [ ] **Fail closed on revert.** `isRentalActive` is `view whenNotPaused` — a paused Rent
+      contract makes it *revert*, not return false. Treat any revert as denial, never as
+      a retryable error.
+- [ ] Return **only** `k`. Never the whole envelope, never the arweaveHash, never logs
+      containing either.
+- [ ] Pin to IPFS and record the CID here — the Action is immutable once pinned, so the
+      CID *is* the security review artifact.
+
+```js
+// Shape of the gate. The first line is the one that matters.
+const env = JSON.parse(await decryptInsideTee(ciphertext, dataToEncryptHash));
+const { v, k, arweaveHash } = env;                      // ← from the CIPHERTEXT
+if (v !== 1) return;
+
+const rented  = await rent.isRentalActive(arweaveHash, userAddress);   // ← NOT a js_param
+const isOwner = (await library.getUploader(arweaveHash)) === userAddress;
+if (!rented && !isOwner) return;                        // fail closed
+
+Lit.Actions.setResponse({ response: k });
+```
+
+### 7c — Reader flow (rent → unlock → read)
+
+- [ ] Browse: `GET /api/search?q=&category=&page=` · detail: `GET /api/upload/:hash`
+- [ ] Rental state: `GET /api/rental/status/:hash/:address` → `{ active, expiry, blacklisted, available }`
+      - handle `available: false` (503) as **"cannot currently tell"**, not "denied" — do
+        not cache it as a settled no
+- [ ] Price/listing: `GET /api/rental/book/:hash` → `{ rentable, pricePerDayAlex, delisted }`
+- [ ] Rent on-chain, user-signed: `token.approve(rentContract, total)` → `rent.rentBook(hash, duration)`
+      - duration must be exactly 1, 7, or 30 days in seconds — anything else reverts
+      - price is **per day**; total = `pricePerDay × days`
+- [ ] Fetch decrypt payload: `GET /api/rental/decrypt-params/:hash/:address`
+      → `{ litEncryptedKeyId, litDataToEncryptHash, encryptionIv, encryptionAuthTag, grantedVia }`
+- [ ] Fetch ciphertext: `gateway.irys.xyz/:arweaveHash`
+- [ ] Execute the Lit Action → receive `k`
+- [ ] **AES-256-GCM decrypt in-browser** (WebCrypto `subtle.decrypt`), using `k` + the IV
+      + auth tag. Note WebCrypto expects the auth tag **appended to the ciphertext**,
+      unlike Node's separate `setAuthTag()` — this is a common porting bug.
+- [ ] Render the PDF from memory. **Never** write plaintext to disk, IndexedDB, or a blob
+      URL that outlives the session, and zero `k` as soon as decryption completes.
+
+### 7d — Archivist flow (upload → stake)
+
+- [ ] `POST /api/upload` (multipart: `file`, `title`, `author`, `category`, `description`, `walletAddress`)
+- [ ] Read `registration` from the response — the backend now registers on-chain itself,
+      so the frontend **no longer calls `registerUpload`**. If `registration.registered`
+      is false, surface `registration.reason` and offer
+      `POST /api/upload/:hash/register` to retry.
+- [ ] Stake, user-signed: `token.approve(stakeContract, amount)` → `stake.stake(hash, amount)`
+      - `MIN_STAKE` is 100 ALEX (`100000000000000000000`)
+      - requires `getUploader(hash) === msg.sender`, which registration already arranged
+- [ ] Set a price so the book becomes rentable: `rent.setBookPrice(hash, pricePerDay)`
+      — only works once status is `Approved`, i.e. after the 14-day challenge window
+- [ ] Show the 14-day window honestly: staking does **not** approve a book. `unstake()`
+      after the window is what flips it to `Approved` and pays the 50 ALEX upload reward.
+
+### 7e — Wiring
+
+- [ ] Contract addresses + ABIs — copy from `abis/*.json` (`node scripts/sync-abis.js`)
+      rather than hand-transcribing; they carry address, chainId, and deployment block
+- [ ] Lit: `LIT_API_URL` / PKP id. Backend uses the **Chipotle v3 REST API** directly
+      (`config/lit.js`), no SDK — decide whether the frontend mirrors that or uses a Lit
+      client library, and record which here
+- [ ] Wallet connection (Rabby/MetaMask) on Base Sepolia 84532; prompt to switch networks
+- [ ] Field limits should come from the backend, not be hardcoded — see the
+      `TITLE_MAX` / `AUTHOR_MAX` / `DESCRIPTION_*` export item under *Revisit at the End*
+
+### 7f — Tests that must exist
+
+- [ ] **The exploit fails.** Rent book A, request book B's ciphertext with A's hash — the
+      Action must refuse. This is the regression test for the entire binding design; if
+      it is missing, nothing else here is verified.
+- [ ] Expired rental refused · blacklisted address refused · uploader allowed without a rental
+- [ ] Paused Rent contract → denial, not a crash or a retry loop
+- [ ] Decrypted PDF is byte-identical to the original (mirrors what
+      `scripts/smoke-test.js` proves on the backend side)
+
+> ⚠️ **The backend cannot enforce any of 7b.** `GET /api/rental/decrypt-params` checks the
+> rental too, but its `address` is an unauthenticated path parameter — that check is
+> defense in depth only. The Lit Action inside the TEE is the real boundary, and it is
+> the only thing standing between a rented book and a leaked one.
+
+## 🧪 Deferred until the full test pass *(deliberate — 2026-08-25)*
+
+Held back on purpose: both are pinned to specific deployed addresses, so a contract
+redeploy invalidates them. Doing them now would mean doing them twice.
+
+- [ ] **Verify contracts on Basescan** — `npx hardhat ignition verify chain-84532` in the
+      contract repo (`BASESCAN_API_KEY` is already set). This is deployment.md step 5, and
+      it is also the only way to call `resolveChallenge` / `pause` / `setAuthorizedCaller`
+      from a browser instead of a script.
+- [ ] **Archivist staking round-trip** — the half the backend never touches. With the
+      contracts verified, entirely from Rabby via Basescan:
+      ```
+      token.approve(0xe3027D298450695d9c4eD9A071D34e2921fc567C, 100000000000000000000)
+      stake.stake("<arweaveHash>", 100000000000000000000)
+      ```
+      Preconditions verified as satisfiable on 2026-08-25: uploader matches the wallet,
+      status Pending, not already staked, MIN_STAKE 100 ALEX, balance 1e9 ALEX,
+      stake contract unpaused. Allowance was 50 ALEX, so `approve` is required first.
+- [ ] Confirm the listener records `Staked`. Expect **no status change** — only library
+      events move `status`, because stake.sol routes its own changes through
+      `library.updateUploadStatus()`. And expect `Pending` to persist: staking opens the
+      14-day challenge window; `unstake()` after it is what flips the book to `Approved`
+      and pays the upload reward.
+
 ## Cross-cutting
 - [ ] Jest set up; replace placeholder `test` script
 - [ ] Rejection logging (reason, uploader, timestamp) for abuse detection
@@ -346,6 +520,10 @@ Nothing here blocks Phases 5–6, but all of it should be settled before real ar
 
 ## Deferred (post-PoC — Decentralization Roadmap)
 - [ ] Phase 1: archivist-funded storage (frontend uploads to Irys, remove `IRYS_WALLET_KEY`)
+  - **Natural point to re-decide Arweave vs. Irys L1.** Once archivists pay for their own
+    storage they are choosing the provider and absorbing the cost, and the decision comes
+    with real numbers instead of estimates. Irys L1 is ~20× cheaper, which is not trivial
+    when archival scans run 150–300 MB. See [`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md).
 - [ ] Phase 2: decentralized indexing via The Graph (MongoDB/Postgres → subgraph)
 - [ ] Phase 3: distributed validation (multi-node consensus)
 - [ ] Phase 4: fully client-side upload + browser encryption (backend optional)
