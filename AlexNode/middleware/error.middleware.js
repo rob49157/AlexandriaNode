@@ -1,4 +1,5 @@
 const multer = require('multer');
+const { MAX_FILE_SIZE_MB } = require('./upload.middleware');
 
 // 404 handler for unmatched routes — keep it before the error handler.
 function notFound(req, res, next) {
@@ -16,7 +17,7 @@ function errorHandler(err, req, res, next) {
         valid: false,
         stage: 'file_basics',
         reason: 'file_too_large',
-        message: `File exceeds the maximum allowed size of ${process.env.MAX_FILE_SIZE_MB || 50} MB.`,
+        message: `File exceeds the maximum allowed size of ${MAX_FILE_SIZE_MB} MB.`,
       });
     }
     return res.status(400).json({
