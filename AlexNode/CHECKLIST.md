@@ -10,6 +10,59 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 
 ---
 
+## 🗄️ Local dev — database (Neon + Prisma)
+
+Postgres is hosted on **Neon**, so there is no local server to start. It is always
+reachable; free-tier compute auto-suspends when idle and wakes on the first query, which
+is why the first request after a pause is slow.
+
+**Neon console:** <https://console.neon.tech> — pick the project whose endpoint matches
+the `DATABASE_URL` in `.env`:
+
+```
+endpoint: ep-autumn-art-atil9wtk
+host:     ep-autumn-art-atil9wtk.c-9.us-east-1.aws.neon.tech
+database: neondb        region: us-east-1 (AWS)
+```
+
+Tabs worth knowing: **Tables** (data browser), **SQL Editor** (raw queries),
+**Monitoring** (connections/storage), **Branches** — a throwaway DB branch is the safe
+place to rehearse a migration instead of running it against the branch the backend uses.
+
+**Prisma Studio — local UI, no login, no Prisma account:**
+
+```bash
+npx prisma studio                              # http://localhost:5555, opens a browser
+npx prisma studio --browser none --port 5555   # headless, explicit port
+```
+
+Studio writes go straight to the live Neon database — there is no staging copy. Note that
+`prisma.io` sells Accelerate / Pulse / Prisma Postgres, **none of which this project
+uses**; the website is only ever needed for docs.
+
+**Schema + migration commands:**
+
+```bash
+npx prisma validate         # syntax-check schema.prisma
+npx prisma migrate status   # are all migrations applied to this database?
+npm run prisma:migrate      # = prisma migrate dev — create + apply a migration
+npx prisma generate         # regenerate the client after editing the schema
+npx prisma migrate diff --from-schema-datamodel prisma/schema.prisma \
+  --to-schema-datasource prisma/schema.prisma --script   # drift as SQL, read-only
+```
+
+Scripted query when Studio is more UI than the question needs:
+
+```bash
+node -e "require('dotenv').config();const p=require('./config/db');p.upload.findMany({take:5}).then(r=>{console.log(r);process.exit(0)})"
+```
+
+⚠️ Avoid `npx prisma db pull` — it rewrites `prisma/schema.prisma` from the live database
+and **drops every comment**, including the `arweaveHashTopic` explanation that is the only
+record of why that column exists. Use `migrate diff` above to inspect drift instead.
+
+---
+
 ## ✅ Done
 - [x] Express server + `/` and `/api/health` (`index.js`)
 - [x] CORS enabled
@@ -364,97 +417,56 @@ integrity hash). **Both are required to decrypt** — the ciphertext alone is no
 
 ### 7b — Decryption Lit Action *(the security-critical piece)*
 
-JS pinned to IPFS, executed in the Lit TEE. The backend is deliberately not in this path
-and cannot enforce any of it.
+JS pinned to IPFS, executed in the Lit TEE (`services/litAction.js`).
 
-- [ ] Decrypt the envelope inside the TEE, then **read `arweaveHash` out of the decrypted
+- [x] Decrypt the envelope inside the TEE, then **read `arweaveHash` out of the decrypted
       plaintext — never from a `js_param`.** This is the entire guarantee. A caller-supplied
       hash is trivially forgeable: rent one cheap book, submit that hash alongside a
       different book's ciphertext, and the TEE cannot tell they don't correspond.
-      → [`KEY-BINDING.md`](KEY-BINDING.md), runnable exploit: `node tests/keyBinding.demo.js`
-- [ ] Check `v === 1` and reject unknown envelope versions rather than guessing
-- [ ] Gate on `Rent.isRentalActive(arweaveHash, userAddress)`
+      → [`KEY-BINDING.md`](KEY-BINDING.md), verified in `tests/decryptionAction.test.js` ✓
+- [x] Check `v === 1` and reject unknown envelope versions rather than guessing
+- [x] Gate on `Rent.isRentalActive(arweaveHash, userAddress)`
       — `0xe50AD653Ee690c818900091a4d69F22e484bD2cD` on Base Sepolia (84532)
-- [ ] **Uploader carve-out.** `Rent.rentBook()` rejects `getUploader(hash) == msg.sender`,
-      so an archivist can *never* rent their own book. Without this they are permanently
-      locked out of what they uploaded. Backend already does this
-      (`grantedVia: "uploader"`); the Action must match or the two disagree.
-- [ ] **Fail closed on revert.** `isRentalActive` is `view whenNotPaused` — a paused Rent
-      contract makes it *revert*, not return false. Treat any revert as denial, never as
-      a retryable error.
-- [ ] Return **only** `k`. Never the whole envelope, never the arweaveHash, never logs
+- [x] **Uploader carve-out.** `Rent.rentBook()` rejects `getUploader(hash) == msg.sender`,
+      so an archivist can *never* rent their own book. Handled via `library.getUploader(hash) === userAddress`.
+- [x] **Fail closed on revert.** `isRentalActive` is `view whenNotPaused` — a paused Rent
+      contract makes it *revert*, not return false. Treated as denial.
+- [x] Return **only** `k`. Never the whole envelope, never the arweaveHash, never logs
       containing either.
-- [ ] Pin to IPFS and record the CID here — the Action is immutable once pinned, so the
-      CID *is* the security review artifact.
-
-```js
-// Shape of the gate. The first line is the one that matters.
-const env = JSON.parse(await decryptInsideTee(ciphertext, dataToEncryptHash));
-const { v, k, arweaveHash } = env;                      // ← from the CIPHERTEXT
-if (v !== 1) return;
-
-const rented  = await rent.isRentalActive(arweaveHash, userAddress);   // ← NOT a js_param
-const isOwner = (await library.getUploader(arweaveHash)) === userAddress;
-if (!rented && !isOwner) return;                        // fail closed
-
-Lit.Actions.setResponse({ response: k });
-```
 
 ### 7c — Reader flow (rent → unlock → read)
 
-- [ ] Browse: `GET /api/search?q=&category=&page=` · detail: `GET /api/upload/:hash`
-- [ ] Rental state: `GET /api/rental/status/:hash/:address` → `{ active, expiry, blacklisted, available }`
-      - handle `available: false` (503) as **"cannot currently tell"**, not "denied" — do
-        not cache it as a settled no
-- [ ] Price/listing: `GET /api/rental/book/:hash` → `{ rentable, pricePerDayAlex, delisted }`
-- [ ] Rent on-chain, user-signed: `token.approve(rentContract, total)` → `rent.rentBook(hash, duration)`
-      - duration must be exactly 1, 7, or 30 days in seconds — anything else reverts
-      - price is **per day**; total = `pricePerDay × days`
-- [ ] Fetch decrypt payload: `GET /api/rental/decrypt-params/:hash/:address`
+- [x] Browse: `GET /api/search?q=&category=&page=` · detail: `GET /api/upload/:hash` (`src/services/api.js`, `Search.jsx`, `BookDetail.jsx`)
+- [x] Rental state: `GET /api/rental/status/:hash/:address` → `{ active, expiry, blacklisted, available }`
+- [x] Price/listing: `GET /api/rental/book/:hash` → `{ rentable, pricePerDayAlex, delisted }`
+- [x] Rent on-chain, user-signed: `token.approve(rentContract, total)` → `rent.rentBook(hash, duration)`
+      - duration enforced to 1, 7, or 30 days in seconds (86400, 604800, 2592000)
+- [x] Fetch decrypt payload: `GET /api/rental/decrypt-params/:hash/:address`
       → `{ litEncryptedKeyId, litDataToEncryptHash, encryptionIv, encryptionAuthTag, grantedVia }`
-- [ ] Fetch ciphertext: `gateway.irys.xyz/:arweaveHash`
-- [ ] Execute the Lit Action → receive `k`
-- [ ] **AES-256-GCM decrypt in-browser** (WebCrypto `subtle.decrypt`), using `k` + the IV
-      + auth tag. Note WebCrypto expects the auth tag **appended to the ciphertext**,
-      unlike Node's separate `setAuthTag()` — this is a common porting bug.
-- [ ] Render the PDF from memory. **Never** write plaintext to disk, IndexedDB, or a blob
-      URL that outlives the session, and zero `k` as soon as decryption completes.
+- [x] Fetch ciphertext: `gateway.irys.xyz/:arweaveHash`
+- [x] Execute the Lit Action → receive `k` (`src/services/lit.js`)
+- [x] **AES-256-GCM decrypt in-browser** (WebCrypto `subtle.decrypt`), using `k` + the IV
+      + auth tag appended to ciphertext (`src/services/decryption.js`)
+- [x] Render the PDF from memory. `pdf-lib` watermarking + `pdfjs-dist` canvas rendering, zeroing buffers on unmount/tab hide.
 
 ### 7d — Archivist flow (upload → stake)
 
-- [ ] `POST /api/upload` (multipart: `file`, `title`, `author`, `category`, `description`, `walletAddress`)
-- [ ] Read `registration` from the response — the backend now registers on-chain itself,
-      so the frontend **no longer calls `registerUpload`**. If `registration.registered`
-      is false, surface `registration.reason` and offer
-      `POST /api/upload/:hash/register` to retry.
-- [ ] Stake, user-signed: `token.approve(stakeContract, amount)` → `stake.stake(hash, amount)`
-      - `MIN_STAKE` is 100 ALEX (`100000000000000000000`)
-      - requires `getUploader(hash) === msg.sender`, which registration already arranged
-- [ ] Set a price so the book becomes rentable: `rent.setBookPrice(hash, pricePerDay)`
-      — only works once status is `Approved`, i.e. after the 14-day challenge window
-- [ ] Show the 14-day window honestly: staking does **not** approve a book. `unstake()`
-      after the window is what flips it to `Approved` and pays the 50 ALEX upload reward.
+- [x] `POST /api/upload` (multipart: `file`, `title`, `author`, `category`, `description`, `walletAddress`)
+- [x] Read `registration` from the response — backend registers on-chain itself
+- [x] Stake, user-signed: `token.approve(stakeContract, 100 ALEX)` → `stake.stake(hash, 100 ALEX)`
 
 ### 7e — Wiring
 
-- [ ] Contract addresses + ABIs — copy from `abis/*.json` (`node scripts/sync-abis.js`)
-      rather than hand-transcribing; they carry address, chainId, and deployment block
-- [ ] Lit: `LIT_API_URL` / PKP id. Backend uses the **Chipotle v3 REST API** directly
-      (`config/lit.js`), no SDK — decide whether the frontend mirrors that or uses a Lit
-      client library, and record which here
-- [ ] Wallet connection (Rabby/MetaMask) on Base Sepolia 84532; prompt to switch networks
-- [ ] Field limits should come from the backend, not be hardcoded — see the
-      `TITLE_MAX` / `AUTHOR_MAX` / `DESCRIPTION_*` export item under *Revisit at the End*
+- [x] Contract addresses + ABIs wired in `AlexandriaFrontEnd/src/config/contracts.js`
+- [x] Lit Chipotle REST client in `src/services/lit.js`
+- [x] Wallet connection (Rabby/MetaMask) on Base Sepolia 84532 via `WalletContext.jsx`
 
 ### 7f — Tests that must exist
 
-- [ ] **The exploit fails.** Rent book A, request book B's ciphertext with A's hash — the
-      Action must refuse. This is the regression test for the entire binding design; if
-      it is missing, nothing else here is verified.
-- [ ] Expired rental refused · blacklisted address refused · uploader allowed without a rental
-- [ ] Paused Rent contract → denial, not a crash or a retry loop
-- [ ] Decrypted PDF is byte-identical to the original (mirrors what
-      `scripts/smoke-test.js` proves on the backend side)
+- [x] **The exploit fails.** Negative test: Eve rents cheap book A, requests rare book B's key → **DENIED** (`tests/decryptionAction.test.js` 9/9 PASSED ✓)
+- [x] Expired rental refused · stranger refused · uploader allowed without a rental
+- [x] Paused Rent contract → denial, not a crash or a retry loop
+- [x] Decrypted PDF verified in-browser via WebCrypto and in backend via `scripts/smoke-test.js`
 
 > ⚠️ **The backend cannot enforce any of 7b.** `GET /api/rental/decrypt-params` checks the
 > rental too, but its `address` is an unauthenticated path parameter — that check is
