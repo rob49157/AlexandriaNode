@@ -6,7 +6,6 @@
 // This is opt-in because it writes to the configured DATABASE_URL.
 
 require('dotenv').config();
-
 if (process.env.RUN_NEON_DB_TEST !== 'true') {
   console.error('Refusing to write to the database. Set RUN_NEON_DB_TEST=true to run this test.');
   process.exit(1);
@@ -19,7 +18,6 @@ if (!process.env.DATABASE_URL || /@host(?::|\/)/.test(process.env.DATABASE_URL))
 
 const crypto = require('node:crypto');
 const prisma = require('../config/db');
-
 const suffix = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 const arweaveHash = `TestUpload_${suffix}`;
 const sha256Hash = crypto.createHash('sha256').update(arweaveHash).digest('hex');
@@ -41,11 +39,14 @@ const upload = {
   encryptionIv: Buffer.alloc(12).toString('base64'),
   encryptionAuthTag: Buffer.alloc(16).toString('base64'),
 };
+console.log('Inserting Neon Upload row:', upload);
 
 async function main() {
   try {
+    console.log('Connecting to Neon database...');
     await prisma.upload.create({ data: upload });
-
+    console.log(upload);
+    console.log(`Inserted Neon Upload row with arweaveHash: ${arweaveHash}`);
     const inserted = await prisma.upload.findUnique({
       where: { arweaveHash },
       select: {
@@ -56,6 +57,7 @@ async function main() {
         sha256Hash: true,
       },
     });
+    console.log('Read back Neon Upload row:', inserted);
 
     if (!inserted) throw new Error('Inserted Upload row could not be read back.');
     if (inserted.title !== upload.title) throw new Error('Upload title did not round-trip.');
