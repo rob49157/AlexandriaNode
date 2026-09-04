@@ -511,11 +511,11 @@ Nothing here blocks Phases 5–6, but all of it should be settled before real ar
 
 **Why `memoryStorage` (context for every item below):** multer holds the raw PDF in RAM because CLAUDE.md forbids unencrypted PDFs on disk — RAM cleanup is enforced by the OS, disk cleanup is best-effort code that a crash can skip, and `unlink()` isn't erasure. This is a **security** choice, not a performance one (disk I/O would be <1% of request time). The cost is that max file size is bounded by **RAM × concurrency**, not by storage.
 
-- [ ] **Raise `MAX_FILE_SIZE_MB` (currently 50, and *unset* in `.env` — running on the `|| 50` default).** Candidate value: **150**.
-  - 3000-page *text* PDF ≈ 9–45 MB → fits 50 MB, but with almost no headroom
-  - 3000-page *scan* ≈ 150–300 MB (Internet Archive-quality, ~50–100 KB/page) → **does not fit**; color/archival scans reach 0.75–9 GB
-  - Since Alexandria targets at-risk and public-domain works (overwhelmingly scans), 50 MB rejects a meaningful share of legitimate uploads
-  - Note the cap is **MiB** (`* 1024 * 1024`), so 50 → 52,428,800 bytes
+- [x] **Raise `MAX_FILE_SIZE_MB` to 150 MiB** (the `.env` fallback and example are both aligned).
+      - 3000-page *text* PDF ≈ 9–45 MB → fits 150 MiB with useful headroom
+      - 3000-page *scan* ≈ 150–300 MB (Internet Archive-quality, ~50–100 KB/page) → smaller scans fit; color/archival scans reach 0.75–9 GB
+      - Since Alexandria targets at-risk and public-domain works (overwhelmingly scans), a low upload cap rejects a meaningful share of legitimate uploads
+      - Note the cap is **MiB** (`* 1024 * 1024`), so 150 → 157,286,400 bytes
 - [ ] **Fix the SimHash event-loop block — needed regardless of where the size cap lands.** Scales with *page count*, not file size, so it already bites at the current 50 MB cap.
   - Measured: 300 pages → 655 ms · 1000 pages → 2.3 s · **3000 pages → 6.5 s of fully blocking synchronous BigInt work** (every other request stalls)
   - Fix A (cheap, high value): cap the text fed to `computeSimHash` at ~200k tokens — bounds cost regardless of book length; a fingerprint from the first ~400 pages is plenty discriminative for dedup
@@ -523,7 +523,6 @@ Nothing here blocks Phases 5–6, but all of it should be settled before real ar
 - [ ] **Add an upload concurrency limit.** Peak RAM is ~2.5–3× file size per in-flight upload (multer buffer + the `Buffer.concat` copy during AES-GCM). At 150 MB that's ~450 MB each; at 500 MB, three concurrent uploads OOM a default Node heap. A queue converts an unbounded crash risk into bounded latency.
 - [ ] **Benchmark `pdf-parse` on a real 3000-page PDF — not yet measured.** Estimated 10–60 s of mostly-blocking extraction, which would dominate everything above and may be the true ceiling on book size.
 - [ ] Duplicate constant: `MAX_FILE_SIZE_MB`/`_BYTES` is defined twice (`middleware/upload.middleware.js:4` and `services/validation.service.js:18`). Same env var so they agree in practice, but neither imports the other. `validateLayer1`'s size check is unreachable via HTTP (multer aborts first) — it's a backstop for direct calls/tests.
-- [ ] Cosmetic: `middleware/error.middleware.js:19` interpolates raw `process.env.MAX_FILE_SIZE_MB` instead of the parsed constant, so a non-numeric value would report a wrong limit in the 413 message while the real cap falls back to 50.
 - [ ] Export `TITLE_MAX` / `AUTHOR_MAX` / `DESCRIPTION_MIN` / `DESCRIPTION_MAX` from `validation.service.js` so the frontend can size its inputs and show character counters instead of hardcoding 300/200/10/2000. (Also unenforced at the DB layer — Prisma `String` → Postgres `TEXT` is unbounded.)
 
 > **The real escape hatch for large scans is Deferred Phase 1** (archivist-funded storage — frontend uploads directly to Irys). That removes the bytes from this server entirely, so neither RAM nor the no-plaintext-on-disk rule constrains file size. Don't rebuild the in-memory upload path twice chasing 500 MB archival scans.
