@@ -10,6 +10,59 @@ Living checklist for the Node.js backend gateway. Phases run cheapest → most i
 
 ---
 
+## 🗄️ Local dev — database (Neon + Prisma)
+
+Postgres is hosted on **Neon**, so there is no local server to start. It is always
+reachable; free-tier compute auto-suspends when idle and wakes on the first query, which
+is why the first request after a pause is slow.
+
+**Neon console:** <https://console.neon.tech> — pick the project whose endpoint matches
+the `DATABASE_URL` in `.env`:
+
+```
+endpoint: ep-autumn-art-atil9wtk
+host:     ep-autumn-art-atil9wtk.c-9.us-east-1.aws.neon.tech
+database: neondb        region: us-east-1 (AWS)
+```
+
+Tabs worth knowing: **Tables** (data browser), **SQL Editor** (raw queries),
+**Monitoring** (connections/storage), **Branches** — a throwaway DB branch is the safe
+place to rehearse a migration instead of running it against the branch the backend uses.
+
+**Prisma Studio — local UI, no login, no Prisma account:**
+
+```bash
+npx prisma studio                              # http://localhost:5555, opens a browser
+npx prisma studio --browser none --port 5555   # headless, explicit port
+```
+
+Studio writes go straight to the live Neon database — there is no staging copy. Note that
+`prisma.io` sells Accelerate / Pulse / Prisma Postgres, **none of which this project
+uses**; the website is only ever needed for docs.
+
+**Schema + migration commands:**
+
+```bash
+npx prisma validate         # syntax-check schema.prisma
+npx prisma migrate status   # are all migrations applied to this database?
+npm run prisma:migrate      # = prisma migrate dev — create + apply a migration
+npx prisma generate         # regenerate the client after editing the schema
+npx prisma migrate diff --from-schema-datamodel prisma/schema.prisma \
+  --to-schema-datasource prisma/schema.prisma --script   # drift as SQL, read-only
+```
+
+Scripted query when Studio is more UI than the question needs:
+
+```bash
+node -e "require('dotenv').config();const p=require('./config/db');p.upload.findMany({take:5}).then(r=>{console.log(r);process.exit(0)})"
+```
+
+⚠️ Avoid `npx prisma db pull` — it rewrites `prisma/schema.prisma` from the live database
+and **drops every comment**, including the `arweaveHashTopic` explanation that is the only
+record of why that column exists. Use `migrate diff` above to inspect drift instead.
+
+---
+
 ## ✅ Done
 - [x] Express server + `/` and `/api/health` (`index.js`)
 - [x] CORS enabled
