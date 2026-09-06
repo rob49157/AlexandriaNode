@@ -389,7 +389,7 @@ LIT_API_URL=https://api.chipotle.litprotocol.com/core/v1
 VALIDATION_SERVICE_URL=http://localhost:8000
 
 # File Upload Limits
-MAX_FILE_SIZE_MB=50
+MAX_FILE_SIZE_MB=150
 ```
 
 ## API Endpoints (Planned)
