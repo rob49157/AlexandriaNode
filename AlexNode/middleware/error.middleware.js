@@ -1,5 +1,5 @@
 const multer = require('multer');
-const { MAX_FILE_SIZE_MB } = require('./upload.middleware');
+const { MAX_FILE_SIZE_MB } = require('../config/uploadLimits');
 
 // 404 handler for unmatched routes — keep it before the error handler.
 function notFound(req, res, next) {
