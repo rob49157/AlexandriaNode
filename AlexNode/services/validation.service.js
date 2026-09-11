@@ -1,6 +1,7 @@
 const sanitizeHtml = require('sanitize-html');
 const { validateLayer2 } = require('./securityScan.service');
 const { validateLayer3 } = require('./dedup.service');
+const { MAX_FILE_SIZE_MB, MAX_FILE_SIZE_BYTES } = require('../config/uploadLimits');
 
 // pdf-parse v2 exposes a PDFParse class (+ typed exceptions) via its CJS build.
 const { PDFParse, PasswordException, InvalidPDFException } = require('pdf-parse');
@@ -15,9 +16,6 @@ async function getFileTypeFromBuffer() {
 }
 
 // --- Config -----------------------------------------------
-const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 150;
-const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
-
 const ALLOWED_CATEGORIES = [
   'science', 'history', 'literature', 'philosophy', 'technology',
   'art', 'mathematics', 'medicine', 'law', 'religion', 'reference', 'other',
@@ -185,4 +183,8 @@ module.exports = {
   ALLOWED_CATEGORIES,
   MAX_FILE_SIZE_MB,
   MAX_FILE_SIZE_BYTES,
+  TITLE_MAX,
+  AUTHOR_MAX,
+  DESCRIPTION_MIN,
+  DESCRIPTION_MAX,
 };
