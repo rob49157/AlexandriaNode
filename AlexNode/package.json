@@ -10,6 +10,8 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
+    "test:db": "node tests/uploadDb.test.js",
+    "benchmark:pdf": "node scripts/benchmark-pdf.js",
     "prisma:migrate": "prisma migrate dev"
   },
   "keywords": [],

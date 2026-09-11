@@ -1,8 +1,5 @@
 const multer = require('multer');
-
-// Max upload size, configurable via env (defaults to 50 MB).
-const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB, 10) || 50;
-const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+const { MAX_FILE_SIZE_MB, MAX_FILE_SIZE_BYTES } = require('../config/uploadLimits');
 
 // In-memory storage: the raw PDF lives in req.file.buffer only for the duration
 // of the request. Nothing is written to disk (per the "no unencrypted PDF on
