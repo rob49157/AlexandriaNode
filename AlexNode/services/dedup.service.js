@@ -160,6 +160,11 @@ async function checkNearDuplicate(simHash) {
     }
   }
 
+  // Closest first. Callers treat matches[0] as "the" match — it is what gets
+  // persisted as nearDuplicateOf and shown to the librarian — and candidates
+  // arrive in whatever order Postgres returns them, which is not by distance.
+  matches.sort((a, b) => a.distance - b.distance);
+
   return {
     isNearDuplicate: matches.length > 0,
     matches,

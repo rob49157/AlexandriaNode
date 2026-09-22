@@ -120,6 +120,7 @@ async function createUpload(req, res, next) {
     }
 
     // --- Persist ---------------------------------------------------------
+    // Closest match first — checkNearDuplicate ranks them by distance.
     const nearest = (result.nearDuplicateMatches || [])[0];
 
     try {
@@ -152,6 +153,13 @@ async function createUpload(req, res, next) {
           encryptionAuthTag: authTag.toString('base64'),
           isNearDuplicate: Boolean(result.isNearDuplicate),
           nearDuplicateOf: nearest ? nearest.arweaveHash : null,
+          nearDuplicateDistance: nearest ? nearest.distance : null,
+          // Audit trail for the librarian review queue. Written once, here:
+          // the plaintext PDF is unavailable after this request, so anything
+          // not recorded now is unrecoverable for this book.
+          clamavStatus: result.clamavStatus,
+          textWordCount: result.textWordCount ?? null,
+          textlessPageCount: result.textlessPageCount ?? null,
         },
       });
     } catch (err) {

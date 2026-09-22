@@ -19,17 +19,42 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const path = require('path');
+
+// Postgres stub, installed before dedup.service is required so that
+// checkNearDuplicate reads these rows instead of opening a connection. Same
+// require.cache technique as tests/librarianQueue.test.js.
+const db = { uploads: [] };
+{
+  const resolved = require.resolve('../config/db');
+  require.cache[resolved] = {
+    id: resolved,
+    filename: resolved,
+    path: path.dirname(resolved),
+    loaded: true,
+    children: [],
+    paths: [],
+    // The band prefilter is exercised by the pigeonhole tests below; here the
+    // stub returns every row so the distance ranking is what is under test.
+    exports: { upload: { findMany: async () => db.uploads } },
+  };
+}
+
 const { scanPdfStructure, checkEncrypted, validateLayer2 } = require('../services/securityScan.service');
 const {
   computeSimHash,
   hammingDistance,
   similarityScore,
   splitBands,
+  parseHash64,
+  HASH_HEX_CHARS,
+  EMPTY_SIMHASH,
   BAND_COUNT,
   BAND_BITS,
   MAX_GUARANTEED_DISTANCE,
 } = require('../services/simhash.service');
-const { computeSha256, simHashBandFields } = require('../services/dedup.service');
+const { computeSha256, simHashBandFields, checkNearDuplicate } = require('../services/dedup.service');
+const { validateLayer1, countWords, TEXTLESS_PAGE_WORDS } = require('../services/validation.service');
 
 // --- Test harness ---
 let passed = 0;
@@ -66,6 +91,42 @@ function makePdf(extraContent = '') {
     '%%EOF',
   ].join('\n');
   return Buffer.from(pdf, 'latin1');
+}
+
+// --- Helper: a parseable PDF whose pages carry no text at all ---
+// Stands in for a scan with no OCR: real page objects, no content streams.
+function blankPdf(pageCount) {
+  const kids = Array.from({ length: pageCount }, (_, i) => `${3 + i} 0 R`).join(' ');
+  const pages = Array.from(
+    { length: pageCount },
+    (_, i) => `${3 + i} 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj`
+  ).join('\n');
+
+  return Buffer.from(
+    [
+      '%PDF-1.4',
+      '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj',
+      `2 0 obj<</Type/Pages/Kids[${kids}]/Count ${pageCount}>>endobj`,
+      pages,
+      'trailer<</Size 4/Root 1 0 R>>',
+      '%%EOF',
+    ].join('\n'),
+    'latin1'
+  );
+}
+
+// --- Helper: the multer file shape validateLayer1 expects ---
+function asUploadedFile(buffer, originalname = 'book.pdf') {
+  return { originalname, mimetype: 'application/pdf', size: buffer.length, buffer };
+}
+
+// --- Helper: a fingerprint an exact number of bits away from another ---
+// The banded-LSH section further down declares its own flipBits(hash, positions);
+// this one takes a count, so it gets a name of its own rather than shadowing it.
+function bitsAway(hash, count) {
+  let value = parseHash64(hash);
+  for (let i = 0; i < count; i++) value ^= 1n << BigInt(i);
+  return value.toString(16).padStart(HASH_HEX_CHARS, '0');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +355,68 @@ console.log('\n  Testing ClamAV fallback (daemon likely not running)...');
   assert(throws(() => splitBands('abc')), 'splitBands: rejects wrong-length input');
   assert(throws(() => splitBands(null)), 'splitBands: rejects null');
   assert(throws(() => hammingDistance('zzzz', sim1a)), 'hammingDistance: rejects malformed input');
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Layer 1: Text inventory (word counts + the page-marker regression)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  console.log('\n=== Layer 1: Text inventory ===\n');
+
+  // A scan with no OCR: real pages, no characters on any of them. pdf-parse
+  // appends "-- 1 of 3 --" per page unless pageJoiner is disabled, and those
+  // markers used to count as extracted text — which gave a fingerprint to a
+  // book that has none, and made two unrelated scans with equal page counts
+  // identical twins. If this test fails, that bug is back.
+  const blankScan = blankPdf(3);
+  const scanLayer1 = await validateLayer1(asUploadedFile(blankScan));
+
+  assert(scanLayer1.valid === true, 'Text inventory: an image-only PDF is still a valid upload');
+  assert(scanLayer1.pageCount === 3, 'Text inventory: page count is read from the document');
+  assert(scanLayer1.textWordCount === 0, 'Text inventory: no OCR → zero words (no page markers counted)');
+  assert(scanLayer1.textlessPageCount === 3, 'Text inventory: every page of a scan is textless');
+  assert(
+    computeSimHash(scanLayer1.text || '') === EMPTY_SIMHASH,
+    'Text inventory: a scan fingerprints as empty, so dedup skips it instead of comparing markers'
+  );
+
+  // The threshold itself: a page carrying only a running head is textless, one
+  // with a sentence on it is not.
+  const runningHead = Array(TEXTLESS_PAGE_WORDS - 1).fill('chapter').join(' ');
+  const sentence = Array(TEXTLESS_PAGE_WORDS + 20).fill('anatomy').join(' ');
+  const counted = countWords([{ text: sentence }, { text: runningHead }, { text: '' }, {}]);
+
+  assert(
+    counted.textWordCount === TEXTLESS_PAGE_WORDS + 20 + (TEXTLESS_PAGE_WORDS - 1),
+    'countWords: totals the words of every page'
+  );
+  assert(counted.textlessPageCount === 3, 'countWords: running-head, empty and missing pages are textless');
+  assert(countWords([]).textWordCount === 0, 'countWords: no pages → zero, not NaN');
+  assert(countWords(undefined).textlessPageCount === 0, 'countWords: missing page array is survivable');
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Layer 3: Near-duplicate ranking
+  // ─────────────────────────────────────────────────────────────────────────
+
+  console.log('\n=== Layer 3: Near-duplicate ranking ===\n');
+
+  // Callers treat matches[0] as "the" match: it is persisted as nearDuplicateOf
+  // and it is the book named on the librarian's dashboard. Postgres returns
+  // candidates in no particular order, so the ranking has to be explicit.
+  const probe = computeSimHash('the anatomy of the human body described in detail across many chapters');
+  db.uploads = [
+    { arweaveHash: 'far', title: 'Three bits away', simHash: bitsAway(probe, 3) },
+    { arweaveHash: 'near', title: 'One bit away', simHash: bitsAway(probe, 1) },
+    { arweaveHash: 'mid', title: 'Two bits away', simHash: bitsAway(probe, 2) },
+  ];
+
+  const ranked = await checkNearDuplicate(probe);
+
+  assert(ranked.isNearDuplicate === true, 'Ranking: all three stored books are inside the threshold');
+  assert(ranked.matches[0].arweaveHash === 'near', 'Ranking: the closest match is first, not the first row read');
+  assert(
+    ranked.matches.map((m) => m.distance).join(',') === '1,2,3',
+    'Ranking: matches are ordered by ascending Hamming distance'
+  );
 
   // ─────────────────────────────────────────────────────────────────────────
   // Summary
