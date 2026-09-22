@@ -116,4 +116,4 @@ async function search(req, res, next) {
   }
 }
 
-module.exports = { search, SEARCH_STATUSES, DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_LENGTH };
+module.exports = { search, parsePositiveInt, SEARCH_STATUSES, DEFAULT_LIMIT, MAX_LIMIT, MAX_QUERY_LENGTH };
