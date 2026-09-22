@@ -11,6 +11,7 @@ const searchRoutes = require('./routes/search.routes');
 const rentalRoutes = require('./routes/rental.routes');
 const stakeRoutes = require('./routes/stake.routes');
 const chainRoutes = require('./routes/chain.routes');
+const librarianRoutes = require('./routes/librarian.routes');
 const eventListener = require('./services/eventListener.service');
 const { notFound, errorHandler } = require('./middleware/error.middleware');
 
@@ -38,6 +39,7 @@ app.use('/api', searchRoutes);
 app.use('/api', rentalRoutes);
 app.use('/api', stakeRoutes);
 app.use('/api', chainRoutes);
+app.use('/api', librarianRoutes);
 
 // 404 + global error handler — must be registered last, after all routes.
 app.use(notFound);
