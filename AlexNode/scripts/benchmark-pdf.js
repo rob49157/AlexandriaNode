@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { PDFParse } = require('pdf-parse');
+const { countWords } = require('../services/validation.service');
 
 const inputPath = process.argv[2];
 
@@ -21,15 +22,24 @@ async function main() {
   const parser = new PDFParse({ data });
 
   try {
-    const result = await parser.getText();
+    // Same options as validateLayer1, so the word counts printed here are the
+    // ones an upload of this file would record. See services/validation.service.js.
+    const result = await parser.getText({ pageJoiner: '' });
     const elapsedSeconds = Number(process.hrtime.bigint() - started) / 1e9;
     const peakRssMiB = process.memoryUsage().rss / 1024 / 1024;
+
+    const pages = result.total || result.pages?.length || 0;
+    const { textWordCount, textlessPageCount } = countWords(result.pages);
 
     console.log(JSON.stringify({
       file: pdfPath,
       fileSizeMiB: Number((data.length / 1024 / 1024).toFixed(2)),
-      pages: result.total || result.pages?.length || 0,
+      pages,
       textCharacters: result.text?.length || 0,
+      // A scan with no OCR lands here as 0 words and textlessPages === pages.
+      textWordCount,
+      wordsPerPage: pages ? Math.round(textWordCount / pages) : 0,
+      textlessPageCount,
       parseSeconds: Number(elapsedSeconds.toFixed(3)),
       peakRssMiB: Number(peakRssMiB.toFixed(1)),
     }, null, 2));

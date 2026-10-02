@@ -29,12 +29,37 @@ const { getStakeStatus } = require('../services/blockchain.service');
 const { toPublicUpload, PUBLIC_UPLOAD_SELECT } = require('./upload.controller');
 const { handleChainError } = require('./rental.controller');
 const { parsePositiveInt, MAX_LIMIT } = require('./search.controller');
+const { NEAR_DUPLICATE_THRESHOLD } = require('../services/dedup.service');
 
 // Only registered-and-pending books are ever candidates. "pending_stake" has no
 // stake to challenge, and approved/rejected/challenged are all past the window.
 const QUEUE_STATUS = 'pending';
 
 const DEFAULT_LIMIT = 50;
+
+// The upload row as the queue reads it: the public book fields plus the audit
+// columns. Deliberately NOT simHash — the distance is precomputed at upload
+// time precisely so fingerprints never have to travel to a browser.
+const QUEUE_SELECT = {
+  ...PUBLIC_UPLOAD_SELECT,
+  nearDuplicateDistance: true,
+  clamavStatus: true,
+  textWordCount: true,
+  textlessPageCount: true,
+};
+
+// What the dashboard needs about the book a near-duplicate matched: enough to
+// name it, link to it, and say whether the same archivist uploaded both.
+const MATCH_SELECT = {
+  arweaveHash: true,
+  title: true,
+  author: true,
+  status: true,
+  uploader: true,
+};
+
+// More than half the pages carrying no text reads as a part-scanned book.
+const MOSTLY_TEXTLESS_RATIO = 0.5;
 
 // Candidates per on-chain round trip. Each candidate costs three eth_calls
 // inside getStakeStatus, so a 50-book page is 150 reads — fine in sequence,
@@ -58,6 +83,76 @@ async function settleInChunks(items, fn, size = CHUNK_SIZE) {
     results.push(...(await Promise.allSettled(chunk.map(fn))));
   }
   return results;
+}
+
+/**
+ * What the automated checks found, and — just as important — what they could
+ * not check at all.
+ *
+ * This replaces the `X/100 (AI)` score the dashboard used to show, which no
+ * backend ever produced. The checks that do exist answer unrelated questions
+ * and do not average into one number: the security scan is pass/fail (and a
+ * failure is rejected at upload, so every book here passed), near-duplicate
+ * detection is a bit distance, and the text inventory is a precondition for
+ * both — a book with no text passes the content checks without being read.
+ *
+ * Categorising is done here rather than in the frontend so the rules are in one
+ * place and under test. The wording shown to the librarian belongs to the UI.
+ *
+ * @param {object} row — upload row selected with QUEUE_SELECT
+ * @param {object} [match] — the near-duplicate's own row, when it still exists
+ */
+function buildAudit(row, match) {
+  const flags = [];
+
+  const security = {
+    // Layer 2 rejects structural exploits outright, so a stored book passed.
+    structuralScan: 'passed',
+    // Null predates the column: "unknown", which is not the same as "not_run".
+    clamav: row.clamavStatus == null ? 'unknown' : row.clamavStatus === 'clean' ? 'clean' : 'not_run',
+  };
+
+  let duplicate = null;
+  if (row.isNearDuplicate && row.nearDuplicateOf) {
+    flags.push('NEAR_DUPLICATE');
+    duplicate = {
+      arweaveHash: row.nearDuplicateOf,
+      // Null when the match is a row this queue cannot see or no longer exists.
+      title: match ? match.title : null,
+      author: match ? match.author : null,
+      status: match ? match.status : null,
+      // A re-upload by the same archivist is a different conversation from one
+      // archivist re-publishing another's book.
+      sameUploader: Boolean(
+        match && row.uploader && match.uploader && match.uploader.toLowerCase() === row.uploader.toLowerCase()
+      ),
+      hammingDistance: row.nearDuplicateDistance ?? null,
+      threshold: NEAR_DUPLICATE_THRESHOLD,
+    };
+  }
+
+  let text = null;
+  if (row.textWordCount != null) {
+    const pageCount = row.pageCount || 0;
+    const textlessPages = row.textlessPageCount ?? null;
+
+    text = {
+      wordCount: row.textWordCount,
+      wordsPerPage: pageCount ? Math.round(row.textWordCount / pageCount) : null,
+      textlessPages,
+      pageCount: pageCount || null,
+    };
+
+    // No text at all: near-duplicate detection was skipped for this book, so
+    // the absence of a duplicate flag above means nothing.
+    if (row.textWordCount === 0) {
+      flags.push('NO_TEXT_LAYER');
+    } else if (pageCount && textlessPages != null && textlessPages > pageCount * MOSTLY_TEXTLESS_RATIO) {
+      flags.push('MOSTLY_TEXTLESS');
+    }
+  }
+
+  return { flags, security, duplicate, text };
 }
 
 /**
@@ -104,14 +199,14 @@ async function getReviewQueue(req, res, next) {
 
     const rows = await prisma.upload.findMany({
       where: { status: QUEUE_STATUS },
-      select: PUBLIC_UPLOAD_SELECT,
+      select: QUEUE_SELECT,
       orderBy: { uploadTimestamp: 'desc' },
       take: limit,
     });
 
     const settled = await settleInChunks(rows, (row) => getStakeStatus(row.arweaveHash));
 
-    const queue = [];
+    const challengeable = [];
     let unavailable = 0;
 
     rows.forEach((row, i) => {
@@ -128,15 +223,32 @@ async function getReviewQueue(req, res, next) {
       const stake = result.value;
       if (!isChallengeable(stake, librarianAddr)) return;
 
-      const book = toPublicUpload(row);
-      queue.push({
-        ...book,
-        staker: stake.staker ?? null,
-        stakeAmountAlex: stake.stakeAmountAlex ?? null,
-        stakeTime: stake.stakeTime ?? null,
-        challengePeriodEnds: stake.challengePeriodEnds ?? null,
-      });
+      challengeable.push({ row, stake });
     });
+
+    // The books the near-duplicate flags point at, fetched in one query for the
+    // whole page. Only the survivors need naming, so this runs after the chain
+    // filter rather than over every candidate.
+    const matchHashes = [
+      ...new Set(challengeable.map(({ row }) => row.nearDuplicateOf).filter(Boolean)),
+    ];
+    const matches = matchHashes.length
+      ? await prisma.upload.findMany({
+          where: { arweaveHash: { in: matchHashes } },
+          select: MATCH_SELECT,
+        })
+      : [];
+    const matchByHash = new Map(matches.map((m) => [m.arweaveHash, m]));
+
+    const queue = challengeable.map(({ row, stake }) => ({
+      ...toPublicUpload(row),
+      staker: stake.staker ?? null,
+      stakeAmountAlex: stake.stakeAmountAlex ?? null,
+      stakeTime: stake.stakeTime ?? null,
+      challengePeriodEnds: stake.challengePeriodEnds ?? null,
+      // Why this book is worth a look, and what was never checked on it.
+      audit: buildAudit(row, matchByHash.get(row.nearDuplicateOf)),
+    }));
 
     // Soonest deadline first — the only ordering that reflects what the
     // librarian is about to lose the ability to act on.
@@ -157,4 +269,12 @@ async function getReviewQueue(req, res, next) {
   }
 }
 
-module.exports = { getReviewQueue, isChallengeable, QUEUE_STATUS, DEFAULT_LIMIT, CHUNK_SIZE };
+module.exports = {
+  getReviewQueue,
+  isChallengeable,
+  buildAudit,
+  QUEUE_STATUS,
+  DEFAULT_LIMIT,
+  CHUNK_SIZE,
+  MOSTLY_TEXTLESS_RATIO,
+};

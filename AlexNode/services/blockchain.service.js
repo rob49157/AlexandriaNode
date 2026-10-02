@@ -215,6 +215,29 @@ async function getStakeStatus(arweaveHash) {
   };
 }
 
+/**
+ * Is this wallet an active librarian?
+ *
+ * One eth_call, kept apart from getStakeStatus because it asks about the caller
+ * rather than the book. Used to decide whether a review copy of the envelope may
+ * be served — the decryption Lit Action re-checks this inside the TEE, so a
+ * wrong answer here costs a served envelope, never a released key.
+ *
+ * @param {string} address wallet
+ */
+async function isActiveLibrarian(address) {
+  const { stake } = getContracts();
+
+  const info = await read(() => stake.librarians(address), { label: 'stake.librarians' });
+
+  return {
+    active: Boolean(info.active),
+    // Atomic units, as a string — see getStakeStatus for why.
+    stakeAmount: info.amount.toString(),
+    stakedSince: toIsoOrNull(toNumberSeconds(info.timestamp)),
+  };
+}
+
 // ─── Rent ────────────────────────────────────────────────────────────────────
 
 /**
@@ -290,6 +313,7 @@ module.exports = {
   getUploadStatusOnChain,
   getUploaderHashes,
   getStakeStatus,
+  isActiveLibrarian,
   isRentalActive,
   getBookRental,
 };

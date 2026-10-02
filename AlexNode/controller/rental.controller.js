@@ -8,10 +8,51 @@
 const prisma = require('../config/db');
 const { isValidArweaveHash } = require('./arweave');
 const { isValidWalletAddress } = require('../middleware/auth.middleware');
-const { isRentalActive, getBookRental, getUploadOnChain, ChainError } = require('../services/blockchain.service');
+const {
+  isRentalActive,
+  getBookRental,
+  getUploadOnChain,
+  getStakeStatus,
+  isActiveLibrarian,
+  ChainError,
+} = require('../services/blockchain.service');
 
 function badRequest(res, reason, message) {
   return res.status(400).json({ error: reason, message });
+}
+
+/**
+ * May this wallet open a book as a librarian reviewing it?
+ *
+ * Three on-chain facts, all of which AlexandriaStake.challengeUpload() requires
+ * too: the caller is an active librarian, the book has an active stake, and the
+ * 14-day window has not closed. The book's own uploader is excluded because the
+ * uploader carve-out has already answered for them, and a librarian cannot
+ * challenge their own upload in any case.
+ *
+ * Fails closed: an unreadable chain denies review rather than granting it.
+ *
+ * @param {string} arweaveHash
+ * @param {string} address wallet
+ * @returns {Promise<boolean>}
+ */
+async function isLibrarianReviewAllowed(arweaveHash, address) {
+  try {
+    const librarian = await isActiveLibrarian(address);
+    if (!librarian.active) return false;
+
+    const stake = await getStakeStatus(arweaveHash);
+
+    return Boolean(
+      stake.staked &&
+        stake.active &&
+        !stake.challengePeriodOver &&
+        stake.staker &&
+        stake.staker.toLowerCase() !== address.toLowerCase()
+    );
+  } catch (err) {
+    return false;
+  }
 }
 
 /**
@@ -145,6 +186,7 @@ async function getDecryptParams(req, res, next) {
     const isUploader = row.uploader && row.uploader.toLowerCase() === requester;
 
     let rental = null;
+    let librarianReview = false;
     if (!isUploader) {
       rental = await isRentalActive(params.arweaveHash, params.address);
 
@@ -156,20 +198,29 @@ async function getDecryptParams(req, res, next) {
       }
 
       if (!rental.active) {
-        return res.status(403).json({
-          error: 'no_active_rental',
-          message: rental.blacklisted
-            ? 'This address is blacklisted from renting.'
-            : 'No active rental for this address. Rent the book on-chain first.',
-          expiry: rental.expiry,
-        });
+        // A book in its challenge window is not rentable — Rent.rentBook()
+        // requires Approved status — so a librarian who has to read it before
+        // challenging cannot buy access even in good faith. Mirrors the
+        // preconditions of AlexandriaStake.challengeUpload(), and closes when
+        // the window does. The Lit Action re-checks all of it in the TEE.
+        librarianReview = await isLibrarianReviewAllowed(params.arweaveHash, params.address);
+
+        if (!librarianReview) {
+          return res.status(403).json({
+            error: 'no_active_rental',
+            message: rental.blacklisted
+              ? 'This address is blacklisted from renting.'
+              : 'No active rental for this address. Rent the book on-chain first.',
+            expiry: rental.expiry,
+          });
+        }
       }
     }
 
     return res.json({
       arweaveHash: row.arweaveHash,
       status: row.status,
-      grantedVia: isUploader ? 'uploader' : 'rental',
+      grantedVia: isUploader ? 'uploader' : librarianReview ? 'librarian_review' : 'rental',
       expiry: rental ? rental.expiry : null,
       // The sealed envelope { v, k, arweaveHash } and Lit's integrity hash for
       // it. Handed to the Lit Action, never opened here — the backend is not in
