@@ -465,10 +465,15 @@ const tagValue = (name) => (irys.lastTags.find((t) => t.name === name) || {}).va
       simHashBand3: 65535,
     },
     isNearDuplicate: true,
+    // Ranked closest-first by checkNearDuplicate; the controller persists the head.
     nearDuplicateMatches: [
       { arweaveHash: 'NeighbourHash000000000000000000000000000000', title: 'A Close Match', distance: 2, similarity: 96.9 },
+      { arweaveHash: 'FartherHash00000000000000000000000000000000', title: 'A Looser Match', distance: 3, similarity: 95.3 },
     ],
     clamavSkipped: true,
+    clamavStatus: 'unavailable',
+    textWordCount: 4200,
+    textlessPageCount: 0,
   });
 
   const nearRes = await runUpload(mockReq(pdf));
@@ -479,6 +484,13 @@ const tagValue = (name) => (irys.lastTags.find((t) => t.name === name) || {}).va
     db.rows[0].nearDuplicateOf === 'NeighbourHash000000000000000000000000000000',
     'Row records which upload it resembles'
   );
+  assert(db.rows[0].nearDuplicateDistance === 2, 'Row records how close that match was, in bits');
+
+  // The audit trail the librarian queue reads. The plaintext PDF is gone once
+  // this request returns, so anything not written here is unrecoverable.
+  assert(db.rows[0].clamavStatus === 'unavailable', 'Row records that the virus scanner was not running');
+  assert(db.rows[0].textWordCount === 4200, 'Row records how many words the fingerprint was built from');
+  assert(db.rows[0].textlessPageCount === 0, 'Row records how many pages carry no text');
 
   // ── On-chain registration failure ────────────────────────────────────────
   // By the time registration runs, the Arweave bytes are paid for and permanent.

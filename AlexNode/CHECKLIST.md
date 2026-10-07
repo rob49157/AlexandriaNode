@@ -417,7 +417,10 @@ integrity hash). **Both are required to decrypt** — the ciphertext alone is no
 
 ### 7b — Decryption Lit Action *(the security-critical piece)*
 
-JS pinned to IPFS, executed in the Lit TEE (`services/litAction.js`).
+JS pinned to IPFS, executed in the Lit TEE. The source lives in the **frontend** repo
+(`Alexandria-Front-end/src/services/litAction.js`), because the browser is what sends it
+to Lit and nothing server-side is in the decryption path. Its test suite and the CID
+registration script sit beside it there.
 
 - [x] Decrypt the envelope inside the TEE, then **read `arweaveHash` out of the decrypted
       plaintext — never from a `js_param`.** This is the entire guarantee. A caller-supplied

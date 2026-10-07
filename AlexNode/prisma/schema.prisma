@@ -55,6 +55,28 @@ model Upload {
   // surfaces the row for librarian review.
   isNearDuplicate   Boolean  @default(false)
   nearDuplicateOf   String?  // arweaveHash of the closest match, if any
+  // Hamming distance to that match: how many of the 64 fingerprint bits differ
+  // (0 = identical text; the flag threshold is 3). Stored rather than recomputed
+  // on read so the review queue never has to pull fingerprints out of Postgres.
+  nearDuplicateDistance Int?
+
+  // Layer 2 outcome, for the audit badge on the librarian dashboard.
+  // "clean" | "unavailable" | "timeout". An infected file is rejected outright
+  // and never reaches this table, so the only question left worth answering
+  // about a stored book is whether the virus scanner was running when it
+  // arrived. Null on rows written before this column existed.
+  clamavStatus      String?
+
+  // Layer 1 text inventory, counted with the SimHash tokenizer — so these are
+  // exactly the words the fingerprint above was built from.
+  //
+  // A scan with no OCR is a stack of page images: zero words, and nothing for
+  // near-duplicate detection (or any later content check) to read. Without
+  // these counts, a librarian cannot tell "no duplicate found" from "never
+  // checked". Null on older rows, which cannot be backfilled — the file on
+  // Arweave is encrypted and this backend cannot decrypt it.
+  textWordCount     Int?
+  textlessPageCount Int?     // Pages with fewer than TEXTLESS_PAGE_WORDS words
 
   // Banded LSH prefilter for near-duplicate lookup. Each column holds one
   // 16-bit slice of simHash, most-significant first. A candidate must match at

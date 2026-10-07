@@ -191,6 +191,12 @@ async function scanWithClamAV(buffer) {
 
 // --- Combined Layer 2 security scan ---
 
+// scanWithClamAV skipReason → the value persisted on the upload row.
+const CLAMAV_STATUS = {
+  clamav_unavailable: 'unavailable',
+  clamav_timeout: 'timeout',
+};
+
 // Run the full Layer 2 security scan pipeline:
 // Order: structural scan → encrypted check → ClamAV virus scan (fails fast on first threat).
 async function validateLayer2(pdfBuffer) {
@@ -209,6 +215,11 @@ async function validateLayer2(pdfBuffer) {
   return {
     valid: true,
     clamavSkipped: clamResult.skipped || false,
+    // A skipped scan is not a clean scan, and the difference has to survive as
+    // far as the librarian: an infected file is rejected here and never stored,
+    // so every book in the review queue "passed" — the only thing left worth
+    // saying is whether the virus scanner was actually running at the time.
+    clamavStatus: CLAMAV_STATUS[clamResult.skipReason] || 'clean',
   };
 }
 
@@ -218,4 +229,5 @@ module.exports = {
   scanWithClamAV,
   validateLayer2,
   DANGEROUS_PATTERNS,
+  CLAMAV_STATUS,
 };
