@@ -11,7 +11,17 @@ const { toPublicUpload, PUBLIC_UPLOAD_SELECT } = require('./upload.controller');
 
 // Statuses a caller may ask for. "pending_stake" is included so the frontend can
 // show an archivist their own unfinished uploads, but it is never the default.
-const SEARCH_STATUSES = ['approved', 'pending', 'pending_stake', 'challenged', 'rejected'];
+// pending_confirmation / storage_failed come from direct Arweave L1 storage
+// (ARWEAVE-DIRECT-PLAN.md §3): bytes not yet confirmed, or never mined.
+const SEARCH_STATUSES = [
+  'approved',
+  'pending',
+  'pending_stake',
+  'challenged',
+  'rejected',
+  'pending_confirmation',
+  'storage_failed',
+];
 
 // Only approved books are public by default. Anything else has not survived the
 // stake-and-challenge window yet, so it is opt-in via ?status=.
