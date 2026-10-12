@@ -9,7 +9,7 @@
 //   node scripts/arweave-spike.js large [--mb 150] [--eager] [--max-ar 2.1] --yes
 //   node scripts/arweave-spike.js watch <txId>           # mined? → chunks → confirmations → probes
 //   node scripts/arweave-spike.js status <txId>          # one-shot snapshot + read probes
-//   node scripts/arweave-spike.js report                 # Q1–Q9 evidence across every run
+//   node scripts/arweave-spike.js report                 # Q1–Q11 evidence across every run
 //
 // Uploads go to RAW Arweave nodes, never a gateway (decision D6). Nodes come from
 // ARWEAVE_NODE_URLS if set (e.g. our own node later), otherwise from GET /peers on
@@ -43,28 +43,31 @@ if (NODE_MAJOR < 22) {
   process.exit(1);
 }
 
-const Arweave = require('arweave');
+// The production module: wallet checks, node discovery (median-height tip), the
+// price quorum and ARWEAVE_MAX_REWARD_AR cap. Requiring it also validates env
+// (e.g. ARWEAVE_CONFIRMATIONS); a bad value is reported as one line, not a stack.
+let cfg;
+try {
+  cfg = require('../config/arweave');
+} catch (err) {
+  console.error(`✗ ${err.message}`);
+  process.exit(1);
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 const ROOT = path.resolve(__dirname, '..');
 const RUNS_DIR = path.join(ROOT, '.arweave-spike');
-const WALLET_FILE = path.resolve(ROOT, process.env.ARWEAVE_WALLET_FILE || '.arweave-wallet.json');
-const WALLET_ADDRESS = (process.env.ARWEAVE_WALLET_ADDRESS || '').trim();
-const list = (s) => (s || '').split(',').map((x) => x.trim()).filter(Boolean);
-// Explicit nodes skip discovery entirely (the Option B path: our own node).
-const EXPLICIT_NODES = list(process.env.ARWEAVE_NODE_URLS);
-// Seeds are used ONLY to learn peer addresses. Each peer is then verified directly.
-const PEER_SEEDS = list(process.env.ARWEAVE_PEER_SEEDS || 'https://arweave.net');
 // Gateways are used ONLY to read data back and compare it to the fixture (Q6).
-const GATEWAYS = list(process.env.ARWEAVE_GATEWAY_URLS || 'https://arweave.net,https://turbo-gateway.com');
-const CONFIRMATIONS = parseInt(process.env.ARWEAVE_CONFIRMATIONS, 10) || 15; // D2
+const GATEWAYS = cfg.ARWEAVE_GATEWAY_URLS;
+const CONFIRMATIONS = cfg.ARWEAVE_CONFIRMATIONS; // D2
 const ANCHOR_DEPTH = 50; // STORE_BLOCKS_BEHIND_CURRENT, ar.hrl [D8][D9]
+// Extra blocks waited past the anchor deadline before calling a tx dropped: the
+// node we ask may lag the tip by up to MAX_PEER_LAG (2), and a tx mined in the
+// last valid block needs a moment to show up in /status. Erring late is safe;
+// declaring a drop early would be wrong.
+const DROP_MARGIN = 3;
 const SERVE_LIMIT = 12 * 1024 * 1024; // MAX_SERVED_TX_DATA_SIZE [D11]
-const WINSTON_PER_AR = 10n ** 12n;
-const NETWORK = 'arweave.N.1'; // what mainnet nodes report in GET /info (observed 2026-10-11)
-const PEER_PROBE_LIMIT = 60; // how many /peers entries to health-check
-const MAX_PEER_LAG = 2; // blocks behind the best tip we saw; a lagging node misreports status
 const HEADER_PEERS = 3; // the same signed header goes to this many nodes (D6)
 const MAX_CHUNK_PEERS = 5; // chunk failover gives up after this many nodes
 const REPOST_EVERY_BLOCKS = 5; // re-send the header while unmined and still inside the anchor window
@@ -78,82 +81,46 @@ const option = (name, fallback) => {
 };
 const positional = args.slice(1).find((a) => !a.startsWith('--'));
 // --max-ar raises the cap for one run (the 150 MiB test costs ≈2.02 AR) without editing .env.
-const MAX_AR = Number(option('max-ar', process.env.SPIKE_MAX_AR || 1));
-
-function arweaveFor(url) {
-  const u = new URL(url);
-  return Arweave.init({
-    host: u.hostname,
-    port: u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80,
-    protocol: u.protocol.replace(':', ''),
-    timeout: 60_000,
-  });
+// This is the spike's own, tighter cap; ARWEAVE_MAX_REWARD_AR (config) still applies.
+// Parsed only by the commands that spend, so a typo cannot break `report` or `watch`.
+function spikeCapWinston() {
+  const raw = option('max-ar', process.env.SPIKE_MAX_AR || '1');
+  try {
+    return cfg.arToWinston(raw);
+  } catch (err) {
+    throw new Error(`--max-ar / SPIKE_MAX_AR: ${err.message}`);
+  }
 }
+const arweaveFor = cfg.arweaveFor;
 
 // Set by selectNodes(): healthy raw nodes, best first, and an arweave-js client on the first.
 let NODES = [];
 let arweave;
 
-async function probeNode(url) {
-  const t = Date.now();
-  try {
-    const res = await fetch(`${url}/info`, { signal: AbortSignal.timeout(5000) });
-    const info = await res.json();
-    return { url, ok: res.ok && info.network === NETWORK, height: info.height, release: info.release, ms: Date.now() - t };
-  } catch (err) {
-    return { url, ok: false, error: (err.cause && err.cause.code) || err.name };
-  }
-}
-
-async function peersFromSeeds() {
-  const found = [];
-  for (const seed of PEER_SEEDS) {
-    try {
-      const res = await fetch(`${seed}/peers`, { signal: AbortSignal.timeout(10_000) });
-      // Peers are "ip:port" and speak plain HTTP. That is safe for uploads: the header
-      // is signed (any change breaks the signature) and the data is already ciphertext.
-      found.push(...(await res.json()).map((p) => `http://${p}`));
-    } catch (err) {
-      console.log(`  peer seed ${seed} failed: ${err.message}`);
-    }
-  }
-  return found;
-}
-
 /**
- * Pick healthy raw nodes. `preferred` (e.g. the nodes a run already used) are kept
- * at the front if they are still healthy. Healthy = answers /info with the mainnet
- * network name and is within MAX_PEER_LAG blocks of the best height seen.
+ * Pick healthy raw nodes via config/arweave.js. Without `preferred` this is the
+ * module's cached list, the SAME one getPrice/getBalance use, so one discovery
+ * serves the whole command and the price comes from the nodes we post to.
+ * `preferred` (the nodes a resumed run already posted to) forces a fresh
+ * selection that keeps those at the front if they are still healthy.
  */
 async function selectNodes(preferred = []) {
-  const candidates = EXPLICIT_NODES.length ? EXPLICIT_NODES : (await peersFromSeeds()).slice(0, PEER_PROBE_LIMIT);
-  const urls = [...new Set([...preferred, ...candidates])];
-  if (!urls.length) throw new Error('No Arweave nodes to try. Set ARWEAVE_NODE_URLS or ARWEAVE_PEER_SEEDS.');
-  const probes = await Promise.all(urls.map(probeNode));
-  const ok = probes.filter((p) => p.ok);
-  if (!ok.length) throw new Error(`None of ${probes.length} Arweave nodes answered /info as ${NETWORK}.`);
-  const tip = Math.max(...ok.map((p) => p.height));
-  const healthy = ok
-    .filter((p) => p.height >= tip - MAX_PEER_LAG)
-    .sort((a, b) => preferred.includes(b.url) - preferred.includes(a.url) || a.ms - b.ms);
-  // The fastest peers cluster in a few address blocks (observed 2026-10-11: several
-  // 38.29.227.x and 165.254.143.x), likely one operator each. Put one node per /24
-  // first, so "3 header nodes" are not 3 machines of the same operator. A /24 is
-  // only a proxy for "different operator"; the protocol does not expose ownership.
-  const block = (url) => new URL(url).hostname.split('.').slice(0, 3).join('.');
-  const seen = new Set();
-  const spread = [];
-  const rest = [];
-  for (const p of healthy) {
-    if (preferred.includes(p.url) || !seen.has(block(p.url))) {
-      seen.add(block(p.url));
-      spread.push(p);
-    } else rest.push(p);
-  }
-  NODES = [...spread, ...rest].map((p) => p.url);
+  NODES = preferred.length ? await cfg.selectNodes(preferred) : await cfg.getNodes();
   arweave = arweaveFor(NODES[0]);
-  console.log(`  nodes: ${healthy.length} healthy of ${probes.length} probed (tip ${tip}); first: ${NODES.slice(0, HEADER_PEERS).join(', ')}`);
-  return { probes, tip };
+  console.log(`  nodes: ${NODES.length} healthy; first: ${NODES.slice(0, HEADER_PEERS).join(', ')}`);
+}
+
+// Height of the anchor block. The tx stays valid while that block is among the
+// last 50 [D2: "a hash of one of the last 50 blocks"], so the real deadline is
+// anchorHeight + 50, not "height when we signed" + 50. Which block /tx_anchor
+// picks relative to the tip is not documented; this records it (Q11).
+async function anchorHeight(anchor) {
+  try {
+    const res = await arweave.api.get(`block/hash/${anchor}`);
+    return res.status === 200 && Number.isSafeInteger(res.data && res.data.height) ? res.data.height : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Small helpers ───────────────────────────────────────────────────────────
@@ -191,19 +158,11 @@ function record(run, type, detail = {}) {
   console.log(`  [${event.t}] ${type}${Object.keys(detail).length ? ' ' + JSON.stringify(detail) : ''}`);
 }
 
-async function loadWallet() {
-  if (!fs.existsSync(WALLET_FILE)) {
-    throw new Error(`No wallet at ${WALLET_FILE}. Run: node scripts/arweave-spike.js wallet`);
-  }
-  const jwk = JSON.parse(fs.readFileSync(WALLET_FILE, 'utf8'));
-  const address = await arweave.wallets.jwkToAddress(jwk);
-  // Same guard as config/irys.js validateWalletKey(): a wrong key is a perfectly
-  // valid wallet that silently pays from (or fails against) the wrong address.
-  if (WALLET_ADDRESS && WALLET_ADDRESS !== address) {
-    throw new Error(`${WALLET_FILE} derives ${address} but ARWEAVE_WALLET_ADDRESS is ${WALLET_ADDRESS}.`);
-  }
-  return { jwk, address };
-}
+// Wallet loading, its checks (EVM address, public-only key, address mismatch),
+// balance and price all come from config/arweave.js, so Phase 0 measures the code
+// production will run rather than a copy of it.
+const loadWallet = () => cfg.loadWallet();
+const balanceOf = async () => (await cfg.getBalance()).winston;
 
 async function height() {
   return (await arweave.network.getInfo()).height;
@@ -229,19 +188,20 @@ async function readPrefix(res, limit) {
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 async function cmdWallet() {
-  if (!fs.existsSync(WALLET_FILE)) {
-    const jwk = await arweave.wallets.generate();
+  const file = cfg.ARWEAVE_WALLET_FILE;
+  if (!fs.existsSync(file)) {
+    const jwk = await cfg.offline.wallets.generate();
     // 'wx' = fail if it exists. Never overwrite a key that might hold funds.
-    fs.writeFileSync(WALLET_FILE, JSON.stringify(jwk), { flag: 'wx', mode: 0o600 });
-    console.log(`Created a new RSA-4096 storage wallet at ${WALLET_FILE}`);
+    fs.writeFileSync(file, JSON.stringify(jwk), { flag: 'wx', mode: 0o600 });
+    console.log(`Created a new RSA-4096 storage wallet at ${file}`);
     console.log('  ⚠️ Back this file up. Arweave keys "can never be recovered if lost" [D4].');
   }
   const { address } = await loadWallet();
-  const balance = await arweave.wallets.getBalance(address);
+  const balance = await balanceOf();
   console.log(`Address : ${address}`);
   console.log(`Balance : ${ar(balance)} (${balance} winston)`);
   console.log(`Node    : ${NODES[0]}`);
-  if (!WALLET_ADDRESS) console.log(`\nAdd to .env:  ARWEAVE_WALLET_ADDRESS=${address}`);
+  if (!cfg.ARWEAVE_WALLET_ADDRESS) console.log(`\nAdd to .env:  ARWEAVE_WALLET_ADDRESS=${address}`);
   if (BigInt(balance) === 0n) console.log('\nFund this address with AR before running small/large.');
 }
 
@@ -264,8 +224,8 @@ async function cmdSignTest() {
 
 async function cmdQuote() {
   const bytes = Math.round(Number(option('mb', 1)) * 1024 * 1024);
-  const price = await arweave.transactions.getPrice(bytes);
-  console.log(`${mib(bytes)} → ${price} winston = ${ar(price)}  (node: ${NODES[0]})`);
+  const price = await cfg.getPrice(bytes); // median of up to 3 nodes, capped
+  console.log(`${mib(bytes)} → ${price} winston = ${ar(price)}`);
 }
 
 /**
@@ -278,17 +238,26 @@ async function startRun(kind, { megabytes, mode, rewardMultiplier }) {
   const bytes = Math.round(megabytes * 1024 * 1024);
   const data = crypto.randomBytes(bytes);
 
-  const price = BigInt(await arweave.transactions.getPrice(bytes));
+  if (!(rewardMultiplier > 0) || !Number.isFinite(rewardMultiplier)) {
+    throw new Error(`--reward-multiplier must be a positive number, got ${rewardMultiplier}`);
+  }
+  // The same price path production will use: median of up to 3 nodes, capped.
+  const price = BigInt(await cfg.getPrice(bytes));
   const reward = (price * BigInt(Math.round(rewardMultiplier * 1000))) / 1000n;
-  const balanceBefore = await arweave.wallets.getBalance(address);
+  const balanceBefore = await balanceOf();
 
   console.log(`\n${kind.toUpperCase()} — ${mib(bytes)} random fixture, mode=${mode}`);
   console.log(`  nodes     ${NODES.slice(0, HEADER_PEERS).join(', ')}`);
   console.log(`  price     ${ar(price)}  ×${rewardMultiplier} → reward ${ar(reward)}`);
   console.log(`  balance   ${ar(balanceBefore)}`);
 
-  if (reward > BigInt(Math.round(MAX_AR * 1e6)) * (WINSTON_PER_AR / 1_000_000n)) {
-    throw new Error(`Reward ${ar(reward)} exceeds SPIKE_MAX_AR=${MAX_AR}. Raise it deliberately if intended.`);
+  const spikeCap = spikeCapWinston();
+  if (reward > spikeCap) {
+    throw new Error(`Reward ${ar(reward)} exceeds the spike cap of ${cfg.winstonToAr(spikeCap)} AR (SPIKE_MAX_AR / --max-ar). Raise it deliberately if intended.`);
+  }
+  // The multiplier is applied after getPrice's cap check, so re-check the final reward.
+  if (reward > cfg.ARWEAVE_MAX_REWARD_WINSTON) {
+    throw new Error(`Reward ${ar(reward)} exceeds ARWEAVE_MAX_REWARD_AR=${cfg.winstonToAr(cfg.ARWEAVE_MAX_REWARD_WINSTON)}.`);
   }
   const funded = BigInt(balanceBefore) >= reward;
   if (!flag('yes')) {
@@ -313,6 +282,11 @@ async function startRun(kind, { megabytes, mode, rewardMultiplier }) {
   // Q1: is the id exactly base64url(sha256(signature)), 43 chars? [D2]
   const derived = toB64url(crypto.createHash('sha256').update(b64urlToBuffer(tx.signature)).digest());
 
+  // Q11: the deadline counts from the anchor block. Fall back to the height at
+  // signing only if the node will not say (later than the truth, so still safe).
+  const anchorH = await anchorHeight(tx.last_tx);
+  const deadlineBase = anchorH ?? heightAtSign;
+
   const run = {
     kind,
     mode,
@@ -325,8 +299,10 @@ async function startRun(kind, { megabytes, mode, rewardMultiplier }) {
     priceAtSign: price.toString(),
     rewardMultiplier,
     anchor: tx.last_tx,
+    anchorHeight: anchorH,
     heightAtSign,
-    anchorDeadline: heightAtSign + ANCHOR_DEPTH,
+    anchorDeadline: deadlineBase + ANCHOR_DEPTH,
+    anchorDeadlineFrom: anchorH !== null ? 'anchor block' : 'height at signing (anchor height unavailable)',
     dataRoot: tx.data_root,
     checks: {
       idIsBase64url43: /^[A-Za-z0-9_-]{43}$/.test(tx.id),
@@ -369,7 +345,7 @@ async function startRun(kind, { megabytes, mode, rewardMultiplier }) {
   await broadcastHeader(run, run.headerNodes.slice(1), 'header_broadcast');
 
   run.postedAt = now();
-  run.balances.afterPost = await arweave.wallets.getBalance(address);
+  run.balances.afterPost = await balanceOf();
   await snapshotTx(run, 'after_header_post');
 
   if (mode === 'full') {
@@ -548,7 +524,7 @@ async function cmdWatch() {
     if (status.confirmed) {
       run.minedAt = now();
       run.minedHeight = status.confirmed.block_height;
-      run.balances.afterMined = await arweave.wallets.getBalance(run.address);
+      run.balances.afterMined = await balanceOf();
       record(run, 'mined', {
         blockHeight: status.confirmed.block_height,
         secondsSincePost: (Date.parse(run.minedAt) - Date.parse(run.postedAt)) / 1000,
@@ -557,10 +533,10 @@ async function cmdWatch() {
       await snapshotTx(run, 'after_mined');
       break;
     }
-    if (h > run.anchorDeadline) {
+    if (h > run.anchorDeadline + DROP_MARGIN) {
       // Q4's interesting case: a transaction that was never mined.
       run.droppedAt = now();
-      run.balances.afterDrop = await arweave.wallets.getBalance(run.address);
+      run.balances.afterDrop = await balanceOf();
       record(run, 'dropped', { height: h, balanceAfterDrop: run.balances.afterDrop });
       return;
     }
@@ -633,6 +609,8 @@ function cmdReport() {
     const bc = ev('header_broadcast')[0];
     console.log(`Q8 header nodes  first=${headerOnly ? headerOnly.status : '?'}  others=${bc ? JSON.stringify(bc.results.map((x) => x.status ?? x.error)) : 'n/a'}  reposts=${ev('header_reposted').length}`);
     console.log(`Q9 chunk nodes   ${JSON.stringify(r.chunkNodes || [])}  (more than one = failover happened)`);
+    const gap = Number.isSafeInteger(r.anchorHeight) ? r.heightAtSign - r.anchorHeight : '?';
+    console.log(`Q11 anchor       block ${r.anchorHeight ?? '?'}, signed at height ${r.heightAtSign} (anchor ${gap} blocks behind); deadline ${r.anchorDeadline} from ${r.anchorDeadlineFrom || 'height at signing'}`);
   }
 }
 

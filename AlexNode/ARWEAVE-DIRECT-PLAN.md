@@ -149,7 +149,7 @@ New nullable columns on `Upload`:
 ```prisma
 storageProvider      String?   // "arweave-l1" | "irys-devnet" (legacy rows)
 arweaveTxPostedAt    DateTime?
-arweaveAnchorHeight  Int?      // block height at signing → 50-block drop deadline
+arweaveAnchorHeight  Int?      // height of the ANCHOR block (not of signing) → drop deadline = this + 50
 arweaveBlockHeight   Int?      // height it was mined in
 arweaveConfirmations Int?
 arweaveUploaderState Json?     // serialised getUploader() state, no data [D4]
@@ -161,6 +161,11 @@ storageAttempts      Int       @default(0)
 `sha256Hash @unique` stays. On `storage_failed` the worker moves it aside (for example
 `failed:<hash>:<ts>`) so a re-upload passes dedup. **Inference:** this is simpler than
 making the unique index partial.
+
+**Also (code review, 2026-10-11):** the SimHash near-duplicate lookup in
+`services/dedup.service.js` must exclude `status = 'storage_failed'` rows. Otherwise
+every re-upload of a failed book is flagged as a near-duplicate of a row that has no
+bytes. Phase 4 adds this, together with a test.
 
 ### 4.5 New: `services/storage.service.js` (the worker)
 Same shape as `eventListener.service.js`: `start()`/`stop()`, a poll interval,
@@ -320,6 +325,45 @@ reports the same id.
 
 ---
 
+## 8c. Code review fixes (2026-10-11)
+
+Peers are unauthenticated and speak plain HTTP, so `config/arweave.js` no longer
+trusts any single one of them:
+- **Tip height is the median** of healthy peers when there are **3 or more**, not the
+  max. Under the old rule, one peer claiming height 10¹² evicted every honest node. A
+  height that is missing or not an integer makes the node unhealthy, rather than
+  producing NaN and caching an empty list.
+- **Price is the median of up to 3 quotes** (asked in parallel), and is refused above
+  `ARWEAVE_MAX_REWARD_AR` (default 3 AR, must be > 0). With 3 quotes, one inflated
+  quote cannot overpay and one deflated quote cannot shrink the reward into a drop.
+- **With fewer than 3 values, the highest wins** (`robustAgg`), for both heights and
+  prices. Two values cannot say which one is wrong, so the cheaper failure is picked.
+  A second check reproduced the lower median picking the wrong one in both cases:
+  pinned `[ours@950, public@1000]` kept only the lagging node, which serves anchors that
+  are already expiring; quotes `[1, 13530674461]` gave a fee of 1 winston, which can
+  never be mined. An inflated price is bounded by the cap. A single pinned node gives
+  one value, and for prices the cap is then the only guard.
+- `ARWEAVE_CONFIRMATIONS` / `ARWEAVE_MAX_REWARD_AR` are validated and fail loudly at
+  load, as one line in the scripts rather than a stack trace.
+- **The drop deadline counts from the anchor block**, not from signing. The tx is valid
+  while its anchor is among the last 50 blocks [D2]. Live, 2026-10-11: `/tx_anchor` on 3
+  nodes returned a block **5 behind the tip** (tip 2019454, anchor 2019449), so "signed
+  at + 50" overstated the window by ~10 min. The spike records the anchor height
+  (`GET /block/hash/{anchor}`) and calls a drop 3 blocks after the deadline (lag
+  margin). `arweaveAnchorHeight` in the schema holds the anchor block's height.
+- `scripts/arweave-spike.js` now uses `config/arweave.js` for the wallet, nodes,
+  balance and price, so Phase 0 measures production code rather than a copy. Commands
+  share the module's cached node list, so one discovery serves the whole command and
+  the price comes from the nodes we post to.
+- `SEARCH_STATUSES` was reverted: the storage-worker states are not catalogue states.
+
+**Known, accepted for now:** in `package-lock.json`, Irys's nested `arweave@1.15.7` is
+now `optional: true, peer: true`. A normal `npm install` / `npm ci` installs it. Only
+`--omit=optional` would drop it and break the Irys upload path. This goes away with
+Irys in Phase 6. Do not deploy with `--omit=optional` before then.
+
+---
+
 ## 9. Verify in Phase 0 (not assumed)
 
 1. Is `tx.id` after `sign()` the same base64url string nodes and gateways report? (Is
@@ -337,6 +381,9 @@ reports the same id.
 9. When chunk upload fails over to a second node mid-transaction, does it accept the rest?
 10. *(Not measured by the script yet.)* How long do nodes keep accepting chunks for a mined
     transaction whose data has not arrived? This bounds how long a crashed worker has to resume.
+11. How far behind the tip does `/tx_anchor` pick its block, and does it vary? One live
+    snapshot (2026-10-11, 3 nodes) said 5 blocks. Every run records `anchorHeight`, and
+    `report` prints the gap. The Phase 4 worker's deadline uses the anchor height.
 
 ---
 

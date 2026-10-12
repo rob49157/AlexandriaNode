@@ -36,7 +36,10 @@ model Upload {
   //   pending_confirmation — header posted, bytes not yet confirmed; the storage
   //                          worker owns the row until it leaves this state
   //   storage_failed       — header never mined within its 50-block anchor window;
-  //                          terminal, the archivist re-uploads (decision D1)
+  //                          terminal, the archivist re-uploads (decision D1). The
+  //                          worker must move sha256Hash aside (plan §4.4) and
+  //                          near-dup lookups must skip these rows, or the
+  //                          re-upload is rejected/flagged against a book with no bytes
   // pending_stake keeps its meaning ("bytes stored, not registered"); a row just
   // reaches it later, after ARWEAVE_CONFIRMATIONS.
   status            String   // "pending_confirmation" | "storage_failed" | "pending_stake" | "pending" | "challenged" | "approved" | "rejected"
@@ -102,9 +105,12 @@ model Upload {
   // which Irys network each one used is not recorded anywhere to backfill from.
   storageProvider      String?   // "arweave-l1" for every row written by the direct path
   arweaveTxPostedAt    DateTime? // when the signed header was first posted
-  // Block height when the tx was signed. The anchor is valid for 50 blocks
-  // (STORE_BLOCKS_BEHIND_CURRENT), so height > this + 50 with no confirmation
-  // means the header can never be mined → storage_failed.
+  // Height of the ANCHOR block (tx.last_tx), via GET /block/hash/{anchor} — not
+  // the height when the tx was signed. The tx is valid while its anchor is among
+  // the last 50 blocks (STORE_BLOCKS_BEHIND_CURRENT), so height > this + 50 with
+  // no confirmation means the header can never be mined → storage_failed.
+  // /tx_anchor picked a block 5 behind the tip on 3 nodes (2026-10-11), so
+  // "signed at + 50" would overstate the window by ~10 minutes.
   arweaveAnchorHeight  Int?
   arweaveBlockHeight   Int?      // height the header was mined in
   arweaveConfirmations Int?      // last observed; pending_stake once >= ARWEAVE_CONFIRMATIONS

@@ -72,7 +72,14 @@ const info = (height, network = 'arweave.N.1') => () => ({ body: { network, heig
 
 // ─── Config loader ───────────────────────────────────────────────────────────
 
-const ENV_KEYS = ['ARWEAVE_WALLET_FILE', 'ARWEAVE_WALLET_ADDRESS', 'ARWEAVE_NODE_URLS', 'ARWEAVE_PEER_SEEDS'];
+const ENV_KEYS = [
+  'ARWEAVE_WALLET_FILE',
+  'ARWEAVE_WALLET_ADDRESS',
+  'ARWEAVE_NODE_URLS',
+  'ARWEAVE_PEER_SEEDS',
+  'ARWEAVE_CONFIRMATIONS',
+  'ARWEAVE_MAX_REWARD_AR',
+];
 
 // config/arweave.js reads env at require time, like the other config modules,
 // so each scenario gets a fresh copy.
@@ -203,6 +210,73 @@ const file = (name) => path.join(tmp, name);
   let err = await rejects(cfg.getNodes());
   assert(err && err.code === 'arweave_unavailable', '15. Nothing healthy → arweave_unavailable, not an empty list');
 
+  // Review finding: the tip was max(height), so one liar evicted every honest node.
+  resetNet();
+  route('https://seed.test/peers', () => ({ body: [...peers, '10.0.9.9:1984'] }));
+  route('http://10.0.9.9:1984/info', info(1e12));
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_PEER_SEEDS: 'https://seed.test' });
+  const withLiar = await cfg.getNodes();
+  assert(
+    !withLiar.includes('http://10.0.9.9:1984') && withLiar.includes('http://10.0.1.1:1984') && withLiar.length === 3,
+    '15b. A peer claiming an absurd height is dropped; honest nodes stay (median tip)'
+  );
+
+  // Review finding: no numeric height made the tip NaN and cached an EMPTY list.
+  net.routes.clear();
+  route('http://a.test:1984/info', () => ({ body: { network: 'arweave.N.1' } }));
+  route('http://b.test:1984/info', () => ({ body: { network: 'arweave.N.1', height: '1000' } }));
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_NODE_URLS: 'http://a.test:1984,http://b.test:1984' });
+  err = await rejects(cfg.getNodes());
+  assert(err && err.code === 'arweave_unavailable', '15c. Missing or non-integer heights → arweave_unavailable, never an empty list');
+
+  // Env validation: an explicit value is honoured or rejected, never coerced.
+  assert(loadConfig({ ARWEAVE_CONFIRMATIONS: '' }).ARWEAVE_CONFIRMATIONS === 15, '15d. ARWEAVE_CONFIRMATIONS defaults to 15');
+  assert(loadConfig({ ARWEAVE_CONFIRMATIONS: '1' }).ARWEAVE_CONFIRMATIONS === 1, '15e. ARWEAVE_CONFIRMATIONS=1 is kept');
+  const badConfs = ['0', '-1', '2.5', 'abc'].map((v) => {
+    try {
+      loadConfig({ ARWEAVE_CONFIRMATIONS: v });
+      return null;
+    } catch (e) {
+      return e.message;
+    }
+  });
+  assert(badConfs.every((m) => m && m.includes('ARWEAVE_CONFIRMATIONS')), '15f. ARWEAVE_CONFIRMATIONS of 0, -1, 2.5, abc fail loudly at load');
+  let capErr = null;
+  try {
+    loadConfig({ ARWEAVE_MAX_REWARD_AR: '1e3' });
+  } catch (e) {
+    capErr = e;
+  }
+  assert(capErr && capErr.message.includes('ARWEAVE_MAX_REWARD_AR'), '15g. A malformed ARWEAVE_MAX_REWARD_AR fails loudly at load');
+  capErr = null;
+  try {
+    loadConfig({ ARWEAVE_MAX_REWARD_AR: '0' });
+  } catch (e) {
+    capErr = e;
+  }
+  assert(capErr && capErr.message.includes('greater than 0'), '15h. ARWEAVE_MAX_REWARD_AR=0 is rejected at load, not by refusing every upload');
+
+  // Second check (A): with 2 pinned nodes the lower median WAS the lagging node,
+  // which then served stale anchors. Under 3 healthy nodes the highest height wins.
+  net.routes.clear();
+  route('http://ours.test:1984/info', info(950));
+  route('http://public.test:1984/info', info(1000));
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_NODE_URLS: 'http://ours.test:1984,http://public.test:1984' });
+  const twoPinned = await cfg.getNodes();
+  assert(
+    twoPinned.length === 1 && twoPinned[0] === 'http://public.test:1984',
+    '15i. Two pinned nodes, ours 50 blocks behind → the current one is kept, the lagging one dropped'
+  );
+  net.routes.clear();
+  route('http://ours.test:1984/info', info(1000));
+  route('http://public.test:1984/info', info(999));
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_NODE_URLS: 'http://ours.test:1984,http://public.test:1984' });
+  const bothOk = await cfg.getNodes();
+  assert(
+    bothOk.length === 2 && bothOk[0] === 'http://ours.test:1984',
+    '15j. Two pinned nodes 1 block apart → both kept, configured order preserved'
+  );
+
   // ─── Balance and price ───────────────────────────────────────────────────
   console.log('\nBalance and price');
 
@@ -253,6 +327,83 @@ const file = (name) => path.join(tmp, name);
     cfg.winstonToAr('0') === '0' && cfg.winstonToAr('13530674461') === '0.013530674461' && cfg.winstonToAr('2023448219630') === '2.02344821963',
     '22. winstonToAr is exact (BigInt, no float rounding)'
   );
+  assert(
+    cfg.arToWinston('3') === 3000000000000n && cfg.arToWinston('2.1') === 2100000000000n && cfg.arToWinston('0.000000000001') === 1n,
+    '22b. arToWinston is exact'
+  );
+
+  // Price quorum: three quotes, one inflated by a liar → the median wins.
+  const threeNodes = (prices) => {
+    net.routes.clear();
+    net.calls = [];
+    ['a', 'b', 'c'].forEach((n, i) => {
+      route(`http://${n}.test:1984/info`, info(1000));
+      route(`http://${n}.test:1984/price/1048576`, () => ({ body: prices[i] }));
+    });
+    return loadConfig({
+      ARWEAVE_WALLET_FILE: file('wallet.json'),
+      ARWEAVE_NODE_URLS: 'http://a.test:1984,http://b.test:1984,http://c.test:1984',
+    });
+  };
+  cfg = threeNodes(['900000000000000', '13530674461', '13524203550']);
+  assert((await cfg.getPrice(1048576)) === '13530674461', '22c. One inflated quote out of three cannot raise the price (median)');
+  cfg = threeNodes(['1', '13530674461', '13524203550']);
+  assert((await cfg.getPrice(1048576)) === '13524203550', '22d. One deflated quote out of three cannot shrink it into an unminable reward');
+
+  // The cap: even a unanimous quote above ARWEAVE_MAX_REWARD_AR is refused.
+  cfg = threeNodes(['5000000000000', '5000000000000', '5000000000000']);
+  err = await rejects(cfg.getPrice(1048576));
+  assert(err && err.code === 'arweave_price_above_cap' && err.message.includes('5 AR'), '22e. A fee above the default 3 AR cap is refused, with the quotes');
+  net.routes.clear();
+  ['a', 'b', 'c'].forEach((n) => {
+    route(`http://${n}.test:1984/info`, info(1000));
+    route(`http://${n}.test:1984/price/1048576`, () => ({ body: '5000000000000' }));
+  });
+  cfg = loadConfig({
+    ARWEAVE_WALLET_FILE: file('wallet.json'),
+    ARWEAVE_NODE_URLS: 'http://a.test:1984,http://b.test:1984,http://c.test:1984',
+    ARWEAVE_MAX_REWARD_AR: '6',
+  });
+  assert((await cfg.getPrice(1048576)) === '5000000000000', '22f. Raising ARWEAVE_MAX_REWARD_AR lets the same fee through');
+
+  // Second check (B): with only 2 quotes the lower median WAS the deflated one,
+  // a reward that can never be mined. Under 3 quotes the highest wins (the cap bounds it).
+  twoNodes();
+  route('http://a.test:1984/price/1048576', () => ({ body: '1' }));
+  route('http://b.test:1984/price/1048576', () => ({ body: '13530674461' }));
+  cfg = pinnedTwo();
+  assert((await cfg.getPrice(1048576)) === '13530674461', '22g. Two quotes, one deflated → the higher one is used, not an unminable fee');
+  twoNodes();
+  route('http://a.test:1984/price/1048576', () => ({ body: '5000000000000' }));
+  route('http://b.test:1984/price/1048576', () => ({ body: '13530674461' }));
+  cfg = pinnedTwo();
+  err = await rejects(cfg.getPrice(1048576));
+  assert(err && err.code === 'arweave_price_above_cap', '22h. Two quotes, one inflated past the cap → refused, never paid');
+
+  // Second check (E): nodes are asked in parallel, so dead nodes cost one timeout total.
+  net.routes.clear();
+  ['a', 'b', 'c'].forEach((n) => {
+    route(`http://${n}.test:1984/info`, info(1000));
+    route(`http://${n}.test:1984/price/10`, () => ({ body: '42' }));
+  });
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_NODE_URLS: 'http://a.test:1984,http://b.test:1984,http://c.test:1984' });
+  await cfg.getNodes();
+  const plainFetch = global.fetch;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  global.fetch = async (url) => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, 30));
+    try {
+      return await plainFetch(url);
+    } finally {
+      inFlight--;
+    }
+  };
+  await cfg.getPrice(10);
+  global.fetch = plainFetch;
+  assert(maxInFlight === 3, '22i. Price quotes are requested in parallel, not one node after another');
 
   twoNodes();
   route(`http://a.test:1984/wallet/${address}/balance`, () => ({ body: '0' }));

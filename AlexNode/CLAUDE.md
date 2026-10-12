@@ -216,7 +216,9 @@ The old JSON-based `accessControlConditions` are deprecated (Datil network shut 
 
 ## Environment & Tooling
 
-- **Runtime:** Node.js v18+ (managed via nvm)
+- **Runtime:** Node.js **v22+** (managed via nvm; `.nvmrc` pins 22.21.1). Required by
+  `arweave@2.x` (direct Arweave L1 storage, see `ARWEAVE-DIRECT-PLAN.md`) and declared in
+  `package.json` `engines`. npm only warns on an engines mismatch, so check before deploying.
 - **Module System:** CommonJS (`"type": "commonjs"` in package.json)
 - **Framework:** Express.js
 - **Entry Point:** `index.js`

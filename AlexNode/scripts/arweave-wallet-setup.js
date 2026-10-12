@@ -20,7 +20,14 @@ if (NODE_MAJOR < 22) {
   process.exit(1);
 }
 
-const arweave = require('../config/arweave');
+// Requiring the config validates env; report a bad value as one line, not a stack.
+let arweave;
+try {
+  arweave = require('../config/arweave');
+} catch (err) {
+  console.error(`✗ ${err.message}`);
+  process.exit(1);
+}
 
 const MAX_FILE_SIZE_MB = Number(process.env.MAX_FILE_SIZE_MB || 150);
 
@@ -63,11 +70,18 @@ async function handleStatus() {
   console.log(`Nodes       : ${nodes.length} healthy${arweave.ARWEAVE_NODE_URLS.length ? ' (pinned by ARWEAVE_NODE_URLS)' : ''}; first ${nodes[0]}`);
 
   const balance = await arweave.getBalance();
-  const maxBytes = MAX_FILE_SIZE_MB * 1024 * 1024;
-  const [perMiB, perMax] = await Promise.all([arweave.getPrice(1024 * 1024), arweave.getPrice(maxBytes)]);
   console.log(`Balance     : ${balance.ar} AR (${balance.winston} winston)`);
+  console.log(`Max reward  : ${arweave.winstonToAr(arweave.ARWEAVE_MAX_REWARD_WINSTON)} AR per upload (ARWEAVE_MAX_REWARD_AR)`);
+
+  // MAX_FILE_SIZE_MB may be fractional; /price takes whole bytes.
+  const maxBytes = Math.round(MAX_FILE_SIZE_MB * 1024 * 1024);
+  const [perMiB, perMax] = await Promise.all([arweave.getPrice(1024 * 1024), arweave.getPrice(maxBytes)]);
   console.log(`Price 1 MiB : ${arweave.winstonToAr(perMiB)} AR`);
-  console.log(`Price ${MAX_FILE_SIZE_MB} MiB: ${arweave.winstonToAr(perMax)} AR  (largest allowed upload)`);
+  console.log(`Price max   : ${arweave.winstonToAr(perMax)} AR for ${MAX_FILE_SIZE_MB} MiB (largest allowed upload)`);
+  if (BigInt(perMax) === 0n) {
+    console.log('⚠️ The network quoted 0 for the largest upload. That is not a real price; check the nodes.');
+    return;
+  }
   const maxUploads = BigInt(balance.winston) / BigInt(perMax);
   console.log(`Covers      : ${maxUploads} upload(s) of the maximum size at today's price`);
   if (maxUploads === 0n) console.log('\n⚠️ The balance cannot cover one maximum-size upload. Top it up.');
