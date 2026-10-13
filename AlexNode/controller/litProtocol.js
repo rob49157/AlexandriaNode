@@ -12,7 +12,7 @@
 //                The backend only encrypts — it is never in the decryption path.
 //
 // Returns { encryptedPdf, iv, authTag, encryptedSymmetricKey, dataToEncryptHash }
-//   • encryptedPdf + iv + authTag  → stored on Arweave via Irys
+//   • encryptedPdf + iv + authTag  → stored on Arweave (direct L1, controller/arweave.js)
 //   • encryptedSymmetricKey + dataToEncryptHash → persisted to Postgres
 //     (dataToEncryptHash is the "litEncryptedKeyId" referenced elsewhere)
 //
@@ -27,7 +27,7 @@
 // value, which the caller cannot forge.
 //
 // This is why encryption is split into two calls: the arweaveHash only exists
-// once the Irys data item is signed, which happens between them.
+// once the Arweave transaction is signed, which happens between them.
 
 const crypto = require('crypto');
 const { litApiCall, LIT_PKP_ID } = require('../config/lit');
@@ -182,7 +182,7 @@ async function sealKey(symmetricKey, arweaveHash) {
  *
  * The caller owns the returned symmetricKey and MUST zero it (`.fill(0)`) once
  * sealKey has consumed it. It is split out from sealKey because the upload
- * pipeline has to sign the Irys transaction in between, to learn the arweaveHash
+ * pipeline has to sign the Arweave transaction in between, to learn the arweaveHash
  * that gets sealed alongside the key.
  *
  * Ciphertext comes back as a raw Buffer, not base64. Base64 would inflate the
@@ -208,7 +208,7 @@ function aesEncryptPdf(pdfBuffer) {
  *
  * Convenience wrapper over aesEncryptPdf + sealKey for callers that already know
  * the arweaveHash. The upload pipeline uses the two phases directly instead,
- * because it has to sign the Irys transaction between them.
+ * because it has to sign the Arweave transaction between them.
  *
  * arweaveHash is REQUIRED and has no default. An optional binding would be no
  * binding at all — the whole point is that a sealed key cannot exist without

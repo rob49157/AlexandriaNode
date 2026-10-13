@@ -1,7 +1,7 @@
 // Layer 2: PDF structural security scanner.
 //
 // Scans the raw PDF buffer for dangerous dictionary entries BEFORE encryption
-// or Arweave/Irys upload. Once on Arweave, storage is permanent and immutable —
+// or Arweave upload. Once on Arweave, storage is permanent and immutable —
 // malicious content can never be removed.
 //
 // Detected threats:
