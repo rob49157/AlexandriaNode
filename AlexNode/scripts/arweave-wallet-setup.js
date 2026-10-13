@@ -1,4 +1,4 @@
-// Arweave storage wallet setup and health check. Replaces scripts/irys-setup.js.
+// Arweave storage wallet setup and health check.
 //
 // Usage:
 //   node scripts/arweave-wallet-setup.js generate   # create the storage wallet file (never overwrites)

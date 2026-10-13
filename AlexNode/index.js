@@ -12,7 +12,9 @@ const rentalRoutes = require('./routes/rental.routes');
 const stakeRoutes = require('./routes/stake.routes');
 const chainRoutes = require('./routes/chain.routes');
 const librarianRoutes = require('./routes/librarian.routes');
+const storageRoutes = require('./routes/storage.routes');
 const eventListener = require('./services/eventListener.service');
+const storageWorker = require('./services/storage.service');
 const { notFound, errorHandler } = require('./middleware/error.middleware');
 
 const app = express();
@@ -40,6 +42,7 @@ app.use('/api', rentalRoutes);
 app.use('/api', stakeRoutes);
 app.use('/api', chainRoutes);
 app.use('/api', librarianRoutes);
+app.use('/api', storageRoutes);
 
 // 404 + global error handler — must be registered last, after all routes.
 app.use(notFound);
@@ -75,10 +78,27 @@ async function start() {
     console.log('[events] listener disabled (EVENT_LISTENER_ENABLED=false)');
   }
 
+  // Arweave storage worker: takes uploads from pending_confirmation (header
+  // posted) to stored, verified, and registered. Never awaited, like the
+  // listener. With STORAGE_WORKER_ENABLED=false uploads are still accepted: the
+  // header is posted, mined, and PAID, but no chunks are sent until a worker
+  // runs. How long nodes keep accepting chunks for a mined tx is unmeasured
+  // (plan §9 Q10), so do not leave the worker off while uploads come in.
+  if (process.env.STORAGE_WORKER_ENABLED !== 'false') {
+    try {
+      storageWorker.start();
+    } catch (err) {
+      console.error('[storage] worker failed to start:', err.message);
+    }
+  } else {
+    console.log('[storage] worker disabled (STORAGE_WORKER_ENABLED=false)');
+  }
+
   // Graceful shutdown: stop the listener, close the HTTP server and Prisma
   const shutdown = async (signal) => {
     console.log(`\n${signal} received, shutting down gracefully...`);
     eventListener.stop();
+    storageWorker.stop();
     server.close(async () => {
       await prisma.$disconnect();
       console.log('HTTP server closed and database disconnected');

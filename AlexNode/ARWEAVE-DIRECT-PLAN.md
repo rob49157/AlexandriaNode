@@ -174,8 +174,9 @@ Same shape as `eventListener.service.js`: `start()`/`stop()`, a poll interval,
 1. `transactions.getStatus(id)` [D4].
 2. **Not mined** and anchor height + 50 has passed → `storage_failed`, delete spool,
    free sha256.
-3. **Mined, chunks outstanding** → load spool + uploader state → `uploadChunk()` loop,
-   saving state after each chunk so a crash resumes [D4].
+3. **Mined, chunks outstanding** → load spool + uploader state → post each chunk to a
+   node that answers `200` (not arweave-js `uploadChunk()`, which stalls on `303`; §9
+   Q12), saving state after each chunk so a crash resumes [D4].
 4. **Chunks done and confirmations ≥ N** → (optional, Phase 0 decides) spot-check
    retrievability → delete spool → `pending_stake` → `registerOnChain()` (existing
    service, unchanged) → `pending` on success.
@@ -219,7 +220,7 @@ last worker error. 503 when the worker is stopped. This follows the reasoning be
 ### 4.11 Tests
 | File | Change |
 |---|---|
-| `tests/uploadFlow.test.js` | Replace the fake Irys with a fake arweave-js. ⚠️ Build the fake from **Phase 0's real responses**, not from this doc. That is the lesson of the base58 incident in `ARWEAVE-IRYS.md`. Assert a 202, `pending_confirmation`, no inline registration, the spool file written, and no spend on a Lit failure. |
+| `tests/uploadFlow.test.js` | Replace the fake Irys with a fake arweave-js. ⚠️ Build the fake from **Phase 0's real responses**, not from this doc. That is the lesson of the base58 incident in `ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history). Assert a 202, `pending_confirmation`, no inline registration, the spool file written, and no spend on a Lit failure. |
 | **New** `tests/storageWorker.test.js` | Not mined → wait; past deadline → `storage_failed` + sha256 freed; mined → chunks; crash mid-chunks → resume from saved state; confirmed → `pending_stake` → registration called once; registration failure stays `pending_stake`. |
 | `tests/readPaths.test.js`, `tests/chainReads.test.js` | Swap the `../config/irys` stub for `../config/arweave` |
 | `tests/keyBinding.demo.js`, `tests/encryption.manual.js` | No logic change; comments |
@@ -229,7 +230,7 @@ last worker error. 503 when the worker is stopped. This follows the reasoning be
   "two keys" paragraph becomes `ARWEAVE_WALLET_FILE` + `BACKEND_PRIVATE_KEY`), the
   "Irys Wallet Funding Model" (now an AR wallet), the project tree, the status list, and
   the roadmap Phase 1 (archivist-funded storage would mean archivists paying in AR).
-- `ARWEAVE-IRYS.md`: a banner saying "Retired 2026-11-01, see ARWEAVE-DIRECT.md", kept
+- `ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history): a banner saying "Retired 2026-11-01, see ARWEAVE-DIRECT.md", kept
   for history and the encoding incident.
 - `KEY-BINDING.md`: one line noting the binding is unchanged under L1.
 
@@ -251,7 +252,7 @@ controllers · validation, security scan, dedup · `abis/` · contracts.
   if built, is unaffected.
 - **Treasury**: buy AR and fund the storage wallet (`ARWEAVE-UPLOAD-OPTIONS.md` §A).
 - **Existing rows**: all current books are on Irys **devnet**, which "does not reach
-  Arweave" and expires after ~60 days (`ARWEAVE-IRYS.md`). There is nothing to migrate.
+  Arweave" and expires after ~60 days (`ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history)). There is nothing to migrate.
   Mark them `storageProvider: 'irys-devnet'`.
 
 ---
@@ -262,11 +263,11 @@ controllers · validation, security scan, dedup · `abis/` · contracts.
 |---|---|---|
 | **0. Spike** | A throwaway script on **mainnet** with a funded JWK and test fixtures only (never a real book). (a) 1 MiB upload. (b) ~60 MiB upload: header first, wait for mining, then chunks. Record real responses. | All §9 "verify in Phase 0" items answered. Responses saved as test fixtures. |
 | **1. Wallet + config** ✅ 2026-10-11 | `config/arweave.js`, `scripts/arweave-wallet-setup.js`, `.env.example`, Node 22, deps. Not yet on the request path. | Balance shows; address assertion works. **Met:** live `status` against mainnet nodes; `tests/arweaveConfig.test.js` 24/24 |
-| **2. Storage layer** | `controller/arweave.js` rewrite, spool | Unit tests against the Phase 0 fixtures |
-| **3. Schema + request path** | Migration ✅ 2026-10-11 (`20261011120000_arweave_l1_storage_fields`, applied to Neon; `SEARCH_STATUSES` extended). Still to do: `createUpload` → 202 | `uploadFlow.test.js` green |
-| **4. Worker** | `storage.service.js`, `index.js`, status route, registration gating | `storageWorker.test.js` green |
-| **5. Live** | Smoke test end to end on mainnet with a small fixture | Upload → confirmed → registered on Base Sepolia → fetched → decrypted |
-| **6. Cleanup** | Remove Irys deps/files, docs | `grep -ri irys` hits only history docs |
+| **2. Storage layer** ✅ 2026-10-13 | `controller/arweave.js` rewritten for raw L1 nodes: sign locally with our own anchor and fee; post the header (no data) to 3 nodes in different /24 blocks; push chunks ourselves to ≥2 nodes that answer `200` (Q12, D9); verify holders; `fetchEncrypted` reads chunk by chunk from raw nodes with Merkle proof + leaf hash checks (D8). `services/spool.service.js` (atomic writes, ciphertext only). Live-checked against the Phase 0 uploads: the 60 MiB book read back byte-identical in 39 s with no gateway. | `tests/helpers/fakeArweaveNetwork.js` built from recorded mainnet responses (`tests/fixtures/arweave-node-responses.json`) |
+| **3. Schema + request path** ✅ 2026-10-13 | Migration (applied to Neon 2026-10-11). `createUpload`: sign → balance check → seal → spool → row (`pending_confirmation`) → post header → **202**. Registration moved to the worker. `retryRegistration` → 409 `storage_not_confirmed` before storage is verified. Near-duplicate check ignores `storage_failed` rows. | `uploadFlow.test.js` 53/53 |
+| **4. Worker** ✅ 2026-10-13 | `services/storage.service.js`: re-post a lost header every 5 blocks; `storage_failed` after anchor + 50 + 3 blocks; chunks after mining; 16 confirmations + 2 verified copies → `pending_stake` → `registerUpload`; replication monitoring for 7 days (alerts only). `index.js` (`STORAGE_WORKER_ENABLED`); `GET /api/storage/status` and `GET /api/storage/:arweaveHash`. | `storageWorker.test.js` 45/45 |
+| **5. Live** ✅ 2026-10-13 | `scripts/smoke-test.js --full`, 26/26 on Arweave mainnet + Base Sepolia. **Part A** (`lNpEgp90sz5PoJZkJO0TxPM35psezksrtPsZnTOjPRc`): encrypt → store → read back from raw nodes → **decrypts to the original PDF**; wallet charged exactly the signed fee at mining. **Part B** (`0Nefi7adj5CU0hIYhDsRF3XXT1LGAUwB4i0rfDjSMCA`): real `POST /api/upload` → 202 → worker: mined ≈2 min, 2 copies, 16 confirmations ≈25 min after posting, both copies verified → `pending_stake` → `registerUpload` (throwaway archivist `0xE1F4A57322B2EA37A2BB687f48aafa6d25567A06`) → `pending`; event listener resolved `UploadRegistered`. Found and fixed on the way: reads only tried 8 nodes (missed both holders); a holder answering `no_offset` right after mining must not be dropped (seen again in Part A, then verified on retry). Not covered: decryption through the real path (needs the decryption Lit Action, KEY-BINDING.md). | Upload → confirmed → registered → fetched. Decrypt proven on stored bytes in Part A. |
+| **6. Cleanup** ✅ 2026-10-13 | Everything Irys deleted (decided 2026-10-13): `config/irys.js`, `scripts/irys-setup.js`, `ARWEAVE-IRYS.md`, `@irys/*` deps (and the nested arweave 1.15.7), `IRYS_*` env vars, test stubs, the base58 id decoder. `scripts/smoke-test.js` and `scripts/verify-upload.js` rewritten for L1. New `GET /api/storage/:hash/data` (raw-node, proof-checked ciphertext for the frontend; no gateway). CLAUDE.md, KEY-BINDING.md and CHECKLIST.md updated. Frontend: 202 + progress polling, reads through the backend, new statuses. Kept on purpose: the research docs, CHECKLIST history, and the applied migration's SQL comment (Prisma checksums applied migrations). | `grep -ri irys` hits only history docs |
 
 ⚠️ **There is no testnet** (`ARWEAVE-DIRECT.md` §10). Phases 0 and 5 spend real AR and
 publish permanently. The data is ciphertext of test fixtures, so it is harmless but
@@ -280,11 +281,13 @@ $3.40 (from the `/price` snapshot in `ARWEAVE-UPLOAD-OPTIONS.md`).
 | # | Decision | Outcome |
 |---|---|---|
 | D1 | Anchor type | **Block anchor** (arweave-js default via `GET /tx_anchor`). A drop becomes `storage_failed` and the archivist re-uploads. |
-| D2 | Confirmations before `pending_stake` | **`ARWEAVE_CONFIRMATIONS`, default 15** (ArDrive's choice [D10]; revisit with Phase 0 timings) |
+| D2 | Confirmations before `pending_stake` | **`ARWEAVE_CONFIRMATIONS`, default 16** (decided 2026-10-13; was 15, ArDrive's choice [D10]). Confirmations prove the header is final, NOT that data is stored; that is D9. |
 | D3 | JWK storage | **File path**, `ARWEAVE_WALLET_FILE` (default `.arweave-wallet.json`, gitignored) |
 | D4 | Runtime | **Node 22 + arweave-js 2.1.0.** Done: `package.json` `arweave ^2.1.0`, `engines.node >=22`, `.nvmrc` = `22.21.1` |
 | D5 | Dev spending | **Real AR, test fixtures only.** The spike refuses any fee above `SPIKE_MAX_AR` (default 1 AR) and only ever uploads random bytes tagged `App-Name=Alexandria-Spike`. |
-| D6 | Where uploads are posted (decided 2026-10-11) | **Raw peer nodes, not a gateway.** `arweave.net` is a gateway in front of the network, not a single node. Phase 0 posts headers and chunks to raw peers taken from `GET /peers` and checked with `GET /info`. Gateways are used only to read data back and check it. |
+| D6 | Where uploads are posted (decided 2026-10-11) | **Raw peer nodes, not a gateway.** `arweave.net` is a gateway in front of the network, not a single node. Phase 0 posts headers and chunks to raw peers taken from `GET /peers` and checked with `GET /info`. ~~Gateways are used only to read data back and check it.~~ Superseded 2026-10-12: no gateway anywhere by default. Reads come from raw nodes (D8). **Discovery is seeded from raw nodes too**: 10 built-in seeds, each verified 2026-10-12 (mainnet `/info` at the tip, non-empty `/peers`, one per /16), plus `.arweave-peers.json`, which saves the last 20 healthy nodes after every discovery so stale seed IPs are replaced automatically. Peer lists from different seeds are interleaved so no single seed fills the probe sample. |
+| D9 | When is a book "stored"? (decided 2026-10-13) | **We make the copies; we don't wait for propagation.** The worker pushes every chunk to at least `ARWEAVE_MIN_HOLDERS` (default 2) nodes that answer `200`, from different /24 blocks. Before `pending_stake`, each must serve the data back byte for byte, **and** the header must have `ARWEAVE_CONFIRMATIONS` (16). After `pending_stake`, replication is monitored but never blocks staking: an alert fires if verified holders drop below the minimum. Reason: live, a book reached 15 confirmations while only the one node we sent it to held its chunks (§9 Q13). |
+| D8 | Read path (decided 2026-10-12) | **No third-party gateways by default.** `ARWEAVE_GATEWAY_URLS` is empty unless someone adds gateways. Reads come from raw nodes via `/tx/{id}/offset` + `/chunk/{offset}`, verified byte for byte live (§9 Q13). This has no 12 MiB limit, unlike `/tx/{id}/data`. Q3 (the pre-mining 50 MiB limit) is deliberately left unmeasured, because the design always sends chunks after mining. |
 | D7 | Who pays for storage (decided 2026-10-11) | **For now, the treasury pays (model C), and every row records `arweaveReward`.** The fee is paid once, at upload: *"an upfront contribution, denominated in AR"* [D17]. It is fixed once signed, because `reward` is part of the signed header (`transaction.js`). Later options, to decide using the real per-book costs: **A**, the archivist pays at upload (needs a contract change and an AR→$ALEX rate; $ALEX has no market price on testnet); **B**, rentals pay it back (`setBookPrice` exists; how `processRentalPayment` splits payments is unverified). Unverified: whether the protocol's difficulty-based AR-per-byte price [D17] keeps the fiat cost stable. |
 
 ---
@@ -311,8 +314,9 @@ fail over between nodes before mining, so the 50 MiB limit is measured, not hidd
 `watch` finishes its chunks after mining. Every run's raw node responses are saved in
 `.arweave-spike/<txId>/run.json`; these become Phase 2's test fixtures.
 
-Nodes (D6): `selectNodes()` reads `GET /peers` from `ARWEAVE_PEER_SEEDS` (default
-`https://arweave.net`, used **only** to learn addresses), checks each candidate with
+Nodes (D6): `selectNodes()` reads `GET /peers` from the cached healthy nodes and
+`ARWEAVE_PEER_SEEDS` (default: 10 verified raw nodes, no gateway; used **only** to
+learn addresses), checks each candidate with
 `GET /info` (network `arweave.N.1`, within 2 blocks of the best height), and puts one node
 per /24 address block first. Setting `ARWEAVE_NODE_URLS` skips discovery (our own node,
 Option B). Observed 2026-10-11: 27–40 of 60 probed peers healthy; peers speak plain HTTP,
@@ -364,6 +368,26 @@ Irys in Phase 6. Do not deploy with `--omit=optional` before then.
 
 ---
 
+## 8d. Worker and request-path review fixes (2026-10-12)
+
+Each finding was checked against the code first. Each fix has a test that fails when
+the original bug is put back (all 10 re-introduced and caught).
+
+| # | Problem | Fix |
+|---|---|---|
+| 1 | Past the deadline, any 2xx to a re-post kept the row `pending_confirmation` forever (sha256 locked, spool kept); `isExpiredAnchorAnswer` was unused | "Invalid anchor" from any node fails it at once. A 2xx is humored for `EXPIRY_GRACE_BLOCKS` (10) more blocks, then it fails anyway: the protocol rejects the anchor, so the 2xx comes from a stale node. The fake network gained `postTxLag` to model one. |
+| 2 | Registration ran once; a gas or RPC blip left the book unregistered until a manual `POST /register`, and a thrown error was written to `storageError` | `retryRegistrations()` in every tick re-tries direct-path `pending_stake` rows with no `onChainTxHash`, backing off from 1 min (doubling) to a 1 h cap, kept in memory and shown in `health()`. `registerStored()` never throws. `already_registered` stops the retries, and the event listener takes over. |
+| 3 | Stake status reported every unregistered row as `pending_stake` | Reports `pending_confirmation` / `storage_failed` as such. |
+| 4 | Two hour-long pushes stopped the tick from reaching other rows | Every row gets a pass. Only chunk pushing is capped (`MAX_PARALLEL_PUSH` = 2); a row without a slot returns `push_queued`. |
+| 5 | The balance check ignored fees already signed into unmined headers | Subtracts the `arweaveReward` of `pending_confirmation` rows with no `arweaveBlockHeight` (charged at mining: Q4, all 4 runs). Two simultaneous requests can still both pass. |
+| 6 | Non-transient errors were labelled `storage_not_configured` and told to retry | A `StorageError` (e.g. `bad_tx_id`) keeps its code, as a 500, without "retry". Only transient errors say "retry". (`tags_too_large` never reached this path: `buildTags` errors already went to the generic 500.) |
+| 7 | Replication: 50 rows in no order, 1 checked per 30-min pass | The whole 7-day window is scanned, least recently checked first, 10 per pass. |
+| 8 | Every confirming pass read the whole spool | The spool is read only on a pass that pushes or verifies. (No Merkle rebuild happened while confirming, contrary to the report; only the read.) |
+| 9 | Mined-at-re-check fell back to the stale status: 0 confirmations, chunks a pass late | Proceeds as mined in the same pass. |
+| 10 | `fetchEncrypted` compared ids as strings | `sameTransactionId()` (decoded bytes), per CLAUDE.md. |
+
+---
+
 ## 9. Verify in Phase 0 (not assumed)
 
 1. Is `tx.id` after `sign()` the same base64url string nodes and gateways report? (Is
@@ -384,6 +408,89 @@ Irys in Phase 6. Do not deploy with `--omit=optional` before then.
 11. How far behind the tip does `/tx_anchor` pick its block, and does it vary? One live
     snapshot (2026-10-11, 3 nodes) said 5 blocks. Every run records `anchorHeight`, and
     `report` prints the gap. The Phase 4 worker's deadline uses the anchor height.
+12. **Which nodes keep a chunk long term?** *(Found live 2026-10-12, first paid run.)*
+    `POST /chunk` returned **`303 See Other`** with an empty body and no `Location`
+    from most nodes. In the node source [S6][S7] that is **not a failure**: `add_chunk`
+    validated the proof and persisted the chunk to the disk pool, then returned
+    `temporary` because `is_estimated_long_term_chunk` was false, meaning this node has
+    no storage module covering where the chunk lands. `200` means the node does expect
+    to keep it. Probes of chunk 0: 3 of 26 nodes answered 200 (tx pending), 4 of 25
+    (tx pending), 6 of 28 (tx mined); the rest were mostly 303, plus single
+    `exceeds_disk_pool_size_limit`, `data_root_not_found` and a non-node.
+    **Consequences:** arweave-js's uploader treats every non-200 as an error and
+    re-sends the same chunk indefinitely on a 303 [S4], so it stalls. The spike now
+    probes nodes with chunk 0, posts chunks itself to a node answering 200, advances
+    only on 200, and moves to the next node on a 303. **Phase 2's `uploadChunks` must
+    do the same; `getUploader().uploadChunk()` alone is not usable.** Still unknown
+    (no source found): whether chunks left only in 303 nodes' disk pools ever reach
+    long-term storage.
+13. **How many nodes hold the data, and how fast does it spread?** *(Measured
+    2026-10-12.)* Reads go straight to raw nodes: `GET /tx/{id}/offset`, then chunk i at
+    `GET /chunk/{offset − size + 1 + i·256 KiB}`, compared byte for byte with the
+    fixture. About 30 minutes after upload, chunks 1–3 of the first 1 MiB upload were
+    on the node we sent them to **and on `72.255.241.138` (ports 1984 and 1987), which
+    we never sent them to**. So the network did replicate, but to one more IP, which
+    is probably one operator. Chunk 0 cannot be used as evidence, because the chunk-node
+    probe posts it everywhere. An earlier reading ("6 nodes serve it") was this probe
+    artefact and was withdrawn. ~~**Open:** should the worker wait for N verified holders
+    from different operators before marking a book `pending_stake`?~~ **Answered by D9**
+    (2026-10-13): yes, 2 copies we push ourselves, both verified.
+
+---
+
+## 10. Open items
+
+### O1. How long will books persist on Arweave? — **not known; no guarantee exists** *(opened 2026-10-13)*
+
+Nobody guarantees a duration: not Arweave, not us. "Permanent" in this project means
+"paid for under Arweave's storage model", not "guaranteed forever". Do not describe
+it to users or the team as a guarantee.
+
+**What Arweave states** ([D17], quoted):
+- Users *"pay for 200 years' worth of replicated storage at present prices"*. This is
+  what the fee buys on paper, not a stated minimum.
+- Intent beyond that: *"only a 0.5% Kryder+ rate is sufficient to sustain the endowment
+  for an indefinite term"*; storage cost has fallen *"≈38.5% per year"* on average over
+  50 years.
+- Copies: *"miners do not accept new data… unless the fees cover storage of a sufficient
+  number of replicas"*. **No replica count is stated** (see also `ARWEAVE-DIRECT.md`,
+  open question 4).
+- It depends on the endowment, which changes *"with the volume of data committed, the
+  cost of data storage, and token value over time"*. So permanence assumes storage
+  keeps getting cheaper, AR keeps enough value, and miners keep running the network.
+
+**What we measured** (§9 Q12, Q13):
+
+| Period | Evidence |
+|---|---|
+| First ~30 min | 2 copies we pushed and verified (D9), plus 1 copy the network made on its own |
+| First 7 days | Our worker re-checks verified copies and alerts below `ARWEAVE_MIN_HOLDERS`; it never re-pushes |
+| After 7 days | **Nobody checks.** Persistence rests entirely on Arweave's incentives |
+
+**Temporary copies do not count.** A node answering `303` holds the chunk only in its
+disk pool. Pending data roots expire after `DEFAULT_DISK_POOL_DATA_ROOT_EXPIRATION_TIME_S
+= 30 * 60` (30 min, configurable) [S8]; once the chunk's offset matures, it is moved to
+long-term storage only on a node with storage covering that range, which a `303` node
+lacks [S7]. Live: `38.29.227.42` accepted chunk 0 with `303` on 2026-10-12 and no longer
+served it the next day. Exact lifetimes per node depend on configuration and on how
+fast the weave grows (the nodes we tested run older releases than the master source).
+
+**Options to close the gap** (to decide):
+1. **Option B: run our own Arweave node** storing the library's weave range, pinned in
+   `ARWEAVE_NODE_URLS`. Gives a copy we control, always readable, and a source to
+   re-push from.
+2. **Re-verify forever, not 7 days, and repair.** Periodically verify every book's
+   copies; if they drop below the minimum, push its chunks to a new long-term node.
+   Nodes accept chunks for a mined transaction, so no new fee is paid. **Caveat:** the
+   spool is deleted after storage, so repair needs the ciphertext from somewhere:
+   option 1's node, a surviving copy (read via `fetchEncrypted`), or a retained backup.
+   Not designed yet.
+3. **Accept the network's model** and say so explicitly in user-facing wording.
+
+**Side finding, same source:** master sets `DEFAULT_MAX_DISK_POOL_DATA_ROOT_BUFFER_MB =
+10000` for non-test builds [S8], not the 50 MiB per transaction the HTTP API docs give
+[D2]. Deployed nodes may differ. Q3 was deliberately left unmeasured (D8), so the
+design is unaffected.
 
 ---
 
@@ -396,3 +503,6 @@ Irys in Phase 6. Do not deploy with `--omit=optional` before then.
 - **S3** arweave-js `common.ts` (`createTransaction` fetches `getTransactionAnchor()` and `getPrice()` when not supplied): https://github.com/ArweaveTeam/arweave-js/blob/master/src/common/common.ts
 - **S4** arweave-js `transaction-uploader.ts` (`postTransaction`: data in body only when ≤ 1 chunk, otherwise "Post the transaction with no data"; 100 errors × ~40 s before giving up): https://github.com/ArweaveTeam/arweave-js/blob/master/src/common/lib/transaction-uploader.ts
 - **S5** arweave-js README, `wallets.getBalance`: https://github.com/ArweaveTeam/arweave-js
+- **S6** Arweave node `ar_http_iface_middleware.erl` `handle_post_chunk(validate_proof, …)`: `ok → 200`, `temporary → 303`, plus the 400/500 error mapping (master, accessed 2026-10-12): https://github.com/ArweaveTeam/arweave/blob/master/apps/arweave/src/ar_http_iface_middleware.erl
+- **S7** Arweave node `ar_disk_pool.erl` `add_chunk/6` (admission → proof validation → persist → `temporary` unless `is_estimated_long_term_chunk`), last changed 2026-08-07 (commit `712c2d1`): https://github.com/ArweaveTeam/arweave/blob/master/apps/arweave/src/ar_disk_pool.erl. Also `remove_expired_data_roots/0` and `route_chunk_by_maturity/6` (O1).
+- **S8** Arweave node `arweave_config.hrl` (`DEFAULT_DISK_POOL_DATA_ROOT_EXPIRATION_TIME_S = 30 * 60`; `DEFAULT_MAX_DISK_POOL_DATA_ROOT_BUFFER_MB = 10000`, 50 under `AR_TEST`), master, accessed 2026-10-13: https://github.com/ArweaveTeam/arweave/blob/master/apps/arweave_config/include/arweave_config.hrl

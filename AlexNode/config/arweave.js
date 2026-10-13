@@ -1,13 +1,13 @@
 // Arweave L1 client — the storage wallet, node selection, balance, and price.
 //
-// Replaces config/irys.js (ARWEAVE-DIRECT-PLAN.md §4.1). Until Phase 6 both exist:
-// controller/arweave.js still uploads through Irys, and nothing on the request
-// path requires this file yet.
+// See ARWEAVE-DIRECT-PLAN.md §4.1. Used by controller/arweave.js (uploads, reads)
+// and services/storage.service.js (the storage worker).
 //
 // No gateway or bundler sits on the write path (decision D6). Requests go to raw
 // Arweave nodes, either the operator's own (ARWEAVE_NODE_URLS, the Option B path)
-// or peers discovered via GET /peers and verified one by one with GET /info.
-// A seed is asked only for addresses; nothing it says about the network is trusted.
+// or peers discovered via GET /peers on raw seed nodes and verified one by one with
+// GET /info. A seed is asked only for addresses; nothing it says is trusted. No
+// gateway is used anywhere by default: not to write, read, or discover.
 //
 // This wallet is a dedicated, low-privilege storage wallet: it can pay for Arweave
 // bytes and nothing else. It is NOT the registrar (BACKEND_PRIVATE_KEY) and must
@@ -24,9 +24,34 @@ const ROOT = path.resolve(__dirname, '..');
 const ARWEAVE_WALLET_FILE = path.resolve(ROOT, process.env.ARWEAVE_WALLET_FILE || '.arweave-wallet.json'); // D3
 const ARWEAVE_WALLET_ADDRESS = (process.env.ARWEAVE_WALLET_ADDRESS || '').trim();
 const ARWEAVE_NODE_URLS = list(process.env.ARWEAVE_NODE_URLS);
-const ARWEAVE_PEER_SEEDS = list(process.env.ARWEAVE_PEER_SEEDS || 'https://arweave.net');
+// Discovery seeds are RAW nodes, not a gateway (decided 2026-10-12: no third
+// parties, including for discovery). Each was verified on 2026-10-12 to answer
+// /info as a mainnet node at the tip and to return a non-empty /peers list; one
+// per /16 address range, to spread them across operators. IPs go stale, so these
+// only bootstrap: every successful discovery saves the healthy nodes it found to
+// ARWEAVE_PEER_CACHE_FILE, and the next discovery seeds from that cache first.
+const DEFAULT_PEER_SEEDS = [
+  'http://148.113.226.53:1984',
+  'http://38.22.0.55:1984',
+  'http://186.244.240.76:1984',
+  'http://94.177.129.21:1980',
+  'http://78.29.33.13:1942',
+  'http://157.180.105.31:1984',
+  'http://94.130.141.13:1984',
+  'http://38.29.227.76:1985',
+  'http://18.143.34.211:1984',
+  'http://95.217.183.95:1984',
+];
+const ARWEAVE_PEER_SEEDS = list(process.env.ARWEAVE_PEER_SEEDS).length
+  ? list(process.env.ARWEAVE_PEER_SEEDS)
+  : DEFAULT_PEER_SEEDS;
+const ARWEAVE_PEER_CACHE_FILE = path.resolve(ROOT, process.env.ARWEAVE_PEER_CACHE_FILE || '.arweave-peers.json');
+const PEER_CACHE_SIZE = 20;
 // Read path only: fetching ciphertext back. Never used to upload or pay.
-const ARWEAVE_GATEWAY_URLS = list(process.env.ARWEAVE_GATEWAY_URLS || 'https://arweave.net,https://turbo-gateway.com');
+// Optional, and empty by default: no third-party gateway is relied on (decided
+// 2026-10-12). Reads come from raw nodes via GET /tx/{id}/offset + GET /chunk/{offset},
+// verified live byte-for-byte on 2026-10-12. Set this only to ADD gateways to try.
+const ARWEAVE_GATEWAY_URLS = list(process.env.ARWEAVE_GATEWAY_URLS);
 const WINSTON_PER_AR = 10n ** 12n;
 
 // Env numbers are validated, not coerced: `parseInt(x) || 15` turned an explicit
@@ -47,7 +72,23 @@ function arToWinston(ar) {
   return BigInt(m[1]) * WINSTON_PER_AR + BigInt((m[2] || '').padEnd(12, '0'));
 }
 
-const ARWEAVE_CONFIRMATIONS = positiveIntEnv('ARWEAVE_CONFIRMATIONS', 15); // D2
+const ARWEAVE_CONFIRMATIONS = positiveIntEnv('ARWEAVE_CONFIRMATIONS', 16); // D2 (16, decided 2026-10-13)
+// D9: chunks are pushed to at least this many long-term (200) nodes from different
+// /24 blocks, and each must serve the data back byte for byte before pending_stake.
+// Copies are made by us, not left to propagation (one node held a confirmed book
+// alone 30 min after upload, observed 2026-10-12).
+const ARWEAVE_MIN_HOLDERS = positiveIntEnv('ARWEAVE_MIN_HOLDERS', 2);
+// Percent added to the network quote. A reward above /price is accepted and mined
+// (Q7, ×1.1 on 2026-10-12), so this is a lever against congestion drops (D1). 0 by
+// default: every ×1 upload in Phase 0 was mined in the next block.
+const ARWEAVE_REWARD_MARGIN_PERCENT = (() => {
+  const raw = (process.env.ARWEAVE_REWARD_MARGIN_PERCENT || '').trim();
+  if (!raw) return 0;
+  if (!/^\d+$/.test(raw) || Number(raw) > 100) {
+    throw new Error(`ARWEAVE_REWARD_MARGIN_PERCENT="${raw}" must be a whole number from 0 to 100.`);
+  }
+  return Number(raw);
+})();
 // The most one upload may pay, in AR. The fee comes from nodes over plain HTTP and
 // becomes the signed reward (D7), so a lying node must not be able to set it.
 // Default 3 AR ≈ 1.5× the largest allowed upload (150 MiB ≈ 2.02 AR on 2026-10-11).
@@ -153,7 +194,7 @@ let _wallet;
  * Check the wallet file before anything uses it.
  *
  * Each mistake is named, because each otherwise surfaces later as something
- * misleading (same reasoning as config/irys.js validateWalletKey):
+ * misleading:
  *   1. No file: the setup step was skipped.
  *   2. An EVM 0x address in ARWEAVE_WALLET_ADDRESS. Arweave and Ethereum addresses
  *      are not compatible, and AR sent to an Ethereum address is lost [ECDSA docs].
@@ -243,19 +284,58 @@ async function probeNode(url) {
   }
 }
 
-async function peersFromSeeds() {
-  const found = [];
-  for (const seed of ARWEAVE_PEER_SEEDS) {
-    try {
-      const res = await fetch(`${seed}/peers`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      // Peers are "ip:port" over plain HTTP. Acceptable: headers are signed and the
-      // data is already AES-GCM ciphertext, so a node can refuse but not alter.
-      found.push(...(await res.json()).map((p) => `http://${p}`));
-    } catch (err) {
-      console.warn(`[arweave] peer seed ${seed} failed: ${err.message}`);
-    }
+// Healthy nodes from the last successful discovery. Best effort: a missing or
+// corrupt file just means bootstrapping from ARWEAVE_PEER_SEEDS alone.
+function readPeerCache() {
+  try {
+    const { nodes } = JSON.parse(fs.readFileSync(ARWEAVE_PEER_CACHE_FILE, 'utf8'));
+    return Array.isArray(nodes) ? nodes.filter((u) => typeof u === 'string' && /^https?:\/\/[^/\s]+$/.test(u)) : [];
+  } catch {
+    return [];
   }
-  return found;
+}
+
+function writePeerCache(nodes) {
+  try {
+    fs.writeFileSync(
+      ARWEAVE_PEER_CACHE_FILE,
+      JSON.stringify({ savedAt: new Date().toISOString(), nodes: nodes.slice(0, PEER_CACHE_SIZE) }, null, 2)
+    );
+  } catch (err) {
+    console.warn(`[arweave] could not save peer cache ${ARWEAVE_PEER_CACHE_FILE}: ${err.message}`);
+  }
+}
+
+/**
+ * Candidate nodes: the seeds themselves (cached healthy nodes first, then
+ * ARWEAVE_PEER_SEEDS) plus every peer they report. Seeds are asked in parallel.
+ * Their peer lists are interleaved round-robin before the PEER_PROBE_LIMIT cut,
+ * so the probed sample draws from every seed, not just the first one, and one
+ * seed cannot fill the sample with its own picks.
+ */
+async function peersFromSeeds() {
+  const seeds = [...new Set([...readPeerCache(), ...ARWEAVE_PEER_SEEDS])];
+  const lists = await Promise.all(
+    seeds.map(async (seed) => {
+      try {
+        const res = await fetch(`${seed}/peers`, { signal: AbortSignal.timeout(10_000) });
+        // Peers are "ip:port" over plain HTTP. Acceptable: headers are signed and the
+        // data is already AES-GCM ciphertext, so a node can refuse but not alter.
+        const peers = await res.json();
+        return Array.isArray(peers) ? peers.filter((p) => typeof p === 'string').map((p) => `http://${p}`) : [];
+      } catch (err) {
+        return [];
+      }
+    })
+  );
+  if (lists.every((l) => !l.length)) {
+    console.warn(`[arweave] none of ${seeds.length} peer seeds returned peers; probing the seeds alone`);
+  }
+  const interleaved = [];
+  for (let i = 0; lists.some((l) => i < l.length); i++) {
+    for (const l of lists) if (i < l.length) interleaved.push(l[i]);
+  }
+  return [...new Set([...seeds, ...interleaved])];
 }
 
 /**
@@ -310,7 +390,9 @@ async function selectNodes(preferred = []) {
       spread.push(p);
     }
   }
-  return [...spread, ...rest].map((p) => p.url);
+  const selected = [...spread, ...rest].map((p) => p.url);
+  writePeerCache(selected);
+  return selected;
 }
 
 /**
@@ -438,8 +520,12 @@ module.exports = {
   ARWEAVE_WALLET_ADDRESS,
   ARWEAVE_NODE_URLS,
   ARWEAVE_PEER_SEEDS,
+  ARWEAVE_PEER_CACHE_FILE,
+  DEFAULT_PEER_SEEDS,
   ARWEAVE_GATEWAY_URLS,
   ARWEAVE_CONFIRMATIONS,
+  ARWEAVE_MIN_HOLDERS,
+  ARWEAVE_REWARD_MARGIN_PERCENT,
   ARWEAVE_SPOOL_DIR,
   _reset,
 };

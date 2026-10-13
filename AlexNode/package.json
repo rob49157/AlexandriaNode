@@ -17,8 +17,6 @@
   },
   "keywords": [],
   "dependencies": {
-    "@irys/upload": "^0.0.15",
-    "@irys/upload-ethereum": "^0.0.16",
     "@prisma/client": "^5.12.1",
     "arweave": "^2.1.0",
     "cors": "^2.8.6",

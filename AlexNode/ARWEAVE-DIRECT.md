@@ -27,7 +27,7 @@ Irys's migration page says [1]:
 > an Arweave-compatible upload path before the retirement date.
 
 That is **three weeks from today**. Staying on Irys after that date means our books go
-to Irys L1, not Arweave. [`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md) already explains why that
+to Irys L1, not Arweave. `ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history) already explains why that
 is unacceptable for Alexandria: permanence on a multi-miner protocol is the product.
 
 The same page also says [1]:
@@ -277,7 +277,7 @@ and tops up a lightly funded storage wallet, which now holds AR.
 - We found no source describing a public Arweave testnet comparable to Irys devnet.
   The repo has a `testnet/` scripts directory [21], but nothing says it is public.
 
-⚠️ Remember the lesson in `ARWEAVE-IRYS.md`: a mock certifies your assumptions.
+⚠️ Remember the lesson in `ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history): a mock certifies your assumptions.
 **Inference:** before mainnet, do at least one small real L1 upload on mainnet. Under
 the 12 MiB serve limit costs cents. Do not rely on arlocal, which is archived and may
 pre-date format-2 chunking.
@@ -327,7 +327,7 @@ we lost with Irys.
 | `services/registration.service.js` | Register only after N confirmations |
 | `package.json` / Node | `arweave@^2.1.0`, Node ≥ 22 |
 | Remove | `@irys/upload`, `@irys/upload-ethereum`, `IRYS_*` env |
-| `ARWEAVE-IRYS.md`, CLAUDE.md | Mark the Irys path as retired, link here |
+| `ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history), CLAUDE.md | Mark the Irys path as retired, link here |
 
 ---
 

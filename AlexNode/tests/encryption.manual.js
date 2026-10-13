@@ -16,7 +16,7 @@ require('dotenv').config();
 const { LIT_API_URL, LIT_API_KEY, LIT_PKP_ID } = require('../config/lit');
 const { generateSymmetricKey, aesEncrypt, sealKey, encryptPdf } = require('../controller/litProtocol');
 
-// Stand-in for a real Irys tx id — sealKey binds the key to it.
+// Stand-in for a real Arweave tx id — sealKey binds the key to it.
 const FAKE_ARWEAVE_HASH = 'wKrH0V1ULRvKtBTAM7VuVDvJxaN8kQrPFuGDf1RYkZ4';
 
 // ── Pre-flight checks ────────────────────────────────────────────────────────

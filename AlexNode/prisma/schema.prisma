@@ -100,9 +100,9 @@ model Upload {
   simHashBand3      Int      @default(0)
 
   // ─── Direct Arweave L1 storage (ARWEAVE-DIRECT-PLAN.md §4.4) ───────────────
-  // All nullable: rows written before this migration went through Irys and have
+  // All nullable: rows written before this migration used the retired upload path and have
   // none of this. Null storageProvider = such a row; it is not backfilled, because
-  // which Irys network each one used is not recorded anywhere to backfill from.
+  // which network each one used is not recorded anywhere to backfill from.
   storageProvider      String?   // "arweave-l1" for every row written by the direct path
   arweaveTxPostedAt    DateTime? // when the signed header was first posted
   // Height of the ANCHOR block (tx.last_tx), via GET /block/hash/{anchor} — not

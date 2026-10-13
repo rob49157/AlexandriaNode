@@ -1,0 +1,101 @@
+{
+  "capturedAt": "2026-10-13T00:38:28.720Z",
+  "note": "Verbatim responses from a raw Arweave mainnet node (69.124.94.88:1984) for spike tx 0jeoz95MAvdEH9uH-7Nqf28MYEt3_8CzWArTSRztx-0. Large bodies are summarised as keys/lengths.",
+  "txAnchor": {
+    "status": 200,
+    "contentType": null,
+    "body": "QlMy5Xs3wItihRO_J_6QKhaEYyHBijX6YCzQU9UBfMjCR128XqDzHThGkIya1VyJ"
+  },
+  "blockByHash": {
+    "status": 200,
+    "contentType": null,
+    "bodyKeysSample": [
+      "replica_format",
+      "packing_difficulty",
+      "unpacked_chunk_hash",
+      "unpacked_chunk2_hash",
+      "chunk2_hash",
+      "merkle_rebase_support_threshold",
+      "chunk_hash",
+      "block_time_history_hash",
+      "recall_byte2",
+      "hash_preimage",
+      "recall_byte",
+      "reward"
+    ],
+    "heightType": "number"
+  },
+  "txStatusMined": {
+    "status": 200,
+    "contentType": null,
+    "body": "{\"block_height\":2019517,\"block_indep_hash\":\"50_QuL9W6me3MODdqpO_BFuw7ACva_Q8rLoy3vx_3K7E4MCukEGiBWlO5fBFE5c1\",\"number_of_confirmations\":661}"
+  },
+  "txStatusUnknown": {
+    "status": 404,
+    "contentType": null,
+    "body": "Not Found."
+  },
+  "txOffset": {
+    "status": 200,
+    "contentType": null,
+    "body": "{\"size\":\"1048576\",\"offset\":\"392123378082038\"}"
+  },
+  "chunkGet": {
+    "status": 200,
+    "contentType": null,
+    "bodyKeys": [
+      "data_path",
+      "tx_path",
+      "absolute_end_offset",
+      "packing",
+      "chunk",
+      "chunk_size"
+    ],
+    "chunkB64Len": 349526,
+    "dataPathB64Len": 470
+  },
+  "chunkGetMissing": {
+    "status": 404,
+    "contentType": null,
+    "body": ""
+  },
+  "txPostAlreadyMined": {
+    "status": 400,
+    "contentType": null,
+    "body": "Invalid anchor (last_tx)."
+  },
+  "infoKeys": [
+    "version",
+    "release",
+    "queue_length",
+    "peers",
+    "node_state_latency",
+    "network",
+    "height",
+    "git_hash",
+    "current",
+    "cached_blocks",
+    "blocks"
+  ],
+  "infoNetwork": "arweave.N.1",
+  "txHeaderGet": {
+    "status": 200,
+    "bodyKeys": [
+      "format",
+      "id",
+      "last_tx",
+      "owner",
+      "tags",
+      "target",
+      "quantity",
+      "data",
+      "data_size",
+      "data_tree",
+      "data_root",
+      "reward",
+      "signature"
+    ],
+    "format": 2,
+    "data": ""
+  }
+}

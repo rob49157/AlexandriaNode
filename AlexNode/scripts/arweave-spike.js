@@ -24,9 +24,8 @@
 //   • every item is tagged App-Name=Alexandria-Spike, so it is never mistaken for
 //     a real Alexandria upload by anything that indexes our tags later.
 //
-// Why record raw responses: the base58 incident (ARWEAVE-IRYS.md). The Irys fake
-// in uploadFlow.test.js was written from a doc instead of from reality, so it
-// certified a bug. Phase 2's fake arweave-js is built from what this script
+// Why record raw responses: the base58 incident (CLAUDE.md, "id encoding"). A test
+// fake written from a doc instead of from reality certified a bug. Phase 2's fake arweave-js is built from what this script
 // saves in .arweave-spike/<txId>/run.json — not from ARWEAVE-DIRECT.md.
 
 require('dotenv').config({ quiet: true });
@@ -164,8 +163,38 @@ function record(run, type, detail = {}) {
 const loadWallet = () => cfg.loadWallet();
 const balanceOf = async () => (await cfg.getBalance()).winston;
 
+// Read-only calls during long waits fail over across nodes: one dropped
+// connection must not end a 30-minute watch (it did, 2026-10-12: "fetch failed").
+// The node that answered becomes the default for the next call.
+async function withFailover(fn) {
+  let lastErr;
+  for (const url of NODES.slice(0, 5)) {
+    try {
+      const result = await fn(arweaveFor(url));
+      if (url !== NODES[0]) {
+        NODES = [url, ...NODES.filter((n) => n !== url)];
+        arweave = arweaveFor(url);
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 async function height() {
-  return (await arweave.network.getInfo()).height;
+  return withFailover(async (a) => (await a.network.getInfo()).height);
+}
+
+// arweave-js getStatus() does not throw on HTTP errors; a non-200/202/404 answer
+// is treated as this node failing so the next one is asked.
+async function txStatus(txId) {
+  return withFailover(async (a) => {
+    const s = await a.transactions.getStatus(txId);
+    if (![200, 202, 404].includes(s.status)) throw new Error(`status ${s.status}`);
+    return s;
+  });
 }
 
 // Read at most `limit` bytes of a response body, then drop the connection, so a
@@ -353,8 +382,13 @@ async function startRun(kind, { megabytes, mode, rewardMultiplier }) {
     // In --eager mode on a larger fixture, we EXPECT errors here — that is Q3.
     // Stop after a few consecutive errors instead of arweave-js's ~1 hour of retries,
     // and do NOT fail over: moving to another node would hide the limit we are measuring.
-    run.chunkNodes.push(NODES[0]);
-    run.chunksComplete = await pushChunks(run, uploader, { stopAfterErrors: 3 });
+    const longTerm = await findLongTermNodes(run, uploader);
+    if (!longTerm.length) {
+      record(run, 'chunks_paused', { reason: 'no node answered 200 for chunk 0' });
+    } else {
+      run.chunkNodes.push(longTerm[0]);
+      run.chunksComplete = await pushChunks(run, uploader, { stopAfterErrors: 3, node: longTerm[0] });
+    }
     saveRun(run);
   }
 
@@ -366,37 +400,79 @@ function saveUploader(txId, uploader) {
   fs.writeFileSync(path.join(runDir(txId), 'uploader.json'), JSON.stringify(uploader));
 }
 
-async function pushChunks(run, uploader, { stopAfterErrors }) {
+// POST /chunk outcomes, from the node source (ar_http_iface_middleware.erl
+// handle_post_chunk + ar_disk_pool.erl add_chunk, master @ 2026-08-07):
+//   200 — accepted, and this node estimates it will keep the chunk long term
+//   303 — accepted into its disk pool, proof valid and persisted, but the node has
+//         no storage module covering where the chunk lands (`temporary`). Observed
+//         live 2026-10-11 from 21 of 26 healthy nodes.
+// arweave-js treats every non-200 as an error and re-sends the same chunk forever
+// on a 303, so chunks are posted here directly, advancing only on 200.
+const FATAL_CHUNK_ERRORS = ['invalid_json', 'chunk_too_big', 'data_path_too_big', 'offset_too_big', 'data_size_too_big', 'chunk_proof_ratio_not_attractive', 'invalid_proof']; // arweave-js FATAL_CHUNK_UPLOAD_ERRORS
+
+async function postChunk(node, uploader, index) {
+  const chunk = uploader.transaction.getChunk(index, uploader.data);
+  try {
+    const res = await fetch(`${node}/chunk`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(chunk),
+      signal: AbortSignal.timeout(60_000),
+    });
+    return { status: res.status, body: (await res.text()).slice(0, 200) };
+  } catch (err) {
+    return { status: -1, body: (err.cause && err.cause.code) || err.message };
+  }
+}
+
+// Q12: which healthy nodes answer 200 (keep long term) for this transaction's
+// chunk 0? Re-posting a chunk is idempotent, so probing every node is harmless.
+async function findLongTermNodes(run, uploader) {
+  const results = await Promise.all(NODES.map(async (node) => ({ node, ...(await postChunk(node, uploader, 0)) })));
+  const tally = {};
+  for (const r of results) tally[`${r.status} ${r.body}`.trim()] = (tally[`${r.status} ${r.body}`.trim()] || 0) + 1;
+  const longTerm = results.filter((r) => r.status === 200).map((r) => r.node);
+  record(run, 'chunk_node_probe', { probed: results.length, tally, longTerm });
+  return longTerm;
+}
+
+async function pushChunks(run, uploader, { stopAfterErrors, node }) {
   const start = Date.now();
   const startChunks = uploader.uploadedChunks;
   let consecutiveErrors = 0;
 
-  while (!uploader.isComplete) {
-    try {
-      await uploader.uploadChunk();
-    } catch (err) {
-      // arweave-js throws on FATAL chunk errors and after 100 consecutive soft ones.
+  while (uploader.chunkIndex < uploader.totalChunks) {
+    const index = uploader.chunkIndex;
+    const { status, body } = await postChunk(node, uploader, index);
+
+    if (status === 200) {
+      uploader.chunkIndex++;
+      consecutiveErrors = 0;
       saveUploader(run.txId, uploader);
-      record(run, 'chunk_fatal', { message: err.message, uploadedChunks: uploader.uploadedChunks });
+      process.stdout.write(`\r  chunks ${uploader.uploadedChunks}/${uploader.totalChunks} (${uploader.pctComplete}%)   `);
+      continue;
+    }
+
+    let error = body;
+    try {
+      error = JSON.parse(body).error || body;
+    } catch {}
+    if (status === 303) {
+      // This node accepted the chunk but will not keep it: move to another node.
+      record(run, 'chunk_temporary', { node, chunk: index, status });
       return false;
     }
-    saveUploader(run.txId, uploader);
-
-    if (uploader.lastResponseError) {
-      consecutiveErrors++;
-      record(run, 'chunk_error', {
-        status: uploader.lastResponseStatus,
-        error: uploader.lastResponseError,
-        uploadedChunks: uploader.uploadedChunks,
-      });
-      if (stopAfterErrors && consecutiveErrors >= stopAfterErrors) {
-        record(run, 'chunks_paused', { reason: `${consecutiveErrors} consecutive errors` });
-        return false;
-      }
-    } else {
-      consecutiveErrors = 0;
-      process.stdout.write(`\r  chunks ${uploader.uploadedChunks}/${uploader.totalChunks} (${uploader.pctComplete}%)   `);
+    consecutiveErrors++;
+    record(run, 'chunk_error', { node, chunk: index, status, error, uploadedChunks: uploader.uploadedChunks });
+    if (FATAL_CHUNK_ERRORS.includes(error)) {
+      record(run, 'chunk_fatal', { node, chunk: index, error });
+      return false;
     }
+    if (consecutiveErrors >= stopAfterErrors) {
+      record(run, 'chunks_paused', { node, reason: `${consecutiveErrors} consecutive errors` });
+      return false;
+    }
+    await sleep(10_000);
   }
 
   const seconds = (Date.now() - start) / 1000;
@@ -433,18 +509,20 @@ async function broadcastHeader(run, nodes, label) {
 async function resumeChunks(run) {
   const dir = runDir(run.txId);
   const data = fs.readFileSync(path.join(dir, 'fixture.bin'));
-  for (const url of NODES.slice(0, MAX_CHUNK_PEERS)) {
-    const state = JSON.parse(fs.readFileSync(path.join(dir, 'uploader.json'), 'utf8'));
-    // The saved error belongs to the previous attempt; keeping it would make
-    // arweave-js sleep ~40 s before the first request to a fresh node.
-    state.lastResponseError = '';
-    const uploader = await arweaveFor(url).transactions.getUploader(state, data);
+  const state = JSON.parse(fs.readFileSync(path.join(dir, 'uploader.json'), 'utf8'));
+  // getUploader re-derives the chunks and checks data_root against the fixture.
+  const uploader = await arweave.transactions.getUploader(state, data);
+  // The set of long-term nodes can change once the tx is mined (the node source
+  // decides by where the chunk lands in the weave), so probe again on resume.
+  const longTerm = await findLongTermNodes(run, uploader);
+  for (const url of longTerm.slice(0, MAX_CHUNK_PEERS)) {
     run.chunkNodes.push(url);
     record(run, 'chunks_resumed', { node: url, uploadedChunks: uploader.uploadedChunks, totalChunks: uploader.totalChunks });
-    run.chunksComplete = await pushChunks(run, uploader, { stopAfterErrors: 5 });
+    run.chunksComplete = await pushChunks(run, uploader, { stopAfterErrors: 5, node: url });
     saveRun(run);
     if (run.chunksComplete) return;
   }
+  if (!longTerm.length) record(run, 'chunks_paused', { reason: 'no node answered 200 for chunk 0' });
 }
 
 // Raw node responses, saved verbatim for Phase 2's test fakes.
@@ -484,6 +562,46 @@ async function probeReads(run) {
     results.nodeTxData = { error: err.message };
   }
 
+  // Raw-node read path, no gateway (decided 2026-10-12): GET /tx/{id}/offset gives
+  // the tx's end offset and size; chunk i is GET /chunk/{start + i*256KiB}, where
+  // start = offset - size + 1 (verified live 2026-10-12: chunks 0..3 of a 1 MiB tx
+  // matched the fixture at exactly those offsets; GET /chunk/{offset} itself 404'd).
+  //
+  // Chunk 0 is deliberately NOT used as evidence: findLongTermNodes() posts chunk 0
+  // to every node, so its presence says nothing about replication. Chunk 1 and the
+  // last chunk were only ever sent to the chunk node(s), so a node holding them got
+  // them from the network (Q13: replication).
+  const total = Math.ceil(run.bytes / (256 * 1024));
+  const indexes = [...new Set([Math.min(1, total - 1), total - 1])];
+  const candidates = [...new Set([...(run.chunkNodes || []), ...NODES])].slice(0, 40);
+  const perNode = await Promise.all(
+    candidates.map(async (n) => {
+      try {
+        const o = await (await fetch(`${n}/tx/${run.txId}/offset`, { signal: AbortSignal.timeout(30_000) })).json();
+        const start = BigInt(o.offset) - BigInt(o.size) + 1n;
+        const checks = await Promise.all(
+          indexes.map(async (i) => {
+            const res = await fetch(`${n}/chunk/${start + BigInt(i * 256 * 1024)}`, { signal: AbortSignal.timeout(60_000) });
+            if (!res.ok) return res.status;
+            const c = Buffer.from((await res.json()).chunk, 'base64url');
+            return c.equals(fixture.subarray(i * 256 * 1024, i * 256 * 1024 + c.length));
+          })
+        );
+        return { node: n, sentByUs: (run.chunkNodes || []).includes(n), checks };
+      } catch (err) {
+        return { node: n, error: (err.cause && err.cause.code) || err.message };
+      }
+    })
+  );
+  const full = perNode.filter((r) => r.checks && r.checks.every((c) => c === true));
+  results.rawNodeChunks = {
+    chunkIndexesChecked: indexes,
+    nodesChecked: perNode.length,
+    holdersVerified: full.map((r) => r.node),
+    replicatedBeyondOurNodes: full.filter((r) => !r.sentByUs).map((r) => r.node),
+    mismatches: perNode.filter((r) => r.checks && r.checks.some((c) => c === false)).map((r) => r.node),
+  };
+
   for (const gw of GATEWAYS) {
     try {
       const res = await fetch(`${gw}/${run.txId}`, {
@@ -515,7 +633,7 @@ async function cmdWatch() {
   // 1. Wait for the header to be mined, or for the anchor to expire (D1).
   let lastCode;
   while (!run.minedAt) {
-    const status = await arweave.transactions.getStatus(run.txId);
+    const status = await txStatus(run.txId);
     const h = await height();
     if (status.status !== lastCode) {
       record(run, 'status_change', { status: status.status, height: h, deadline: run.anchorDeadline });
@@ -558,7 +676,7 @@ async function cmdWatch() {
 
   // 3. Wait for the confirmation target (D2).
   while (!run.confirmedAt) {
-    const status = await arweave.transactions.getStatus(run.txId);
+    const status = await txStatus(run.txId);
     const confs = status.confirmed ? status.confirmed.number_of_confirmations : 0;
     process.stdout.write(`\r  confirmations ${confs}/${CONFIRMATIONS}   `);
     if (confs >= CONFIRMATIONS) {
@@ -581,7 +699,7 @@ async function cmdWatch() {
 async function cmdStatus() {
   const run = loadRun(positional);
   await selectNodes(run.headerNodes);
-  const status = await arweave.transactions.getStatus(run.txId);
+  const status = await txStatus(run.txId);
   console.log(`${run.txId}: ${JSON.stringify(status)}  (height ${await height()}, deadline ${run.anchorDeadline})`);
   await snapshotTx(run, 'status');
   await probeReads(run);
@@ -609,6 +727,7 @@ function cmdReport() {
     const bc = ev('header_broadcast')[0];
     console.log(`Q8 header nodes  first=${headerOnly ? headerOnly.status : '?'}  others=${bc ? JSON.stringify(bc.results.map((x) => x.status ?? x.error)) : 'n/a'}  reposts=${ev('header_reposted').length}`);
     console.log(`Q9 chunk nodes   ${JSON.stringify(r.chunkNodes || [])}  (more than one = failover happened)`);
+    console.log(`Q12 /chunk probe ${JSON.stringify(ev('chunk_node_probe').map((p) => p.tally))}  temporary(303) events=${ev('chunk_temporary').length}`);
     const gap = Number.isSafeInteger(r.anchorHeight) ? r.heightAtSign - r.anchorHeight : '?';
     console.log(`Q11 anchor       block ${r.anchorHeight ?? '?'}, signed at height ${r.heightAtSign} (anchor ${gap} blocks behind); deadline ${r.anchorDeadline} from ${r.anchorDeadlineFrom || 'height at signing'}`);
   }

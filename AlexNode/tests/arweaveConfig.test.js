@@ -77,14 +77,18 @@ const ENV_KEYS = [
   'ARWEAVE_WALLET_ADDRESS',
   'ARWEAVE_NODE_URLS',
   'ARWEAVE_PEER_SEEDS',
+  'ARWEAVE_PEER_CACHE_FILE',
   'ARWEAVE_CONFIRMATIONS',
   'ARWEAVE_MAX_REWARD_AR',
 ];
 
 // config/arweave.js reads env at require time, like the other config modules,
-// so each scenario gets a fresh copy.
+// so each scenario gets a fresh copy. Discovery writes a peer cache, so every
+// scenario gets its own temp cache file unless it names one: never the repo's.
+let cacheSeq = 0;
 function loadConfig(env) {
   for (const k of ENV_KEYS) delete process.env[k];
+  process.env.ARWEAVE_PEER_CACHE_FILE = path.join(tmp, `peers-${cacheSeq++}.json`);
   Object.assign(process.env, env);
   delete require.cache[require.resolve('../config/arweave')];
   return require('../config/arweave');
@@ -230,7 +234,7 @@ const file = (name) => path.join(tmp, name);
   assert(err && err.code === 'arweave_unavailable', '15c. Missing or non-integer heights → arweave_unavailable, never an empty list');
 
   // Env validation: an explicit value is honoured or rejected, never coerced.
-  assert(loadConfig({ ARWEAVE_CONFIRMATIONS: '' }).ARWEAVE_CONFIRMATIONS === 15, '15d. ARWEAVE_CONFIRMATIONS defaults to 15');
+  assert(loadConfig({ ARWEAVE_CONFIRMATIONS: '' }).ARWEAVE_CONFIRMATIONS === 16, '15d. ARWEAVE_CONFIRMATIONS defaults to 16');
   assert(loadConfig({ ARWEAVE_CONFIRMATIONS: '1' }).ARWEAVE_CONFIRMATIONS === 1, '15e. ARWEAVE_CONFIRMATIONS=1 is kept');
   const badConfs = ['0', '-1', '2.5', 'abc'].map((v) => {
     try {
@@ -276,6 +280,48 @@ const file = (name) => path.join(tmp, name);
     bothOk.length === 2 && bothOk[0] === 'http://ours.test:1984',
     '15j. Two pinned nodes 1 block apart → both kept, configured order preserved'
   );
+
+  // ─── Seeds: raw nodes only, and a self-refreshing cache ────────────────
+  cfg = loadConfig({});
+  assert(
+    cfg.ARWEAVE_PEER_SEEDS === cfg.DEFAULT_PEER_SEEDS &&
+      cfg.DEFAULT_PEER_SEEDS.length >= 3 &&
+      cfg.DEFAULT_PEER_SEEDS.every((u) => /^http:\/\/\d{1,3}(\.\d{1,3}){3}:\d+$/.test(u)),
+    '15k. Default seeds are raw ip:port nodes; no gateway hostname (e.g. arweave.net)'
+  );
+
+  // A discovery saves the healthy nodes; a later one whose seeds are all dead still
+  // finds nodes through that cache.
+  const cacheFile = file('peers-shared.json');
+  net.routes.clear();
+  net.calls = [];
+  route('http://seedA.test:1984/peers', () => ({ body: ['10.9.1.1:1984', '10.9.2.1:1984'] }));
+  route('http://seedA.test:1984/info', info(1000));
+  route('http://10.9.1.1:1984/info', info(1000));
+  route('http://10.9.2.1:1984/info', info(1000));
+  route('http://10.9.1.1:1984/peers', () => ({ body: ['10.9.2.1:1984'] }));
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_PEER_SEEDS: 'http://seedA.test:1984', ARWEAVE_PEER_CACHE_FILE: cacheFile });
+  await cfg.getNodes();
+  const saved = JSON.parse(fs.readFileSync(cacheFile, 'utf8')).nodes;
+  assert(saved.includes('http://10.9.1.1:1984') && saved.includes('http://10.9.2.1:1984'), '15l. A successful discovery saves the healthy nodes to the peer cache');
+
+  net.routes.delete('http://seedA.test:1984/peers');
+  net.routes.delete('http://seedA.test:1984/info');
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_PEER_SEEDS: 'http://seedA.test:1984', ARWEAVE_PEER_CACHE_FILE: cacheFile });
+  const fromCache = await cfg.getNodes();
+  assert(fromCache.includes('http://10.9.1.1:1984'), '15m. With every configured seed dead, discovery still works from the cache');
+
+  // Interleaving: with two seeds, the probed sample contains peers from BOTH, even
+  // when the first seed's list alone would fill PEER_PROBE_LIMIT (60).
+  net.routes.clear();
+  const many = Array.from({ length: 80 }, (_, i) => `10.20.${i}.1:1984`);
+  route('http://seedB.test:1984/peers', () => ({ body: many }));
+  route('http://seedC.test:1984/peers', () => ({ body: ['10.30.0.1:1984'] }));
+  route('http://10.30.0.1:1984/info', info(1000));
+  for (const p of many) route(`http://${p}/info`, info(1000));
+  cfg = loadConfig({ ARWEAVE_WALLET_FILE: file('wallet.json'), ARWEAVE_PEER_SEEDS: 'http://seedB.test:1984,http://seedC.test:1984' });
+  const mixed = await cfg.getNodes();
+  assert(mixed.includes('http://10.30.0.1:1984'), '15n. A second seed\'s peers are probed even when the first seed lists 80');
 
   // ─── Balance and price ───────────────────────────────────────────────────
   console.log('\nBalance and price');

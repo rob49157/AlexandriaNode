@@ -133,10 +133,14 @@ async function checkNearDuplicate(simHash) {
   // Stored all-zero fingerprints came from PDFs with no extractable text; they
   // can never be a genuine near-duplicate, so keep them out of the candidates.
   const excludeEmpty = { NOT: { simHash: EMPTY_SIMHASH } };
+  // A storage_failed row was never stored (its header was never mined, D1), and
+  // the archivist is told to upload again. Matching it would flag their retry as
+  // a near-duplicate of a book that does not exist.
+  const excludeFailed = { NOT: { status: 'storage_failed' } };
 
   const where = USE_BAND_PREFILTER
-    ? { AND: [excludeEmpty, { OR: bandMatchClauses(simHash) }] }
-    : excludeEmpty;
+    ? { AND: [excludeEmpty, excludeFailed, { OR: bandMatchClauses(simHash) }] }
+    : { AND: [excludeEmpty, excludeFailed] };
 
   const candidates = await prisma.upload.findMany({
     where,
