@@ -64,8 +64,7 @@ function stub(relativePath, exports) {
   return exports;
 }
 
-// Keep the Irys and Lit SDKs off the require path — no read path here uses them.
-stub('../config/irys', { getIrys: async () => ({}), IRYS_GATEWAY_URL: 'https://gateway.test.invalid' });
+// Keep Lit off the require path — no read path here uses it.
 stub('../config/lit', {
   LIT_PKP_ID: 'pkp_test_0001',
   LIT_API_KEY: 'test-key',
@@ -847,6 +846,18 @@ async function testControllers() {
     r.res.statusCode === 200 && r.res.body.status === 'pending_stake' && r.res.body.registered === false,
     'an indexed-but-unregistered book reports pending_stake'
   );
+
+  // Review 2026-10-12 #3: a book whose bytes are not stored must not be reported
+  // as pending_stake, or the frontend asks for a stake that stake.stake() reverts.
+  for (const storageState of ['pending_confirmation', 'storage_failed']) {
+    db.uploads = [makeUploadRow({ status: storageState })];
+    r = await call(getStakeStatusForHash, { arweaveHash: HASH_A });
+    assert(
+      r.res.statusCode === 200 && r.res.body.status === storageState && r.res.body.registered === false && r.res.body.index.inSync === true,
+      `an unregistered ${storageState} book reports ${storageState}, not pending_stake`
+    );
+  }
+  db.uploads = [makeUploadRow({ status: 'pending_stake' })];
 
   chain.uploads.set(HASH_A, { uploader: ARCHIVIST, timestamp: 1_760_000_000, status: 0, metadata: '' });
   chain.stakes.set(HASH_A, {

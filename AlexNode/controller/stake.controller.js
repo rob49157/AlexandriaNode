@@ -41,9 +41,18 @@ async function getStakeStatusForHash(req, res, next) {
     }
 
     // AlexandriaLibrary is the authority on status; it is what stake.sol and
-    // rent.sol both read. "pending_stake" only exists off-chain — it means the
-    // bytes are on Arweave but registerUpload() has not been called yet.
-    const status = onChain.registered ? onChain.status : 'pending_stake';
+    // rent.sol both read. Before registration the status is off-chain only:
+    //   pending_stake         bytes stored, registerUpload() not called yet
+    //   pending_confirmation  bytes NOT stored yet (storage worker still running)
+    //   storage_failed        bytes never stored; the archivist must re-upload
+    // The last two used to be reported as pending_stake, which told the frontend
+    // to ask for a stake that stake.stake() would revert.
+    const OFF_CHAIN_STORAGE_STATES = ['pending_confirmation', 'storage_failed'];
+    const status = onChain.registered
+      ? onChain.status
+      : row && OFF_CHAIN_STORAGE_STATES.includes(row.status)
+        ? row.status
+        : 'pending_stake';
 
     return res.json({
       arweaveHash,

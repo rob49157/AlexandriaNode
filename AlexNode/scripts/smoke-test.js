@@ -1,33 +1,43 @@
 #!/usr/bin/env node
-// Live end-to-end smoke test against real infrastructure.
+// Live end-to-end test against real infrastructure: Phase 5 of ARWEAVE-DIRECT-PLAN.md.
 //
-//   node scripts/smoke-test.js            # storage integrity only (no chain writes)
-//   node scripts/smoke-test.js --full     # + real upload through HTTP + on-chain registration
+//   node scripts/smoke-test.js            # Part A: storage roundtrip on Arweave mainnet
+//   node scripts/smoke-test.js --full     # + Part B: real HTTP upload → worker → Base Sepolia
 //
-// ⚠️ --full REGISTERS A BOOK ON-CHAIN PERMANENTLY. AlexandriaLibrary.registerUpload
-// has no delete. Run it deliberately, with metadata you are content to leave on
-// Base Sepolia forever.
+// ⚠️ MAINNET + PERMANENT. Each part publishes one small test PDF to Arweave
+// mainnet, paid from the storage wallet (≈0.0135 AR each), and it stays public
+// forever (encrypted). Part B also REGISTERS the book on Base Sepolia, and
+// AlexandriaLibrary.registerUpload has no delete. The archivist is a fresh
+// throwaway address, so nobody can ever stake on that entry.
 //
-// Nothing here is stubbed: real Irys devnet, real Lit API, real Base Sepolia,
-// real Neon. This is the only test that proves the pieces work *together* —
-// every other suite mocks at least one boundary.
+// Nothing is stubbed: real Arweave nodes, real Lit, real Neon, real Base Sepolia.
+// This is the only test that proves the pieces work together.
 //
-// Part A (storage integrity) keeps the symmetric key in-process so it can prove
-// the bytes Arweave hands back decrypt to the original PDF. The upload path
-// deliberately cannot do this: it zeroes the key, and only a Lit Action can
-// release the sealed copy. Part A is therefore the only place the full crypto
-// round-trip over *really stored* bytes is verifiable today.
+// Part A keeps the symmetric key in-process, so it can prove that bytes read
+// back from Arweave decrypt to the original PDF. The upload path cannot: it
+// zeroes the key, and only the (not yet built) decryption Lit Action can release
+// the sealed copy (KEY-BINDING.md). Part B therefore proves storage, indexing and
+// registration, and checks the stored bytes against the signed data_root.
+//
+// Part B needs the server running with this code:
+//   nvm use 22.21.1 && npm start      (STORAGE_WORKER_ENABLED not false)
 
 require('dotenv').config({ quiet: true });
 
 const crypto = require('crypto');
 const { ethers } = require('ethers');
 
+if (Number(process.versions.node.split('.')[0]) < 22) {
+  console.error(`Node ${process.versions.node}: arweave-js 2.x needs Node >= 22. Run: nvm use 22.21.1`);
+  process.exit(1);
+}
+
 const FULL = process.argv.includes('--full');
+const PORT = process.env.PORT || 3001;
+const BASE = `http://localhost:${PORT}`;
 
 let passed = 0;
 let failed = 0;
-
 function assert(condition, name, detail) {
   if (condition) {
     console.log(`  ✓ ${name}`);
@@ -37,14 +47,11 @@ function assert(condition, name, detail) {
     failed++;
   }
 }
-
-function section(name) {
-  console.log(`\n── ${name} ${'─'.repeat(Math.max(0, 60 - name.length))}`);
-}
-
+const section = (name) => console.log(`\n── ${name} ${'─'.repeat(Math.max(0, 60 - name.length))}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const stamp = () => new Date().toISOString().slice(11, 19);
 
-/** Minimal but structurally valid PDF — passes magic bytes, parses, 1 page. */
+/** Minimal but structurally valid PDF: passes magic bytes, parses, 1 page. */
 function makePdf(marker) {
   return Buffer.from(
     [
@@ -68,242 +75,176 @@ function makePdf(marker) {
   );
 }
 
-/**
- * Poll the Irys gateway until the data item is served.
- * Freshly-pushed items take a few seconds to become retrievable.
- */
-async function fetchFromGateway(arweaveHash, { attempts = 12, delayMs = 5000 } = {}) {
-  const { IRYS_GATEWAY_URL } = require('../config/irys');
-  const url = `${IRYS_GATEWAY_URL}/${arweaveHash}`;
+// ─── Part A: storage roundtrip (key kept in-process) ─────────────────────────
 
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return Buffer.from(await res.arrayBuffer());
-      process.stdout.write(`    gateway ${res.status}, retry ${i}/${attempts}\r`);
-    } catch (err) {
-      process.stdout.write(`    gateway unreachable, retry ${i}/${attempts}\r`);
-    }
-    await sleep(delayMs);
-  }
-  return null;
-}
-
-// ─── Part A: storage integrity ───────────────────────────────────────────────
-
-async function storageIntegrity() {
-  section('Part A — storage integrity (key retained in-process)');
-
+async function storageRoundtrip() {
+  section('Part A — encrypt → store on mainnet → read back from raw nodes → decrypt');
+  const cfg = require('../config/arweave');
+  const arweave = require('../controller/arweave');
   const { aesEncryptPdf } = require('../controller/litProtocol');
-  const { prepareUpload, commitUpload, buildTags, isValidArweaveHash } = require('../controller/arweave');
-  const { getBalance, getPrice } = require('../config/irys');
 
-  const pdf = makePdf(`smoke-${Date.now()}`);
-  console.log(`  PDF: ${pdf.length} bytes`);
+  const pdf = makePdf(`live-A-${Date.now()}`);
+  const before = await cfg.getBalance();
+  console.log(`  PDF ${pdf.length} bytes; wallet ${before.address} holds ${before.ar} AR`);
 
-  const before = await getBalance();
-  const quote = await getPrice(pdf.length);
-  console.log(`  quote: ${(Number(quote) / 1e18).toFixed(10)} ETH`);
-
-  // Encrypt, keeping the key so the round-trip is checkable.
   const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(Buffer.from(pdf));
-  assert(!ciphertext.equals(pdf), 'ciphertext differs from plaintext');
-  assert(iv.length === 12, 'IV is 12 bytes (GCM standard)');
-  assert(authTag.length === 16, 'auth tag is 16 bytes');
-
-  const tags = buildTags({
+  const tags = arweave.buildTags({
     iv,
     authTag,
-    metadata: { title: 'Smoke Test', author: 'Alexandria', category: 'philosophy', description: 'storage check' },
+    metadata: { title: 'Alexandria live storage test (Part A)', author: 'Alexandria', category: 'other' },
     uploader: '0x0000000000000000000000000000000000000001',
     sha256Hash: crypto.createHash('sha256').update(pdf).digest('hex'),
   });
 
-  const { arweaveHash, tx } = await prepareUpload(ciphertext, tags);
-  assert(isValidArweaveHash(arweaveHash), 'arweaveHash is 43-char base64url', arweaveHash);
-  console.log(`  arweaveHash: ${arweaveHash}`);
+  const prepared = await arweave.prepareUpload(ciphertext, tags);
+  const hash = prepared.arweaveHash;
+  assert(arweave.isValidArweaveHash(hash), 'arweaveHash is 43-char base64url', hash);
+  console.log(`  arweaveHash ${hash}  fee ${cfg.winstonToAr(prepared.reward)} AR`);
 
-  await commitUpload(tx, arweaveHash);
-  console.log('  pushed to Irys devnet');
+  const post = await arweave.postHeader(prepared.header);
+  assert(post.accepted.length >= 1, `header accepted by ${post.accepted.length} node(s)`, JSON.stringify(post.results));
 
-  const after = await getBalance();
-  const spent = BigInt(before.atomic) - BigInt(after.atomic);
-
-  // Irys does not charge for data items under 100 KiB, so a small fixture is
-  // free and the balance legitimately does not move. Assert it never went UP,
-  // and report which regime we are in rather than pretending to measure cost.
-  const FREE_TIER_BYTES = 100 * 1024;
-  const freeTier = ciphertext.length < FREE_TIER_BYTES;
-  assert(spent >= 0n, 'storage credit did not increase');
-  if (freeTier) {
-    console.log(`  spent: 0 (under Irys' ${FREE_TIER_BYTES}-byte free tier — no charge expected)`);
-  } else {
-    assert(spent > 0n, 'storage credit was spent for an above-free-tier upload', `${spent} atomic`);
-    console.log(`  spent: ${(Number(spent) / 1e18).toFixed(10)} ETH`);
+  console.log(`  [${stamp()}] waiting for the header to be mined...`);
+  let status;
+  for (let i = 0; i < 60; i++) {
+    status = await arweave.getTxStatus(hash).catch(() => ({ state: 'error' }));
+    if (status.state === 'mined') break;
+    if (status.state === 'not_found' && i % 10 === 9) await arweave.postHeader(prepared.header);
+    await sleep(15_000);
   }
+  assert(status.state === 'mined', 'header mined', JSON.stringify(status));
+  if (status.state !== 'mined') return null;
+  console.log(`  [${stamp()}] mined in block ${status.blockHeight}`);
 
-  console.log('  waiting for gateway propagation...');
-  const fetched = await fetchFromGateway(arweaveHash);
-  assert(fetched !== null, 'ciphertext retrievable from the gateway');
+  const after = await cfg.getBalance();
+  assert(BigInt(before.winston) - BigInt(after.winston) === BigInt(prepared.reward), 'wallet charged exactly the signed fee at mining (Q4)', `${before.winston} → ${after.winston}`);
 
-  if (fetched) {
-    assert(fetched.equals(ciphertext), 'retrieved bytes are byte-identical to what was uploaded');
-    assert(!fetched.equals(pdf), 'what Arweave stores is NOT the plaintext PDF');
+  const state = { holders: {} };
+  await arweave.pushChunks({ header: prepared.header, data: ciphertext, state, minHolders: cfg.ARWEAVE_MIN_HOLDERS });
+  const holders = Object.entries(state.holders).filter(([, h]) => h.done).map(([n]) => n);
+  assert(holders.length >= cfg.ARWEAVE_MIN_HOLDERS, `chunks on ${holders.length} long-term nodes`, holders.join(', '));
+  assert(new Set(holders.map(arweave.blockOf)).size === holders.length, 'copies are in different /24 blocks');
 
-    // The real proof: decrypt what the gateway returned.
-    const decipher = crypto.createDecipheriv('aes-256-gcm', symmetricKey, iv);
-    decipher.setAuthTag(authTag);
-    let decrypted = null;
-    try {
-      decrypted = Buffer.concat([decipher.update(fetched), decipher.final()]);
-    } catch (err) {
-      assert(false, 'decrypts without an auth-tag failure', err.message);
-    }
-    if (decrypted) {
-      assert(decrypted.equals(pdf), 'gateway bytes decrypt to the ORIGINAL PDF, byte for byte');
-    }
+  // Right after mining a holder can answer "not readable yet" (no_offset) for a
+  // while (seen live 2026-10-13); the worker waits for 16 confirmations first.
+  // Here: retry for up to 10 minutes.
+  let check;
+  for (let i = 0; i < 20; i++) {
+    check = await arweave.verifyHolders({ txId: hash, header: prepared.header, nodes: holders, data: ciphertext });
+    if (check.verified.length >= cfg.ARWEAVE_MIN_HOLDERS) break;
+    console.log(`  [${stamp()}] verified ${check.verified.length}/${holders.length}: ${JSON.stringify(check.failures)}; retrying`);
+    await sleep(30_000);
   }
+  assert(check.verified.length >= cfg.ARWEAVE_MIN_HOLDERS, 'each copy reads back byte for byte', JSON.stringify(check.failures));
 
+  const fetched = await arweave.fetchEncrypted(hash, { preferNodes: holders });
+  assert(fetched.equals(ciphertext), 'fetchEncrypted (raw nodes, no gateway) returns the exact ciphertext');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', symmetricKey, iv);
+  decipher.setAuthTag(authTag);
+  let decrypted = null;
+  try {
+    decrypted = Buffer.concat([decipher.update(fetched), decipher.final()]);
+  } catch (err) {
+    assert(false, 'decrypts without an auth-tag failure', err.message);
+  }
+  if (decrypted) assert(decrypted.equals(pdf), 'bytes read from Arweave decrypt to the ORIGINAL PDF');
   symmetricKey.fill(0);
-  return arweaveHash;
+  return hash;
 }
 
-// ─── Part B: full pipeline over HTTP ─────────────────────────────────────────
+// ─── Part B: the real request path ───────────────────────────────────────────
 
 async function fullPipeline() {
-  section('Part B — full pipeline (HTTP → Irys → Lit → Postgres → chain)');
-
+  section('Part B — POST /api/upload → storage worker → Base Sepolia');
   const prisma = require('../config/db');
   const { getContracts } = require('../config/blockchain');
-  const PORT = process.env.PORT || 3001;
-  const BASE = `http://localhost:${PORT}`;
+  const arweave = require('../controller/arweave');
 
-  // The archivist. Recorded on-chain as `uploader`, so this is the address that
-  // would have to sign stake.stake() afterwards.
-  const ARCHIVIST = '0x5F47ecD28155790f1271df965373fD9aCEA643b9';
+  const health = await fetch(`${BASE}/api/storage/status`).catch(() => null);
+  assert(health && health.status === 200, `server reachable and storage worker running at ${BASE}`);
+  if (!health || health.status !== 200) return null;
 
-  const pdf = makePdf(`e2e-${Date.now()}`);
-  const title = `Smoke Test ${new Date().toISOString().slice(0, 16)}`;
-
+  // A fresh address no one holds the key to: the on-chain entry stays inert.
+  const ARCHIVIST = ethers.Wallet.createRandom().address;
+  const pdf = makePdf(`live-B-${Date.now()}`);
+  const title = `Alexandria live storage test ${new Date().toISOString().slice(0, 16)}`;
   const form = new FormData();
-  form.append('file', new Blob([pdf], { type: 'application/pdf' }), 'smoke.pdf');
+  form.append('file', new Blob([pdf], { type: 'application/pdf' }), 'live-test.pdf');
   form.append('title', title);
-  form.append('author', 'Alexandria Smoke Test');
+  form.append('author', 'Alexandria Live Test');
   form.append('category', 'philosophy');
-  form.append('description', 'End-to-end verification upload. Safe to ignore.');
+  form.append('description', 'Phase 5 verification upload (direct Arweave L1). Safe to ignore.');
   form.append('walletAddress', ARCHIVIST);
 
-  console.log(`  POST ${BASE}/api/upload ...`);
+  console.log(`  archivist (throwaway): ${ARCHIVIST}`);
   const res = await fetch(`${BASE}/api/upload`, { method: 'POST', body: form });
   const body = await res.json();
+  assert(res.status === 202, 'POST /api/upload → 202 Accepted', `${res.status}: ${JSON.stringify(body).slice(0, 300)}`);
+  if (res.status !== 202) return null;
+  const hash = body.arweaveHash;
+  console.log(`  arweaveHash ${hash}  fee ${body.storage.rewardAr} AR  header accepted by ${body.storage.headerAcceptedBy}`);
+  assert(body.status === 'pending_confirmation', 'status is pending_confirmation');
 
-  assert(res.status === 201, `upload returns 201`, `got ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
-  if (res.status !== 201) return null;
-
-  const { arweaveHash } = body;
-  console.log(`  arweaveHash: ${arweaveHash}`);
-  console.log(`  registration: ${JSON.stringify(body.registration)}`);
-
-  assert(Boolean(arweaveHash), 'response carries an arweaveHash');
-  assert(Boolean(body.litEncryptedKeyId), 'response carries the sealed key id');
-  assert(body.registration.registered === true, 'registered on-chain', body.registration.message);
-  assert(Boolean(body.registration.txHash), 'registration transaction hash returned');
-  assert(body.status === 'pending', 'status advanced to pending', body.status);
-
-  // --- Postgres ---
-  const row = await prisma.upload.findUnique({ where: { arweaveHash } });
-  assert(Boolean(row), 'row indexed in Postgres');
-  if (row) {
-    assert(row.status === 'pending', 'row status is pending');
-    assert(row.uploader.toLowerCase() === ARCHIVIST.toLowerCase(), 'row records the archivist as uploader');
-    assert(Boolean(row.arweaveHashTopic), 'arweaveHashTopic written (event listener join key)');
-    assert(
-      row.arweaveHashTopic === ethers.id(arweaveHash),
-      'arweaveHashTopic is keccak256 of the hash'
-    );
-    assert(Boolean(row.litEncryptedKeyId && row.encryptionIv && row.encryptionAuthTag), 'key material persisted');
-    assert(row.onChainTxHash === body.registration.txHash, 'registration tx recorded on the row');
+  // The worker takes it from here. Poll the public progress route.
+  console.log(`  [${stamp()}] following GET /api/storage/${hash} (≈30–40 min for 16 confirmations)`);
+  let p = {};
+  let last = '';
+  const deadline = Date.now() + 90 * 60_000;
+  while (Date.now() < deadline) {
+    p = await (await fetch(`${BASE}/api/storage/${hash}`)).json();
+    const line = `${p.status} mined=${p.mined} conf=${p.confirmations}/${p.confirmationsRequired} copies=${p.copiesComplete}/${p.copiesRequired} verified=${p.verifiedCopies}${p.error ? ` err=${p.error}` : ''}`;
+    if (line !== last) console.log(`  [${stamp()}] ${line}`);
+    last = line;
+    if (!['pending_confirmation'].includes(p.status)) break;
+    await sleep(30_000);
   }
+  assert(['pending_stake', 'pending'].includes(p.status), 'worker stored it: status left pending_confirmation', p.status);
+  assert(p.confirmations >= p.confirmationsRequired, `${p.confirmations} confirmations (>= ${p.confirmationsRequired})`);
+  assert(p.verifiedCopies >= p.copiesRequired, `${p.verifiedCopies} verified copies (>= ${p.copiesRequired})`);
+  assert(p.status === 'pending', 'registered on-chain → pending', p.status);
 
-  // --- On-chain ---
+  const row = await prisma.upload.findUnique({ where: { arweaveHash: hash } });
+  assert(row && row.storageProvider === 'arweave-l1', 'row is storageProvider arweave-l1');
+  assert(row && row.uploader.toLowerCase() === ARCHIVIST.toLowerCase(), 'row records the archivist as uploader');
+  assert(row && row.arweaveHashTopic === ethers.id(hash), 'arweaveHashTopic = keccak256(hash)');
+  assert(row && Boolean(row.onChainTxHash), 'registration tx recorded on the row', row && row.onChainTxHash);
+
   const { library } = getContracts();
-  const onChain = await library.getUpload(arweaveHash);
-  assert(onChain.uploader.toLowerCase() === ARCHIVIST.toLowerCase(), 'chain records the ARCHIVIST as uploader');
-  assert(Number(onChain.status) === 0, 'chain status is Pending (0)');
-  const meta = JSON.parse(onChain.metadata);
-  assert(meta.t === title, 'on-chain metadata carries the title');
+  const onChain = await library.getUpload(hash);
+  assert(onChain.uploader.toLowerCase() === ARCHIVIST.toLowerCase(), 'Base Sepolia records the ARCHIVIST as uploader');
+  assert(JSON.parse(onChain.metadata).t === title, 'on-chain metadata carries the title');
 
-  // --- Read endpoints ---
-  const lookup = await (await fetch(`${BASE}/api/upload/${arweaveHash}`)).json();
-  assert(lookup.arweaveHash === arweaveHash, 'GET /api/upload/:hash returns the book');
-  assert(lookup.litEncryptedKeyId === undefined, 'public lookup does NOT leak key material');
+  const lookup = await (await fetch(`${BASE}/api/upload/${hash}`)).json();
+  assert(lookup.arweaveHash === hash && lookup.litEncryptedKeyId === undefined, 'GET /api/upload/:hash returns it without key material');
+  const params = await (await fetch(`${BASE}/api/rental/decrypt-params/${hash}/${ARCHIVIST}`)).json();
+  assert(params.grantedVia === 'uploader' && Boolean(params.litEncryptedKeyId), 'uploader carve-out returns the decrypt payload');
 
-  const stake = await (await fetch(`${BASE}/api/stake/status/${arweaveHash}`)).json();
-  assert(stake.registered === true, 'GET /api/stake/status sees the on-chain registration');
-  assert(stake.staked === false, 'not staked yet — that is the archivist’s next step');
+  const stored = await arweave.fetchEncrypted(hash, { preferNodes: (row && row.arweaveUploaderState.verified.nodes) || [] });
+  assert(stored.length === pdf.length && !stored.equals(pdf), 'read back from raw nodes: right length, ciphertext not plaintext');
 
-  const params = await (await fetch(`${BASE}/api/rental/decrypt-params/${arweaveHash}/${ARCHIVIST}`)).json();
-  assert(params.grantedVia === 'uploader', 'uploader carve-out grants decrypt params without a rental');
-  assert(Boolean(params.litEncryptedKeyId && params.encryptionIv && params.encryptionAuthTag), 'decrypt payload is complete');
-
-  const stranger = await fetch(`${BASE}/api/rental/decrypt-params/${arweaveHash}/0x2222222222222222222222222222222222222222`);
-  assert(stranger.status === 403, 'a stranger without a rental is refused', `got ${stranger.status}`);
-
-  // --- Gateway ---
-  console.log('  waiting for gateway propagation...');
-  const stored = await fetchFromGateway(arweaveHash);
-  assert(stored !== null, 'ciphertext retrievable from the gateway');
-  if (stored) {
-    assert(!stored.equals(pdf), 'stored bytes are not the plaintext PDF');
-    assert(
-      stored.length === pdf.length,
-      'ciphertext length matches plaintext (AES-GCM does not pad)',
-      `${stored.length} vs ${pdf.length}`
-    );
-  }
-
-  // --- Event listener ---
-  // The listener resolves the keccak topic back to this hash via
-  // Upload.arweaveHashTopic, which is the whole reason that column exists.
   console.log('  waiting for the event listener to see UploadRegistered...');
   let event = null;
-  for (let i = 0; i < 24; i++) {
-    event = await prisma.event.findFirst({ where: { arweaveHash, eventName: 'UploadRegistered' } });
-    if (event) break;
-    await sleep(5000);
+  for (let i = 0; i < 24 && !event; i++) {
+    event = await prisma.event.findFirst({ where: { arweaveHash: hash, eventName: 'UploadRegistered' } });
+    if (!event) await sleep(5000);
   }
-  assert(Boolean(event), 'event listener recorded UploadRegistered');
-  if (event) {
-    assert(event.arweaveHash === arweaveHash, 'listener resolved the keccak topic back to the plaintext hash');
-    assert(event.transactionHash === body.registration.txHash, 'event matches the registration transaction');
-  }
+  assert(Boolean(event), 'event listener resolved UploadRegistered to this hash');
 
   await prisma.$disconnect();
-  return arweaveHash;
+  return hash;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
 (async () => {
-  console.log(`\nAlexandria smoke test — ${FULL ? 'FULL (writes on-chain)' : 'storage only'}\n`);
-
-  const storedHash = await storageIntegrity();
-
-  let e2eHash = null;
-  if (FULL) {
-    e2eHash = await fullPipeline();
-  } else {
-    console.log('\n  (skipping Part B — pass --full to run the on-chain pipeline)');
-  }
-
-  console.log(`\n${'='.repeat(64)}`);
-  console.log(`RESULT: ${failed === 0 ? 'ALL PASSED ✓' : 'FAILURES ✗'}   passed ${passed}, failed ${failed}`);
-  if (storedHash) console.log(`  storage test : https://gateway.irys.xyz/${storedHash}`);
-  if (e2eHash) console.log(`  end-to-end   : https://gateway.irys.xyz/${e2eHash}`);
+  console.log(`\nAlexandria live test — ${FULL ? 'Part A + Part B (writes on-chain)' : 'Part A only'}\n`);
+  const a = await storageRoundtrip();
+  const b = FULL ? await fullPipeline() : null;
+  if (!FULL) console.log('\n  (Part B skipped — pass --full)');
+  console.log(`\n${'='.repeat(64)}\nRESULT: ${failed === 0 ? 'ALL PASSED ✓' : 'FAILURES ✗'}   passed ${passed}, failed ${failed}`);
+  if (a) console.log(`  Part A tx: ${a}`);
+  if (b) console.log(`  Part B tx: ${b}`);
   console.log(`${'='.repeat(64)}\n`);
-
   process.exit(failed === 0 ? 0 : 1);
 })().catch((err) => {
-  console.error('\nSmoke test crashed:', err);
+  console.error('\nLive test crashed:', err);
   process.exit(1);
 });

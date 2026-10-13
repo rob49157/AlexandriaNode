@@ -31,7 +31,18 @@ model Upload {
   // "pending_stake" on creation — the file is on Arweave but the archivist has
   // not yet staked/registered on-chain. The event listener (Phase 6) advances it
   // to "pending" once UploadRegistered fires.
-  status            String   // "pending_stake" | "pending" | "challenged" | "approved" | "rejected"
+  //
+  // Direct Arweave L1 (ARWEAVE-DIRECT-PLAN.md §3) adds two states BEFORE that:
+  //   pending_confirmation — header posted, bytes not yet confirmed; the storage
+  //                          worker owns the row until it leaves this state
+  //   storage_failed       — header never mined within its 50-block anchor window;
+  //                          terminal, the archivist re-uploads (decision D1). The
+  //                          worker must move sha256Hash aside (plan §4.4) and
+  //                          near-dup lookups must skip these rows, or the
+  //                          re-upload is rejected/flagged against a book with no bytes
+  // pending_stake keeps its meaning ("bytes stored, not registered"); a row just
+  // reaches it later, after ARWEAVE_CONFIRMATIONS.
+  status            String   // "pending_confirmation" | "storage_failed" | "pending_stake" | "pending" | "challenged" | "approved" | "rejected"
   fileSize          Int      // Bytes (of the original PDF, not the ciphertext)
   pageCount         Int?     // From Layer 1 pdf-parse
   sha256Hash        String   @unique // Unique index for exact duplicate detection
@@ -88,7 +99,34 @@ model Upload {
   simHashBand2      Int      @default(0)
   simHashBand3      Int      @default(0)
 
+  // ─── Direct Arweave L1 storage (ARWEAVE-DIRECT-PLAN.md §4.4) ───────────────
+  // All nullable: rows written before this migration used the retired upload path and have
+  // none of this. Null storageProvider = such a row; it is not backfilled, because
+  // which network each one used is not recorded anywhere to backfill from.
+  storageProvider      String?   // "arweave-l1" for every row written by the direct path
+  arweaveTxPostedAt    DateTime? // when the signed header was first posted
+  // Height of the ANCHOR block (tx.last_tx), via GET /block/hash/{anchor} — not
+  // the height when the tx was signed. The tx is valid while its anchor is among
+  // the last 50 blocks (STORE_BLOCKS_BEHIND_CURRENT), so height > this + 50 with
+  // no confirmation means the header can never be mined → storage_failed.
+  // /tx_anchor picked a block 5 behind the tip on 3 nodes (2026-10-11), so
+  // "signed at + 50" would overstate the window by ~10 minutes.
+  arweaveAnchorHeight  Int?
+  arweaveBlockHeight   Int?      // height the header was mined in
+  arweaveConfirmations Int?      // last observed; pending_stake once >= ARWEAVE_CONFIRMATIONS
+  // Serialized arweave-js getUploader() state: progress + the signed header, NO
+  // data (toJSON() strips it) and no key material. Resuming needs this plus the
+  // spooled ciphertext, which must be byte-identical [arweave-js README].
+  arweaveUploaderState Json?
+  // Exact fee in winston, from the signed header — fixed once signed (D7). A
+  // String because winston exceeds Int and is money: no float, no rounding.
+  arweaveReward        String?
+  storageError         String?   // last storage failure, named, for /api/storage/status
+  storageAttempts      Int       @default(0) // worker passes that hit an error
+
   @@index([title, author]) // Index for search queries
+  // The storage worker polls for status = "pending_confirmation".
+  @@index([status])
   // One index per band so Postgres can bitmap-OR the four equality lookups.
   @@index([simHashBand0])
   @@index([simHashBand1])

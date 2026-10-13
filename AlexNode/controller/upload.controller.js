@@ -1,9 +1,58 @@
 const { validateUpload } = require('../services/validation.service');
 const { aesEncryptPdf, sealKey } = require('./litProtocol');
-const { prepareUpload, commitUpload, buildTags, isValidArweaveHash } = require('./arweave');
+const { prepareUpload, postHeader, buildTags, isValidArweaveHash, StorageError } = require('./arweave');
+const arweaveConfig = require('../config/arweave');
+const spool = require('../services/spool.service');
 const { topicForHash } = require('../config/blockchain');
 const { registerOnChain, preflight } = require('../services/registration.service');
 const prisma = require('../config/db');
+
+// Storage failures before anything is spent: name the cause, because each needs
+// a different person to act (an operator, the treasury, or just a retry). Only
+// the transient ones tell the user to retry; a StorageError (e.g. bad_tx_id)
+// keeps its own code and is a 500, since retrying the same upload cannot fix it.
+function storageUnavailable(res, err) {
+  if (err instanceof StorageError) {
+    return res.status(500).json({
+      valid: false,
+      stage: 'storage',
+      reason: err.code,
+      message: `Could not prepare the Arweave upload (${err.message}). Nothing was stored or paid.`,
+    });
+  }
+  const code =
+    err.code === 'arweave_price_above_cap'
+      ? 'arweave_price_above_cap'
+      : err.code === 'arweave_unavailable'
+        ? 'arweave_unavailable'
+        : 'storage_not_configured';
+  const retry = code === 'storage_not_configured' ? '' : ' — please retry later';
+  return res.status(503).json({
+    valid: false,
+    stage: 'storage',
+    reason: code,
+    message: `Could not prepare the Arweave upload (${err.message}). Nothing was stored or paid${retry}.`,
+  });
+}
+
+/**
+ * Fees signed into headers that are posted but not mined yet. The wallet is
+ * charged at mining (Q4: 0 at post, exactly the reward at mining, all four
+ * Phase 0 runs), so these are owed but still inside the balance. Counting only
+ * this upload's fee let two 150 MiB uploads both pass on a 2.5 AR wallet.
+ *
+ * A row is counted until the worker records arweaveBlockHeight; for the few
+ * seconds between mining and that write its fee is counted twice (deducted AND
+ * committed), which can only refuse an upload, never overspend.
+ * @returns {Promise<bigint>} winston
+ */
+async function committedRewardWinston() {
+  const rows = await prisma.upload.findMany({
+    where: { storageProvider: 'arweave-l1', status: 'pending_confirmation', arweaveBlockHeight: null },
+    select: { arweaveReward: true },
+  });
+  return rows.reduce((sum, r) => sum + BigInt(r.arweaveReward || '0'), 0n);
+}
 
 // POST /api/upload
 // Orchestration entry point for the upload pipeline.
@@ -11,21 +60,27 @@ const prisma = require('../config/db');
 // Validation: Layer 1 (file basics) → Layer 2 (security) → Layer 3 (dedup) → Layer 5 (metadata).
 // (Layer 4, AI content analysis, is a separate service and not wired up yet.)
 //
-// Then: encrypt → sign → seal → upload → persist.
+// Then: encrypt → sign → check balance → seal → spool → persist → post header → 202.
+// The storage worker (services/storage.service.js) finishes the job: chunks,
+// confirmations, verified copies, then pending_stake and registration.
 //
 // ─── Why this order ─────────────────────────────────────────────────────────
-// Everything that can fail cheaply is made to fail BEFORE the one step that
-// costs money and cannot be undone (the Irys push):
+// Everything that can fail cheaply fails BEFORE the one step that can cost money
+// (a posted header that gets mined):
 //
 //   validate           4xx, nothing spent
 //   AES encrypt        local
-//   sign Irys tx       local, free — but yields the arweaveHash
+//   sign Arweave tx    local, free — but yields the arweaveHash (Q1)
+//   balance check      the wallet must cover the signed fee, or nothing happens
 //   seal key           network; failing here still costs nothing
-//   push to Arweave    $$, permanent, irreversible
-//   persist to Postgres
+//   spool ciphertext   chunks go out later and must be the same bytes
+//   persist row        status pending_confirmation, with the signed header
+//   post header       $$ once mined (Q4), permanent
 //
-// Sealing before pushing is the point. Reversed, a Lit failure would leave
-// permanently paid-for bytes that nobody could ever decrypt.
+// Sealing before posting is the point: reversed, a Lit failure would leave
+// paid-for bytes nobody could ever decrypt. Persisting before posting is the
+// other half: posted first, a failed DB write would leave a header that may be
+// mined and paid for, with no row telling the worker to send its data.
 async function createUpload(req, res, next) {
   try {
     if (!req.file) {
@@ -60,11 +115,12 @@ async function createUpload(req, res, next) {
     let arweaveHash;
     let litEncryptedKeyId;
     let litDataToEncryptHash;
+    let prepared;
 
     try {
       // --- Sign locally to learn the arweaveHash --------------------------
-      // Free and offline. A data item's id is sha256 of its signature, so it is
-      // fully determined at signing time — no placeholder txid needed.
+      // Free and offline. The id is sha256 of the signature, so it is fully
+      // determined at signing time (Q1) — no placeholder txid needed.
       const tags = buildTags({
         iv,
         authTag,
@@ -73,17 +129,37 @@ async function createUpload(req, res, next) {
         sha256Hash: result.sha256Hash,
       });
 
-      let tx;
       try {
-        ({ arweaveHash, tx } = await prepareUpload(ciphertext, tags));
+        prepared = await prepareUpload(ciphertext, tags);
+        arweaveHash = prepared.arweaveHash;
       } catch (err) {
-        console.error('[upload] Irys transaction preparation failed:', err.message);
-        return res.status(502).json({
-          valid: false,
-          stage: 'storage',
-          reason: 'irys_unavailable',
-          message: 'Could not prepare the Arweave upload. Nothing was stored — please retry.',
-        });
+        console.error('[upload] Arweave transaction preparation failed:', err.message);
+        return storageUnavailable(res, err);
+      }
+
+      // --- The wallet must cover the fee we just signed ------------------
+      // ...on top of every fee already signed into a posted-but-unmined header.
+      // Caught here, by name, while nothing has been sealed, spooled, or sent.
+      // Two requests checking at the same instant can still both pass (neither
+      // row exists yet); this closes the common case, not that race.
+      try {
+        const [balance, committed] = await Promise.all([arweaveConfig.getBalance(), committedRewardWinston()]);
+        if (BigInt(balance.winston) - committed < BigInt(prepared.reward)) {
+          console.error(
+            `[upload] storage wallet ${balance.address} holds ${balance.ar} AR, ` +
+              `${arweaveConfig.winstonToAr(committed)} AR of it owed to uploads not mined yet; this upload needs ` +
+              `${arweaveConfig.winstonToAr(prepared.reward)} AR. Top it up.`
+          );
+          return res.status(503).json({
+            valid: false,
+            stage: 'storage',
+            reason: 'storage_wallet_low',
+            message: 'The storage wallet cannot cover this upload right now. Nothing was stored or paid — please retry later.',
+          });
+        }
+      } catch (err) {
+        console.error('[upload] storage wallet balance check failed:', err.message);
+        return storageUnavailable(res, err);
       }
 
       // --- Seal the key, bound to that hash (Layer 2 of the envelope) -----
@@ -101,22 +177,24 @@ async function createUpload(req, res, next) {
           message: 'Could not encrypt the file key. Nothing was stored — please retry.',
         });
       }
-
-      // --- Push the bytes. Paid and irreversible from here on. ------------
-      try {
-        await commitUpload(tx, arweaveHash);
-      } catch (err) {
-        console.error('[upload] Irys upload failed:', err.message);
-        return res.status(502).json({
-          valid: false,
-          stage: 'storage',
-          reason: 'arweave_upload_failed',
-          message: 'Could not store the file on Arweave. Nothing was persisted — please retry.',
-        });
-      }
     } finally {
       // Zero the symmetric key regardless of which branch we left through.
       symmetricKey.fill(0);
+    }
+
+    // --- Spool the ciphertext --------------------------------------------
+    // The worker sends chunks after the header is mined, possibly after a
+    // restart, and they must be these exact bytes.
+    try {
+      await spool.write(arweaveHash, ciphertext);
+    } catch (err) {
+      console.error(`[upload] could not spool ciphertext for ${arweaveHash}:`, err.message);
+      return res.status(500).json({
+        valid: false,
+        stage: 'storage',
+        reason: 'spool_write_failed',
+        message: 'Could not stage the encrypted file for upload. Nothing was stored or paid — please retry.',
+      });
     }
 
     // --- Persist ---------------------------------------------------------
@@ -138,7 +216,16 @@ async function createUpload(req, res, next) {
           category: result.metadata.category,
           description: result.metadata.description,
           uploader: req.walletAddress,
-          status: 'pending_stake',
+          // Owned by the storage worker until the bytes are confirmed and
+          // verified on ARWEAVE_MIN_HOLDERS nodes (D9); then pending_stake.
+          status: 'pending_confirmation',
+          storageProvider: 'arweave-l1',
+          arweaveAnchorHeight: prepared.anchorHeight,
+          arweaveReward: prepared.reward,
+          // The signed header is all the worker needs to re-post it (same id) and
+          // to rebuild chunk proofs from the spool. No key material: owner is the
+          // public modulus and the signature is public.
+          arweaveUploaderState: { v: 1, header: prepared.header, holders: {} },
           fileSize,
           pageCount: result.pageCount,
           sha256Hash: result.sha256Hash,
@@ -163,78 +250,64 @@ async function createUpload(req, res, next) {
         },
       });
     } catch (err) {
-      // The only lossy case: storage is paid for and permanent, but the index
-      // row is missing. No funds lost and no state corruption — but the row has
-      // to be reconstructable by hand, so log everything needed to rebuild it.
-      console.error(
-        '[upload] [ORPHAN] Arweave upload succeeded but the Postgres row failed to write. ' +
-          'Recover with: ' +
-          JSON.stringify({
-            arweaveHash,
-            litEncryptedKeyId,
-            litDataToEncryptHash,
-            uploader: req.walletAddress,
-            sha256Hash: result.sha256Hash,
-            encryptionIv: iv.toString('base64'),
-            encryptionAuthTag: authTag.toString('base64'),
-          }),
-        err
-      );
-
-      return res.status(500).json({
+      // Nothing has been posted yet, so nothing is paid and nothing is lost:
+      // drop the spooled ciphertext and let the archivist retry. A unique-key
+      // failure here is a concurrent upload of the same file winning the race.
+      await spool.remove(arweaveHash).catch(() => {});
+      const duplicate = err && err.code === 'P2002';
+      console.error(`[upload] index write failed for ${arweaveHash} before posting; nothing spent:`, err.message);
+      return res.status(duplicate ? 409 : 500).json({
         valid: false,
-        stage: 'persistence',
-        reason: 'index_write_failed',
-        message:
-          'The file was stored on Arweave but could not be indexed. Keep this arweaveHash — ' +
-          'the upload can be recovered and staked with it.',
-        arweaveHash,
+        stage: duplicate ? 'dedup' : 'persistence',
+        reason: duplicate ? 'exact_duplicate' : 'index_write_failed',
+        message: duplicate
+          ? 'This exact file was uploaded at the same moment by another request.'
+          : 'Could not index the upload. Nothing was stored or paid — please retry.',
       });
     }
 
-    // --- Register on-chain ------------------------------------------------
-    // Deliberately after the index row exists and deliberately non-fatal. The
-    // bytes are already paid for and permanent, so a chain failure here must
-    // not turn a successful upload into an error response — it leaves the row
-    // at "pending_stake", which is the same recoverable state as an archivist
-    // who closed the browser mid-flow. `registration` in the response tells the
-    // frontend whether to show "staking available" or "registration pending".
-    const registration = await registerOnChain(arweaveHash, req.walletAddress, result.metadata);
-
-    if (registration.registered && registration.txHash) {
-      // Advance immediately rather than waiting up to a poll interval for the
-      // event listener. The listener's own update is guarded on
-      // status: 'pending_stake', so it degrades to a no-op instead of fighting
-      // this write.
-      try {
-        await prisma.upload.updateMany({
-          where: { arweaveHash, status: 'pending_stake' },
-          data: { status: 'pending', onChainTxHash: registration.txHash },
-        });
-      } catch (err) {
-        // Cosmetic only — the listener will apply the same change on its next
-        // pass from the UploadRegistered event.
-        console.warn(`[upload] could not record registration tx for ${arweaveHash}: ${err.message}`);
-      }
+    // --- Post the header -------------------------------------------------
+    // From here the upload can cost money (once mined). A post that every node
+    // refuses is NOT treated as failure: a node may have accepted it and lost the
+    // reply. The worker re-posts the same signed header until it is mined or its
+    // anchor expires (storage_failed, D1).
+    let header = { accepted: [], results: [] };
+    try {
+      header = await postHeader(prepared.header);
+    } catch (err) {
+      console.error(`[upload] header post for ${arweaveHash} failed; the storage worker will retry:`, err.message);
+    }
+    try {
+      await prisma.upload.update({
+        where: { arweaveHash },
+        data: { arweaveTxPostedAt: new Date() },
+      });
+    } catch (err) {
+      console.warn(`[upload] could not record header post time for ${arweaveHash}: ${err.message}`);
     }
 
-    return res.status(201).json({
+    // 202: accepted, not finished. The bytes are confirmed and copied by the
+    // storage worker; registration on-chain follows automatically once they are.
+    return res.status(202).json({
       valid: true,
       arweaveHash,
       litEncryptedKeyId,
-      status: registration.registered && registration.txHash ? 'pending' : 'pending_stake',
-      registration: {
-        registered: registration.registered,
-        reason: registration.reason,
-        message: registration.message,
-        txHash: registration.txHash || null,
+      status: 'pending_confirmation',
+      storage: {
+        headerAcceptedBy: header.accepted.length,
+        reward: prepared.reward,
+        rewardAr: arweaveConfig.winstonToAr(prepared.reward),
+        confirmationsRequired: arweaveConfig.ARWEAVE_CONFIRMATIONS,
+        copiesRequired: arweaveConfig.ARWEAVE_MIN_HOLDERS,
       },
-      // The archivist stakes from their own wallet: stake.stake() requires
-      // getUploader(hash) == msg.sender, and registerUpload recorded them as
-      // the uploader. Registration being done is what unblocks that call.
-      nextStep: registration.registered
-        ? 'Approve $ALEX and call stake.stake(arweaveHash, amount) from your wallet.'
-        : 'Upload stored. Retry registration with POST /api/upload/:arweaveHash/register before staking.',
+      // Staking needs registerUpload(), which the backend calls only after the
+      // bytes are confirmed and verified. Until then stake.stake() would revert.
+      nextStep:
+        'Storage in progress (usually 30–60 minutes). Poll GET /api/storage/' +
+        arweaveHash +
+        ' or GET /api/upload/' +
+        arweaveHash +
+        ' — stake once status is "pending".',
       isNearDuplicate: Boolean(result.isNearDuplicate),
       nearDuplicateMatches: result.nearDuplicateMatches || [],
       clamavSkipped: result.clamavSkipped,
@@ -374,6 +447,22 @@ async function retryRegistration(req, res, next) {
       });
     }
 
+    // Registration unlocks staking. Before the bytes are confirmed and verified
+    // (D9), an archivist could stake on a book whose data never lands, so the
+    // storage worker registers it itself once storage is done.
+    if (row.status === 'pending_confirmation' || row.status === 'storage_failed') {
+      return res.status(409).json({
+        registered: false,
+        arweaveHash,
+        error: 'storage_not_confirmed',
+        status: row.status,
+        message:
+          row.status === 'storage_failed'
+            ? 'This upload was never stored on Arweave. Upload the file again.'
+            : 'The file is still being stored on Arweave. It is registered automatically when storage is confirmed.',
+      });
+    }
+
     const registration = await registerOnChain(arweaveHash, row.uploader, row);
 
     if (!registration.registered) {
@@ -427,4 +516,5 @@ module.exports = {
   getRegistrarStatus,
   toPublicUpload,
   PUBLIC_UPLOAD_SELECT,
+  storageUnavailable,
 };

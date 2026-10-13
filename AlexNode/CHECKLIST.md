@@ -3,6 +3,7 @@
 Living checklist for the Node.js backend gateway. Phases run cheapest → most infra-dependent, so each is independently testable without waiting on external services. See `CLAUDE.md` for full architecture.
 
 ## Locked Decisions
+- **Storage (2026-10-13): direct Arweave L1, Irys removed.** Irys retired its Arweave upload path (1 Nov 2026), so the backend now posts straight to raw Arweave mainnet nodes: no bundler, no gateway, no third party. Plan, decisions (D1–D9) and live Phase 0 evidence: [`ARWEAVE-DIRECT-PLAN.md`](ARWEAVE-DIRECT-PLAN.md). Everything below that mentions Irys is **history** from before the switch; the code, config, dependencies and `IRYS_*` env vars are gone.
 - **Database:** Prisma + Postgres (Neon) — NOT MongoDB/Mongoose.
 - **Encryption:** Two-layer envelope encryption: backend encrypts validated PDFs using **local AES-256-GCM**, then encrypts the 32-byte symmetric key via **Lit Protocol Chipotle v3 REST API** (PKP encryption in TEE via Lit Actions). Access control gating is enforced at decryption time via Lit Actions. Backend is never in the decryption path.
 - **Encryption stays backend-side for the PoC** — the validation pipeline needs plaintext. Browser-side encryption is a later phase (needs decentralized validation first).
@@ -129,7 +130,7 @@ record of why that column exists. Use `migrate diff` above to inspect drift inst
 - [x] `controller/arweave.js` — `prepareUpload` (sign locally → `arweaveHash`), `commitUpload` (push + receipt-id assertion), `fetchEncrypted`, `buildTags`
   - ⚠️ First point where file size costs real treasury money (permanent, prepaid, no delete). AES-GCM ciphertext ≈ plaintext size, so the `MAX_FILE_SIZE_MB` cap is a direct spending cap — see *Revisit at the End*.
   - **On devnet for now** (`IRYS_NETWORK=devnet`) — free testnet tokens, ~60-day retention, and **devnet never reaches Arweave**. Flip to `mainnet` only once the flow is proven.
-  - ⚠️ **Before flipping to mainnet**, re-check the storage provider. Irys has launched its own L1 datachain and **deprecated the Arweave bundlers we use** — still operating, but "no longer actively supported." Decision (2026-08-25) is to stay on Arweave: permanence is Alexandria's product, Arweave is a multi-miner protocol rather than one company's chain, and if Irys vanishes we lose an on-ramp rather than the books. Mainnet is the point of no return, so confirm the bundlers still run and price **ArDrive Turbo** as the fallback. Data items are ANS-104 and ids are `sha256(signature)`, so swapping bundlers is a `config/irys.js` change that touches no stored data. Full reasoning + sources: **[`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md)**.
+  - ⚠️ **Before flipping to mainnet**, re-check the storage provider. Irys has launched its own L1 datachain and **deprecated the Arweave bundlers we use** — still operating, but "no longer actively supported." Decision (2026-08-25) is to stay on Arweave: permanence is Alexandria's product, Arweave is a multi-miner protocol rather than one company's chain, and if Irys vanishes we lose an on-ramp rather than the books. Mainnet is the point of no return, so confirm the bundlers still run and price **ArDrive Turbo** as the fallback. Data items are ANS-104 and ids are `sha256(signature)`, so swapping bundlers is a `config/irys.js` change that touches no stored data. Full reasoning + sources: **`ARWEAVE-IRYS.md` (deleted 2026-10-13; in git history)**.
   - ⚠️ **Irys id encoding trap:** `@irys/bundles` exposes `DataItem.id` as base58 (44 chars); gateways and receipts use base64url (43). Its own getter/setter disagree (`get id` → base58, `set id` → base64url). `transactionId()` derives base64url from `tx.rawId`; never use `tx.id`.
 - [x] Resolve `arweaveHash`-before-encrypt ordering (see Open Question) — **resolved**, see below
 - [x] Persist full `Upload` row to Postgres (`status: "pending_stake"`) — spreads `result.simHashBands` into the Prisma `create` payload alongside `simHash`
@@ -446,7 +447,7 @@ registration script sit beside it there.
       - duration enforced to 1, 7, or 30 days in seconds (86400, 604800, 2592000)
 - [x] Fetch decrypt payload: `GET /api/rental/decrypt-params/:hash/:address`
       → `{ litEncryptedKeyId, litDataToEncryptHash, encryptionIv, encryptionAuthTag, grantedVia }`
-- [x] Fetch ciphertext: `gateway.irys.xyz/:arweaveHash`
+- [x] Fetch ciphertext: ~~`gateway.irys.xyz/:arweaveHash`~~ → `GET /api/storage/:arweaveHash/data` (backend reads raw Arweave nodes, proof-checked; 2026-10-13)
 - [x] Execute the Lit Action → receive `k` (`src/services/lit.js`)
 - [x] **AES-256-GCM decrypt in-browser** (WebCrypto `subtle.decrypt`), using `k` + the IV
       + auth tag appended to ciphertext (`src/services/decryption.js`)
@@ -505,7 +506,7 @@ redeploy invalidates them. Doing them now would mean doing them twice.
 - [ ] Rejection logging (reason, uploader, timestamp) for abuse detection
 - [ ] Lint config (optional)
 - [x] Contract ABIs + deployed addresses imported from `AlexandriaSmartContract` — `node scripts/sync-abis.js`, output committed to `abis/`
-- [ ] Irys wallet balance monitoring / low-balance alert
+- [ ] Storage wallet low-balance alert (balance is visible at `GET /api/storage/status`; nothing alerts yet)
 
 ---
 
@@ -528,16 +529,13 @@ Nothing here blocks Phases 5–6, but all of it should be settled before real ar
 - [x] Centralize `MAX_FILE_SIZE_MB` / `_BYTES` in `config/uploadLimits.js`; multer and validation share the same parsed fallback.
 - [x] Export `TITLE_MAX` / `AUTHOR_MAX` / `DESCRIPTION_MIN` / `DESCRIPTION_MAX` from `validation.service.js` so the frontend can size its inputs and show character counters instead of hardcoding 300/200/10/2000. (Also unenforced at the DB layer — Prisma `String` → Postgres `TEXT` is unbounded.)
 
-> **The real escape hatch for large scans is Deferred Phase 1** (archivist-funded storage — frontend uploads directly to Irys). That removes the bytes from this server entirely, so neither RAM nor the no-plaintext-on-disk rule constrains file size. Don't rebuild the in-memory upload path twice chasing 500 MB archival scans.
+> **The real escape hatch for large scans is Deferred Phase 1** (archivist-funded storage — frontend posts directly to Arweave). That removes the bytes from this server entirely, so neither RAM nor the no-plaintext-on-disk rule constrains file size. Don't rebuild the in-memory upload path twice chasing 500 MB archival scans.
 
 ---
 
 ## Deferred (post-PoC — Decentralization Roadmap)
-- [ ] Phase 1: archivist-funded storage (frontend uploads to Irys, remove `IRYS_WALLET_KEY`)
-  - **Natural point to re-decide Arweave vs. Irys L1.** Once archivists pay for their own
-    storage they are choosing the provider and absorbing the cost, and the decision comes
-    with real numbers instead of estimates. Irys L1 is ~20× cheaper, which is not trivial
-    when archival scans run 150–300 MB. See [`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md).
+- [ ] Phase 1: archivist-funded storage (frontend posts to Arweave with the archivist's own wallet; remove the backend storage wallet)
+  - Real per-book costs are recorded in `Upload.arweaveReward` (D7), so this can be decided on actual numbers.
 - [ ] Phase 2: decentralized indexing via The Graph (MongoDB/Postgres → subgraph)
 - [ ] Phase 3: distributed validation (multi-node consensus)
 - [ ] Phase 4: fully client-side upload + browser encryption (backend optional)

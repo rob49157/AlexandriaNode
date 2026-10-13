@@ -15,7 +15,7 @@ The backend is the orchestration layer — it sits between the frontend, AI vali
 - **Backend Gateway (THIS REPO):** Node.js + Express (upload orchestration, Lit Protocol encryption, Arweave indexing)
 - **AI Validation:** Python + FastAPI (OCR/text extraction, content quality analysis, NLP-based checks) — separate service
 - **Blockchain:** Base Testnet / Solidity (handles $ALEX token, archivist staking, time-bound rental permissions) — `AlexandriaSmartContract` repo
-- **Storage:** Arweave via Irys (permanent encrypted file storage) + Postgres (off-chain search indexing)
+- **Storage:** Arweave L1 mainnet, posted directly to raw Arweave nodes with no bundler and no gateway (permanent encrypted file storage) + Postgres (off-chain search indexing). See [`ARWEAVE-DIRECT-PLAN.md`](ARWEAVE-DIRECT-PLAN.md).
 
 ### Backend Responsibilities
 This service handles:
@@ -23,7 +23,7 @@ This service handles:
 - **Security Scanning:** ClamAV virus scanning, embedded JS/attachment detection, auto-action stripping (all in-process)
 - **Deduplication:** SHA-256 exact duplicate detection and SimHash near-duplicate fingerprinting (all in-process)
 - **Lit Protocol Encryption:** Two-layer envelope encryption — AES-256-GCM locally for the PDF, then Lit Chipotle v3 PKP encryption for the symmetric key via REST API
-- **Arweave/Irys Storage:** Upload encrypted PDFs to permanent storage, manage transaction IDs
+- **Arweave Storage:** Sign and post encrypted PDFs to Arweave L1 nodes; a background worker confirms them, copies them to 2 independent nodes and verifies both (`services/storage.service.js`)
 - **Postgres Indexing:** Maintain searchable off-chain index of all uploads (title, author, category, arweaveHash, status)
 - **Event Listening:** Monitor on-chain events (uploads, rentals, challenges) and sync to Postgres (read-only, no writes)
 
@@ -44,26 +44,33 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 6. Backend runs Layer 5 validation: metadata sanitization and required field checks
    → ANY failure at steps 2-6 = reject immediately, nothing stored
 7. Backend generates symmetric key (crypto.randomBytes(32))
-8. Backend encrypts PDF with AES-256-GCM
-9. Backend uploads encrypted PDF to Arweave via Irys → gets arweaveHash
-10. Backend encrypts symmetric key with Lit Protocol, setting access condition:
-    → Lit checks Rent.sol.isRentalActive(arweaveHash, userAddress)
-11. Backend stores metadata + uploader wallet address in Postgres (status: "pending_stake")
-12. Backend discards symmetric key and unencrypted PDF from memory
-13. Backend returns { arweaveHash, litEncryptedKeyId } to frontend
+8. Backend encrypts PDF with AES-256-GCM; zeroes the plaintext
+9. Backend signs the Arweave L1 transaction locally (free) → arweaveHash
+   = base64url(sha256(signature)), known before anything is sent
+10. Backend checks the storage wallet can pay the signed fee (else 503, nothing spent)
+11. Backend seals { v, k, arweaveHash } with Lit (the decryption Lit Action gates
+    on the hash INSIDE the envelope — KEY-BINDING.md); zeroes the key
+12. Backend spools the ciphertext to disk, writes the Postgres row
+    (status "pending_confirmation"), THEN posts the signed header to 3 nodes
+13. Backend returns 202 { arweaveHash, litEncryptedKeyId, status, storage } to frontend
 
-13. Backend calls library.registerUpload(arweaveHash, archivistAddress, metadata)
+=== STORAGE WORKER (services/storage.service.js, background) ===
+14. Waits for the header to be mined; re-posts the same signed header if lost;
+    after anchor + 50 blocks unmined → "storage_failed" (archivist re-uploads)
+15. Sends the chunks to 2 nodes in different /24 blocks that answer 200
+16. At 16 confirmations, reads both copies back and verifies them → "pending_stake"
+17. Calls library.registerUpload(arweaveHash, archivistAddress, metadata)
     → signed by the registrar wallet, because this function is onlyAuthorized
     → the ARCHIVIST is recorded as `uploader`, not the backend
-    → non-fatal: on failure the row stays "pending_stake" and is retryable via
-      POST /api/upload/:arweaveHash/register
-14. Backend returns { arweaveHash, litEncryptedKeyId, registration } to frontend
+    → success: "pending". Failure is non-fatal: the row stays "pending_stake" and
+      is retryable via POST /api/upload/:arweaveHash/register
 
 === FRONTEND (value-moving transactions, signed by archivist's wallet) ===
-15. Frontend calls token.approve(stakeContractAddress, stakeAmount)
-16. Frontend calls stake.stake(arweaveHash, stakeAmount)
-    → requires getUploader(arweaveHash) == msg.sender, which step 13 satisfied
-17. Backend event listener picks up on-chain events → updates Postgres status
+18. Frontend polls GET /api/storage/:arweaveHash until status is "pending"
+19. Frontend calls token.approve(stakeContractAddress, stakeAmount)
+20. Frontend calls stake.stake(arweaveHash, stakeAmount)
+    → requires getUploader(arweaveHash) == msg.sender, which step 17 satisfied
+21. Backend event listener picks up on-chain events → updates Postgres status
 ```
 
 ### Why This Split?
@@ -210,13 +217,15 @@ The backend uses **two-layer envelope encryption** via the Lit Chipotle v3 REST 
 1. **Layer 1 (Local):** Generate a random AES-256 symmetric key, encrypt the PDF with AES-256-GCM
 2. **Layer 2 (Lit TEE):** Encrypt the 32-byte symmetric key via `POST /core/v1/lit_action` using a PKP (Programmable Key Pair) inside a Trusted Execution Environment
 
-Access control is enforced at **decryption time** by Lit Actions — immutable JavaScript pinned to IPFS that runs inside the TEE. The decryption Lit Action (Phase 5+) will call `Rent.sol.isRentalActive(arweaveHash, userAddress)` before releasing the symmetric key. The backend is never in the decryption path.
+Access control is enforced at **decryption time** by Lit Actions — immutable JavaScript pinned to IPFS that runs inside the TEE. The decryption Lit Action lives in the frontend (`AlexandriaFrontEnd/Alexandria-Front-end/src/services/litAction.js`) and calls `Rent.sol.isRentalActive(arweaveHash, userAddress)` with the hash read from inside the sealed envelope before releasing the symmetric key. The backend is never in the decryption path.
 
 The old JSON-based `accessControlConditions` are deprecated (Datil network shut down Feb 2026).
 
 ## Environment & Tooling
 
-- **Runtime:** Node.js v18+ (managed via nvm)
+- **Runtime:** Node.js **v22+** (managed via nvm; `.nvmrc` pins 22.21.1). Required by
+  `arweave@2.x` (direct Arweave L1 storage, see `ARWEAVE-DIRECT-PLAN.md`) and declared in
+  `package.json` `engines`. npm only warns on an engines mismatch, so check before deploying.
 - **Module System:** CommonJS (`"type": "commonjs"` in package.json)
 - **Framework:** Express.js
 - **Entry Point:** `index.js`
@@ -233,9 +242,10 @@ helmet                   — Security headers
 # Blockchain (read-only — event listening and status queries)
 ethers                   — Smart contract event listening and read calls (no write transactions)
 
-# Storage
-@irys/sdk                — Arweave uploads via Irys
-arweave                  — Arweave transaction queries
+# Storage (direct Arweave L1 — no bundler, no gateway)
+arweave                  — arweave-js 2.x: local signing, chunking, Merkle proofs only. Its own
+                           uploader is NOT used (it stalls on the 303 most nodes answer); all
+                           network traffic is our own fetch() to raw nodes (controller/arweave.js)
 
 # Encryption (Lit Chipotle v3 — REST API, no heavy SDK)
 # Uses native Node.js crypto for AES-256-GCM and fetch() for Lit REST API
@@ -296,12 +306,16 @@ AlexNode/
 │   └── {library,stake,rent,token,payment}.json
 │
 ├── scripts/
-│   └── sync-abis.js            # Regenerate abis/ from the AlexandriaSmartContract deployment
+│   ├── sync-abis.js            # Regenerate abis/ from the AlexandriaSmartContract deployment
+│   ├── arweave-wallet-setup.js # Storage wallet: generate | status (address check, balance, prices)
+│   ├── smoke-test.js           # Live end-to-end test on Arweave mainnet (+ --full: HTTP → Base Sepolia)
+│   ├── verify-upload.js        # Cross-check one book across Arweave, chain, Postgres, listener
+│   └── arweave-spike.js        # Phase 0 measurements on mainnet (records raw node responses)
 │
 ├── config/
 │   ├── db.js                   # Prisma client singleton (Postgres connection)
 │   ├── blockchain.js           # Ethers provider + read-only contract instances (NO signer)
-│   ├── irys.js                 # Irys client configuration
+│   ├── arweave.js              # Storage wallet, raw-node discovery/health, balance, price quorum
 │   └── lit.js                  # Lit Chipotle v3 REST API client (stateless, no SDK)
 │
 ├── routes/
@@ -309,7 +323,8 @@ AlexNode/
 │   ├── search.routes.js        # GET /search?q=...
 │   ├── rental.routes.js        # GET /rental/status, /rental/book, /rental/decrypt-params
 │   ├── stake.routes.js         # GET /stake/status/:hash
-│   └── chain.routes.js         # GET /chain/status (event listener health)
+│   ├── chain.routes.js         # GET /chain/status (event listener health)
+│   └── storage.routes.js       # GET /storage/status, /storage/:hash, /storage/:hash/data
 │
 ├── controller/                 # singular
 │   ├── upload.controller.js    # Upload orchestration + public read projection
@@ -317,7 +332,8 @@ AlexNode/
 │   ├── rental.controller.js    # Rental status + rental-gated decrypt params
 │   ├── stake.controller.js     # Stake status queries
 │   ├── chain.controller.js     # Listener health
-│   ├── arweave.js              # Irys prepare/commit, tags, hash validation
+│   ├── arweave.js              # Arweave L1: sign, post header, push chunks, verify, proof-checked reads
+│   ├── storage.controller.js   # Storage worker health, per-book progress, ciphertext download
 │   └── litProtocol.js          # AES-256-GCM + Lit PKP key sealing
 │
 ├── services/
@@ -326,6 +342,8 @@ AlexNode/
 │   ├── validation.service.js   # Layer 1 + Layer 5 validation pipeline
 │   ├── securityScan.service.js # Layer 2 structural PDF scan + ClamAV
 │   ├── dedup.service.js        # Layer 3 SHA-256 + banded-LSH near-dup lookup
+│   ├── storage.service.js      # Storage worker: pending_confirmation → stored → registered
+│   ├── spool.service.js        # Ciphertext waiting for its chunks to be sent (atomic, ciphertext only)
 │   └── simhash.service.js      # 64-bit SimHash fingerprinting
 │
 ├── prisma/
@@ -338,7 +356,11 @@ AlexNode/
 │   └── error.middleware.js     # Global error handler
 │
 └── tests/                      # Plain `node tests/<name>.test.js` — no runner yet
-    ├── uploadFlow.test.js      # Full upload pipeline, mocked Irys/Lit/Postgres
+    ├── uploadFlow.test.js      # Request path → 202; Lit/Postgres stubbed, Arweave via the fake network
+    ├── storageWorker.test.js   # Worker: mining, copies, 303s, crash/resume, deadline, verify, registration
+    ├── arweaveConfig.test.js   # Wallet checks, node discovery/seeds, balance, price quorum
+    ├── helpers/fakeArweaveNetwork.js # Fake nodes built from recorded mainnet responses
+    ├── fixtures/arweave-node-responses.json # Verbatim mainnet node responses
     ├── securityAndDedup.test.js # Layer 2 + Layer 3
     ├── readPaths.test.js       # GET /upload/:hash + /search
     ├── chainReads.test.js      # On-chain reads + event listener
@@ -376,9 +398,14 @@ CHAIN_CONFIRMATIONS=3               # reorg buffer
 CHAIN_LOG_CHUNK=10000               # getLogs span; publicnode caps at 50k, drpc ~10k
 # CHAIN_START_BLOCK=                # defaults to the earliest deployment block in abis/
 
-# Arweave / Irys
-IRYS_NODE_URL=https://node2.irys.xyz
-IRYS_WALLET_KEY=                    # Dedicated storage wallet, funded by project treasury
+# Arweave L1 storage (see .env.example for every option)
+ARWEAVE_WALLET_FILE=.arweave-wallet.json   # RSA JWK key file — keep OUTSIDE the repo; back it up
+ARWEAVE_WALLET_ADDRESS=             # asserted against the file; an 0x address is rejected by name
+ARWEAVE_NODE_URLS=                  # blank = discover raw peers; set to pin nodes (our own node)
+ARWEAVE_CONFIRMATIONS=16            # header finality before a book counts as stored
+ARWEAVE_MIN_HOLDERS=2               # independent nodes holding a verified copy
+ARWEAVE_MAX_REWARD_AR=3             # fee cap per upload
+STORAGE_WORKER_ENABLED=true
 
 # Lit Protocol — Chipotle v3 REST API
 LIT_API_KEY=                        # from dashboard.chipotle.litprotocol.com
@@ -392,19 +419,42 @@ VALIDATION_SERVICE_URL=http://localhost:8000
 MAX_FILE_SIZE_MB=150
 ```
 
-## API Endpoints (Planned)
+## API Endpoints
 
 ### Upload
 ```
 POST /api/upload
   - Body: multipart/form-data (PDF file + metadata + walletAddress)
   - Auth: None (wallet address included as metadata, real proof of ownership is on-chain staking)
-  - Flow: validate → encrypt → store on Arweave → index in Postgres (status: pending_stake)
-  - Returns: { arweaveHash, litEncryptedKeyId }
-  - Frontend then handles on-chain staking and registration with returned arweaveHash
+  - Flow: validate → encrypt → sign → seal → spool → index (status: pending_confirmation) → post header
+  - Returns: 202 { arweaveHash, litEncryptedKeyId, status: "pending_confirmation", storage }
+  - The storage worker then stores it (≈25–40 min) and registers it on-chain; the
+    frontend polls GET /api/storage/:arweaveHash and lets the archivist stake once
+    status is "pending"
+  - 503 storage_wallet_low | arweave_unavailable | arweave_price_above_cap: nothing stored or paid
 
 GET /api/upload/:arweaveHash
   - Returns: Upload metadata (title, author, status, uploader, timestamp)
+
+POST /api/upload/:arweaveHash/register
+  - Retry registration. 409 storage_not_confirmed while the book is not stored yet
+```
+
+### Storage (direct Arweave L1)
+```
+GET /api/storage/status
+  - Worker health, storage wallet balance, settings, pending/failed counts, oldest
+    pending upload. 503 when the worker is stopped.
+
+GET /api/storage/:arweaveHash
+  - Progress of one upload: { status, stored, mined, confirmations,
+    confirmationsRequired, copiesComplete, copiesRequired, verifiedCopies, error }
+
+GET /api/storage/:arweaveHash/data
+  - The ciphertext, read from raw Arweave nodes with every chunk proof-checked.
+    Raw nodes are plain HTTP, which the HTTPS frontend cannot fetch, and no
+    third-party gateway is used. Only for books this backend indexed and verified
+    as stored. Public bytes, useless without the Lit-released key.
 ```
 
 ### Search
@@ -612,7 +662,7 @@ PDF arrives at POST /api/upload
 
 - **Layer 1:** AES-256-GCM encrypts the raw PDF with a locally-generated random symmetric key (fast, no network)
 - **Layer 2:** The 32-byte symmetric key is encrypted by a PKP inside a Lit TEE via `POST /core/v1/lit_action` (small network call)
-- **Access control** is NOT embedded at encryption time. It is enforced at decryption time by a Lit Action (Phase 5+).
+- **Access control** is NOT embedded at encryption time. It is enforced at decryption time by a Lit Action (built in the frontend).
 
 The backend NEVER stores unencrypted PDFs or raw symmetric keys. Keys are zeroed from memory immediately after encryption.
 
@@ -621,68 +671,59 @@ The decryption Lit Action gates on `Rent.isRentalActive(arweaveHash, user)`. If 
 
 So the hash is sealed **inside** the ciphertext as `{ v, k, arweaveHash }`. The decryption Action reads it out of the decrypted plaintext and gates on that value, which the caller cannot forge.
 
-This is why encryption is split into two calls (`aesEncryptPdf` → `sealKey`): the `arweaveHash` only exists once the Irys data item is signed, which happens between them.
+This is why encryption is split into two calls (`aesEncryptPdf` → `sealKey`): the `arweaveHash` only exists once the Arweave transaction is signed, which happens between them.
 
-**The decrypt half is not built yet, and the guarantee is worthless without it.** The decryption Lit Action must read `arweaveHash` from the decrypted envelope and gate on that — never on a `js_param`. See **[`KEY-BINDING.md`](KEY-BINDING.md)** for the exploit, a runnable demo, and a reviewer checklist.
+**The decrypt half is built in the frontend** (`src/services/litAction.js`) and reads `arweaveHash` from the decrypted envelope — never from a `js_param`. Every edit to it must re-pass the reviewer checklist and the negative test in **[`KEY-BINDING.md`](KEY-BINDING.md)** (the exploit, a runnable demo, and the checklist), because the guarantee is worthless if that Action gets it wrong.
 
 ### At Upload Time
 ```javascript
-const { aesEncryptPdf, sealKey } = require('./controller/litProtocol');
-const { prepareUpload, commitUpload, buildTags } = require('./controller/arweave');
+// controller/upload.controller.js, simplified
+const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(pdfBuffer); // Layer 1, local
 
-// Layer 1: Local AES-256-GCM (raw Buffer — base64 would cost 33% more on Arweave)
-const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(pdfBuffer);
+// Sign the Arweave L1 transaction locally — free, offline. The id is
+// base64url(sha256(signature)) and the signature covers data_root, so the
+// arweaveHash is fixed before anything is sent (prepareUpload re-checks this).
+const prepared = await prepareUpload(ciphertext, buildTags({ ... })); // { arweaveHash, header, reward, anchorHeight }
 
-// Sign the Irys data item locally — free, offline, and yields the arweaveHash
-// (a data item's id is sha256 of its signature, so it's known before upload).
-const { arweaveHash, tx } = await prepareUpload(ciphertext, buildTags({ ... }));
-
-// Layer 2: Seal the key BOUND to that hash, still before spending anything
-const { encryptedSymmetricKey, dataToEncryptHash } = await sealKey(symmetricKey, arweaveHash);
+// The storage wallet must cover the signed fee, or nothing happens (503).
+// Layer 2: seal the key BOUND to that hash, still before anything can be paid.
+const { encryptedSymmetricKey, dataToEncryptHash } = await sealKey(symmetricKey, prepared.arweaveHash);
 symmetricKey.fill(0);
 
-// Only now push bytes — the paid, irreversible step
-await commitUpload(tx, arweaveHash);
-
-// Persist encryptedSymmetricKey + dataToEncryptHash (litEncryptedKeyId) in Postgres
+await spool.write(arweaveHash, ciphertext);              // chunks go out later, must be these bytes
+await prisma.upload.create({ ...status: 'pending_confirmation', arweaveUploaderState: { header } });
+await postHeader(prepared.header);                       // paid once mined
+// → 202. services/storage.service.js does the rest (chunks, confirmations, copies, registration).
 ```
 
-**Order matters.** Sealing before pushing means a Lit failure costs nothing. Reversed, it would leave permanently paid-for bytes that nobody can ever decrypt.
+**Order matters.** Sealing before posting means a Lit failure costs nothing; reversed, it would leave paid-for bytes nobody can decrypt. Persisting before posting means a failed database write never leaves a header that may be mined (and paid for) with no row telling the worker to send its data.
 
-⚠️ **Arweave id encoding.** A transaction id is **32 raw bytes** (`sha256` of the data item's signature). Everything else is a rendering of those bytes, and the two renderings in play look interchangeable but never compare equal as strings:
+⚠️ **Arweave id encoding.** A transaction id is **32 raw bytes** (`sha256` of the signature), rendered as **base64url, 43 characters**: gateways, tags, on-chain consumers and our DB all use that form, and it was verified live on mainnet (ARWEAVE-DIRECT-PLAN.md §9 Q1). Two rules, learned the hard way under the old upload path (whose receipts were base58, 44 chars, and never compared equal as strings):
+1. Derive the id yourself and check it: `prepareUpload` recomputes base64url(sha256(signature)) and refuses a mismatch.
+2. Never compare two ids as strings: use `sameTransactionId()`, which compares the decoded 32 bytes.
 
-| Encoding | Length | Alphabet | Where it appears |
-|---|---|---|---|
-| **base64url** | 43 | `A–Z a–z 0–9 - _` | gateways, Arweave tags, on-chain consumers, our DB — **the canonical form** |
-| **base58** | 44 | `A–Z a–z 0–9` minus `0 O I l`, no `-` or `_` | `DataItem.id` getter, **and Irys upload receipts** |
+> A wrong belief about the id format was once copied into a test fake, so the mock asserted the assumption instead of testing reality, and the bug survived every suite until a live upload. That is why the test fakes are now built from recorded mainnet responses (`tests/fixtures/`, `.arweave-spike/*/run.json`).
 
-`@irys/bundles` disagrees with itself: `get id` encodes base58 while `set id` decodes base64url.
-
-**Two rules, and the second one was learned the hard way:**
-1. Always *derive* the hash as base64url of `tx.rawId` — never read `tx.id`. `controller/arweave.js` does this via `transactionId()`.
-2. Never *compare* two ids as strings. `commitUpload` compared the base58 receipt id against our base64url hash and threw on every upload ever attempted — including correct ones. Use `sameTransactionId()`, which compares the decoded 32 bytes.
-
-> An earlier version of this file claimed upload receipts were base64url. They are not. That wrong belief was copied into the test fake, so the mock asserted the assumption instead of testing reality, and the bug survived every suite until a live upload.
-
-📄 **Full explainer: [`ARWEAVE-IRYS.md`](ARWEAVE-IRYS.md)** — what Arweave and Irys each are and how they relate, where the `arweaveHash` actually comes from (`sha256` of the data item signature, derived offline before any spend), why that determinism is what makes the key binding possible, which surface speaks which encoding, and why devnet never reaches Arweave.
+📄 **Why direct L1, and the sourced facts behind every design choice:** [`ARWEAVE-DIRECT.md`](ARWEAVE-DIRECT.md) (protocol research), [`ARWEAVE-UPLOAD-OPTIONS.md`](ARWEAVE-UPLOAD-OPTIONS.md) (alternatives), [`ARWEAVE-DIRECT-PLAN.md`](ARWEAVE-DIRECT-PLAN.md) (decisions D1–D9, Phase 0 live answers Q1–Q13).
 
 ### Security Rules
 - Symmetric keys exist in memory only during the upload transaction
 - No unencrypted PDFs written to disk at any point
-- Backend holds exactly two keys, both low-privilege and separate:
-  `IRYS_WALLET_KEY` (pays for Arweave bytes only) and `BACKEND_PRIVATE_KEY`
-  (calls `library.registerUpload()` only). Neither can move $ALEX or stake.
-  Do not merge them into one wallet, and never give either contract ownership.
-- Backend does have an Irys wallet key (`IRYS_WALLET_KEY`) solely for paying Arweave storage fees
+- Backend holds exactly two keys, both low-privilege and separate: the Arweave
+  storage wallet (`ARWEAVE_WALLET_FILE`, an RSA JWK file kept outside the repo; pays
+  for Arweave bytes only) and `BACKEND_PRIVATE_KEY` (calls `library.registerUpload()`
+  only). Neither can move $ALEX or stake. Do not merge them into one wallet, and
+  never give either contract ownership.
+- The spool (`ARWEAVE_SPOOL_DIR`) holds AES-GCM ciphertext only, deleted once the book is verified stored
 - Upload requests include wallet address as metadata (not cryptographic auth — on-chain staking is the real proof of ownership)
 - File uploads validated for size, type, and content before processing
 
-### Irys Wallet Funding Model
-- The Irys wallet is a **dedicated, low-privilege storage wallet** — it can only pay for Arweave uploads
-- The **project treasury wallet** periodically tops up the Irys wallet with small amounts
-- Keep the Irys wallet lightly funded to minimize exposure — if the server is compromised, the attacker can only burn through whatever storage credits are currently loaded
+### Storage Wallet Funding Model
+- The Arweave storage wallet is a **dedicated, low-privilege wallet** — it can only pay for Arweave uploads
+- The **project treasury** periodically sends it AR (bought on an exchange and withdrawn on the Arweave network — never to an 0x address)
+- Keep it lightly funded: if the server is compromised, an attacker can only spend what is loaded. Each upload is also capped by `ARWEAVE_MAX_REWARD_AR`
 - The treasury wallet stays offline and never touches the backend server
-- Monitor Irys wallet balance and alert when it needs a top-up
+- Balance: `GET /api/storage/status` or `node scripts/arweave-wallet-setup.js status` (shows how many maximum-size uploads it covers). Every row records its exact fee in `arweaveReward` (D7)
 
 ## Prisma Schema (Postgres)
 
@@ -790,15 +831,15 @@ The current architecture is **intentionally centralized for the PoC**. The backe
 
 ### What's Centralized (PoC)
 - **Upload pipeline:** Single backend server validates, encrypts, and uploads to Arweave
-- **Storage funding:** Single Irys wallet funded by project treasury pays for all Arweave uploads
+- **Storage funding:** Single Arweave storage wallet funded by project treasury pays for all uploads
 - **Search index:** Postgres on the backend server — if the server goes down, search is unavailable (though all data still exists on Arweave and on-chain)
 - **Validation:** Backend decides what passes validation — single authority on content quality
 
 ### Phase 1: Archivist-Funded Storage
 Move Arweave storage costs from the project to the archivists themselves:
-- Frontend uploads encrypted PDFs directly to Irys using the archivist's wallet
+- Frontend posts encrypted PDFs to Arweave nodes using the archivist's own Arweave wallet
 - Backend only handles validation and Lit Protocol encryption, returns the encrypted blob to the frontend
-- Removes `IRYS_WALLET_KEY` from backend entirely — no funded wallets on the server at all
+- Removes the storage wallet (`ARWEAVE_WALLET_FILE`) from the backend entirely — no funded wallets on the server at all
 - Archivists pay for storage as part of their upload cost (alongside staking)
 
 ### Phase 2: Decentralized Indexing

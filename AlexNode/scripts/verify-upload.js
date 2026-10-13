@@ -13,6 +13,11 @@
 
 require('dotenv').config({ quiet: true });
 
+if (Number(process.versions.node.split('.')[0]) < 22) {
+  console.error(`Node ${process.versions.node}: arweave-js 2.x needs Node >= 22. Run: nvm use 22.21.1`);
+  process.exit(1);
+}
+
 const { ethers } = require('ethers');
 
 const hash = process.argv[2];
@@ -33,16 +38,20 @@ function check(condition, label, detail) {
 (async () => {
   console.log(`\nVerifying ${hash}\n`);
 
-  // ── 1. Arweave / Irys gateway ──────────────────────────────────────────────
-  console.log('Arweave (gateway.irys.xyz)');
-  const { IRYS_GATEWAY_URL } = require('../config/irys');
+  // ── 1. Arweave (raw nodes, no gateway) ─────────────────────────────────────
+  // Read the way the reader does: header signature checked, then every chunk
+  // proof-checked against the signed data_root (controller/arweave.js).
+  console.log('Arweave (raw mainnet nodes)');
+  const arweave = require('../controller/arweave');
+  const { ARWEAVE_CONFIRMATIONS } = require('../config/arweave');
   let stored = null;
   try {
-    const res = await fetch(`${IRYS_GATEWAY_URL}/${hash}`);
-    check(res.ok, 'data item is served', `HTTP ${res.status}`);
-    if (res.ok) {
-      stored = Buffer.from(await res.arrayBuffer());
-      check(stored.length > 0, 'has content', `${stored.length} bytes`);
+    const st = await arweave.getTxStatus(hash);
+    check(st.state === 'mined', 'transaction is mined', st.state === 'mined' ? `block ${st.blockHeight}` : st.state);
+    if (st.state === 'mined') {
+      check(st.confirmations >= ARWEAVE_CONFIRMATIONS, `at least ${ARWEAVE_CONFIRMATIONS} confirmations`, String(st.confirmations));
+      stored = await arweave.fetchEncrypted(hash);
+      check(stored.length > 0, 'data reads back from raw nodes, every chunk proof-checked', `${stored.length} bytes`);
       check(
         stored.slice(0, 5).toString('latin1') !== '%PDF-',
         'content is NOT a readable PDF (i.e. it is encrypted)',
@@ -50,7 +59,7 @@ function check(condition, label, detail) {
       );
     }
   } catch (err) {
-    check(false, 'gateway reachable', err.message);
+    check(false, 'Arweave nodes reachable', err.message);
   }
 
   // ── 2. Base Sepolia ────────────────────────────────────────────────────────
@@ -143,7 +152,6 @@ function check(condition, label, detail) {
 
   console.log(`\n${'='.repeat(60)}`);
   console.log(`${bad === 0 ? 'VERIFIED ✓' : 'PROBLEMS FOUND ✗'}   ${ok} checks passed, ${bad} failed`);
-  console.log(`  gateway: ${IRYS_GATEWAY_URL}/${hash}`);
   console.log(`${'='.repeat(60)}\n`);
 
   process.exit(bad === 0 ? 0 : 1);

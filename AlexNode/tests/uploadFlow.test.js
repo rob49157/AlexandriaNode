@@ -1,31 +1,27 @@
-// Phase 5 test: full upload orchestration — encrypt → sign → seal → upload → persist.
+// Upload request path: validate → encrypt → sign → balance → seal → spool →
+// persist → post header → 202 (direct Arweave L1, ARWEAVE-DIRECT-PLAN.md §4.3).
 //
-// Run: node tests/uploadFlow.test.js
+// Run: node tests/uploadFlow.test.js   (Node >= 22)
 //
-// External services (Irys, Lit, Postgres) are stubbed by replacing their config
-// modules in require.cache before the controller is loaded. Layers 1/2/3/5 run
-// for real against a fake Prisma client, so validation is genuinely exercised.
+// Lit and Postgres are stubbed. Arweave is NOT: the real config/arweave.js and
+// controller/arweave.js run against tests/helpers/fakeArweaveNetwork.js, whose
+// responses are copied from real mainnet nodes (Phase 0), with a real RSA-4096
+// wallet in a temp dir. Layers 1/2/3/5 run for real.
 //
-// Tests:
-//   1. Happy path returns 201 { arweaveHash, litEncryptedKeyId }
-//   2. Persisted row carries all four simHashBand* columns
-//   3. AES-GCM roundtrip: stored ciphertext decrypts back to the original PDF
-//   4. The sealed Lit envelope is bound to the arweaveHash
-//   5. Lit failure → 502, nothing pushed to Arweave, nothing persisted
-//   6. Irys push failure → 502, nothing persisted
-//   7. Postgres failure after push → 500 + [ORPHAN] log carrying the hash
-//   8. Exact duplicate → 409 with zero Lit/Irys calls (no spend)
-//   9. Near-duplicate → persists with isNearDuplicate + nearDuplicateOf
-//  10. arweaveHash is base64url (43 chars), never the SDK's base58 id
+// Every failure case asserts what was spent: nothing may be posted (and so
+// nothing can be mined and paid) unless the row and the spool both exist.
 
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const Arweave = require('arweave');
+const { createFakeArweave } = require('./helpers/fakeArweaveNetwork');
 
 let passed = 0;
 let failed = 0;
-
 function assert(condition, testName) {
   if (condition) {
     console.log(`  ✓ ${testName}`);
@@ -36,510 +32,412 @@ function assert(condition, testName) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Stub installation — must happen before the controller is required
-// ─────────────────────────────────────────────────────────────────────────────
-
 function stub(relativePath, exports) {
   const resolved = require.resolve(relativePath);
-  require.cache[resolved] = {
-    id: resolved,
-    filename: resolved,
-    path: path.dirname(resolved),
-    loaded: true,
-    children: [],
-    paths: [],
-    exports,
-  };
+  require.cache[resolved] = { id: resolved, filename: resolved, path: path.dirname(resolved), loaded: true, children: [], paths: [], exports };
   return exports;
 }
 
-const toBase64Url = (buf) =>
-  Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-
-// --- Fake Postgres ---
-const db = { rows: [], failCreate: false };
-
-stub('../config/db', {
-  upload: {
-    findUnique: async ({ where }) =>
-      db.rows.find((r) => r.sha256Hash === where.sha256Hash) || null,
-    // The real query filters on the indexed band columns; the JS verification
-    // pass in dedup.service re-checks Hamming distance regardless, so returning
-    // every row here is a looser prefilter with an identical outcome.
-    findMany: async () => db.rows,
-    create: async ({ data }) => {
-      if (db.failCreate) throw new Error('simulated Neon outage');
-      db.rows.push(data);
-      return data;
-    },
-    updateMany: async ({ where, data }) => {
-      const matched = db.rows.filter((r) =>
-        Object.entries(where).every(([k, v]) => r[k] === v)
-      );
-      matched.forEach((r) => Object.assign(r, data));
-      return { count: matched.length };
-    },
-  },
-  $connect: async () => {},
-  $disconnect: async () => {},
-});
-
-// --- Fake on-chain registration ---
-//
-// ⚠️ This stub is load-bearing. Without it, createUpload calls the REAL
-// registration service, which — once BACKEND_PRIVATE_KEY exists — signs real
-// transactions against the live AlexandriaLibrary. That happened: a single test
-// run wrote six junk hashes into the registry permanently, because
-// registerUpload has no delete.
-//
-// config/blockchain.js now refuses to produce a signer from a test entrypoint as
-// a second line of defence, but stub the boundary here anyway — a test should
-// not depend on a guard elsewhere to avoid spending money.
-const registration = { calls: [], result: null };
-
-stub('../services/registration.service', {
-  registerOnChain: async (arweaveHash, uploader, meta) => {
-    registration.calls.push({ arweaveHash, uploader, meta });
-    return (
-      registration.result || {
-        registered: true,
-        reason: null,
-        message: 'Registered on-chain.',
-        txHash: `0x${'d'.repeat(64)}`,
-      }
-    );
-  },
-  preflight: async () => ({ ready: true, address: `0x${'c'.repeat(40)}` }),
-  buildMetadata: (m) => JSON.stringify({ t: m.title, a: m.author, c: m.category }),
-});
-
-// --- Fake Lit ---
-const lit = { calls: 0, fail: false, lastMessage: null };
-
-stub('../config/lit', {
-  LIT_PKP_ID: 'pkp_test_0001',
-  LIT_API_KEY: 'test-key',
-  LIT_API_URL: 'https://api.test.invalid/core/v1',
-  disconnectLit: async () => {},
-  litApiCall: async (_endpoint, body) => {
-    lit.calls++;
-    if (lit.fail) throw new Error('simulated Lit outage');
-    lit.lastMessage = body.js_params.message;
-    return {
-      has_error: false,
-      response: JSON.stringify({
-        ciphertext: 'SEALED::' + crypto.createHash('sha256').update(lit.lastMessage).digest('hex'),
-        dataToEncryptHash: 'dth_' + crypto.randomBytes(8).toString('hex'),
-      }),
-    };
-  },
-});
-
-// --- Fake Irys ---
-const irys = {
-  prepared: 0,
-  committed: 0,
-  fail: null,
-  lastCiphertext: null,
-  lastTags: null,
-  // When set, the fake node reports a different id than the one we derived —
-  // simulating the id-encoding trap actually biting in production.
-  receiptIdOverride: null,
-};
-
-stub('../config/irys', {
-  IRYS_NETWORK: 'devnet',
-  IRYS_GATEWAY_URL: 'https://gateway.test.invalid',
-  getBalance: async () => ({ atomic: '0', network: 'devnet', address: '0xtest' }),
-  getPrice: async () => '0',
-  getIrys: async () => ({
-    address: '0xtestwallet',
-    createTransaction(data, opts) {
-      if (irys.fail === 'prepare') throw new Error('simulated Irys outage');
-      irys.prepared++;
-      irys.lastCiphertext = Buffer.from(data);
-      irys.lastTags = opts.tags;
-
-      // Real data items derive rawId as sha256(signature). Any deterministic
-      // 32-byte value stands in — what matters is that the id is fixed at
-      // signing time and that commitUpload's receipt check sees a match.
-      const rawId = crypto.createHash('sha256').update(data).digest();
-
-      return {
-        rawId,
-        get id() {
-          // Mirrors the SDK's base58 getter, so test 10 fails if the production
-          // code ever reads tx.id instead of deriving base64url from rawId.
-          return 'BASE58_' + rawId.toString('hex').slice(0, 20);
-        },
-        async sign() {
-          return Buffer.alloc(64);
-        },
-        async upload() {
-          if (irys.fail === 'commit') throw new Error('simulated Irys push failure');
-          irys.committed++;
-          return {
-            id: irys.receiptIdOverride !== null ? irys.receiptIdOverride : toBase64Url(rawId),
-            timestamp: Date.now(),
-          };
-        },
-      };
-    },
-  }),
-});
-
-// --- Validation: real by default, overridable for cases that need exotic state ---
-const realValidation = require('../services/validation.service');
-let validateOverride = null;
-
-stub('../services/validation.service', {
-  ...realValidation,
-  validateUpload: async (file, body) =>
-    validateOverride ? validateOverride(file, body) : realValidation.validateUpload(file, body),
-});
-
-const { createUpload } = require('../controller/upload.controller');
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fixtures
-// ─────────────────────────────────────────────────────────────────────────────
-
-function makePdf(extraContent = '') {
-  return Buffer.from(
-    [
-      '%PDF-1.4',
-      '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj',
-      '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj',
-      '3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj',
-      extraContent,
-      'xref',
-      '0 4',
-      '0000000000 65535 f ',
-      '0000000009 00000 n ',
-      '0000000058 00000 n ',
-      '0000000115 00000 n ',
-      'trailer<</Size 4/Root 1 0 R>>',
-      'startxref',
-      '190',
-      '%%EOF',
-    ].join('\n'),
-    'latin1'
-  );
-}
-
-const METADATA = {
-  title: 'On the Origin of Species',
-  author: 'Charles Darwin',
-  category: 'science',
-  description: 'A foundational work of evolutionary biology, published 1859.',
-};
-
-function mockReq(pdf, metadata = METADATA) {
-  return {
-    // Fresh copy every call — the controller zeroes this buffer.
-    file: {
-      originalname: 'book.pdf',
-      mimetype: 'application/pdf',
-      size: pdf.length,
-      buffer: Buffer.from(pdf),
-    },
-    body: { ...metadata },
-    walletAddress: '0x1234567890abcdef1234567890abcdef12345678',
-  };
-}
-
-function mockRes() {
-  const res = { statusCode: null, body: null };
-  res.status = (code) => {
-    res.statusCode = code;
-    return res;
-  };
-  res.json = (body) => {
-    res.body = body;
-    return res;
-  };
-  return res;
-}
-
-async function runUpload(req) {
-  const res = mockRes();
-  let nextErr = null;
-  await createUpload(req, res, (e) => {
-    nextErr = e;
-  });
-  if (nextErr) throw nextErr;
-  return res;
-}
-
-function resetState() {
-  db.rows = [];
-  db.failCreate = false;
-  lit.calls = 0;
-  lit.fail = false;
-  lit.lastMessage = null;
-  irys.prepared = 0;
-  irys.committed = 0;
-  irys.fail = null;
-  irys.lastCiphertext = null;
-  irys.lastTags = null;
-  irys.receiptIdOverride = null;
-  validateOverride = null;
-}
-
-const tagValue = (name) => (irys.lastTags.find((t) => t.name === name) || {}).value;
-
-// ─────────────────────────────────────────────────────────────────────────────
+const NODES = ['http://10.1.1.1:1984', 'http://10.2.1.1:1984', 'http://10.3.1.1:1984'];
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'upload-flow-'));
+const SPOOL = path.join(tmp, 'spool');
 
 (async () => {
-  const pdf = makePdf();
+  // --- A real wallet, before config/arweave reads env ---------------------
+  const jwk = await Arweave.init({}).wallets.generate();
+  const walletAddress = await Arweave.init({}).wallets.jwkToAddress(jwk);
+  fs.writeFileSync(path.join(tmp, 'wallet.json'), JSON.stringify(jwk));
+  Object.assign(process.env, {
+    ARWEAVE_WALLET_FILE: path.join(tmp, 'wallet.json'),
+    ARWEAVE_WALLET_ADDRESS: walletAddress,
+    ARWEAVE_NODE_URLS: NODES.join(','),
+    ARWEAVE_SPOOL_DIR: SPOOL,
+    ARWEAVE_PEER_CACHE_FILE: path.join(tmp, 'peers.json'),
+    ARWEAVE_MAX_REWARD_AR: '3',
+    ARWEAVE_REWARD_MARGIN_PERCENT: '0',
+  });
+  delete process.env.ARWEAVE_PEER_SEEDS;
 
-  // ── 1. Happy path ────────────────────────────────────────────────────────
-  console.log('\n=== Happy path ===\n');
-  resetState();
-  const okRes = await runUpload(mockReq(pdf));
+  const net = createFakeArweave({ nodeUrls: NODES });
+  global.fetch = net.fetch;
 
-  assert(okRes.statusCode === 201, `Successful upload returns 201 (got ${okRes.statusCode})`);
-  assert(Boolean(okRes.body && okRes.body.arweaveHash), 'Response carries arweaveHash');
-  assert(Boolean(okRes.body && okRes.body.litEncryptedKeyId), 'Response carries litEncryptedKeyId');
-  // The row is created as "pending_stake" and only advances once registration
-  // lands — the stub reports success, so the response reports "pending".
-  assert(okRes.body.status === 'pending', 'Status is pending after successful registration');
-  assert(db.rows[0].status === 'pending', 'The indexed row is advanced to pending too');
-  assert(irys.committed === 1, 'Exactly one Arweave push occurred');
-  assert(db.rows.length === 1, 'Exactly one Postgres row written');
-
-  // The ARCHIVIST must be recorded on-chain, not the backend — stake.stake()
-  // requires getUploader(hash) == msg.sender, so getting this wrong would make
-  // the upload permanently unstakeable.
-  assert(registration.calls.length === 1, 'Registration attempted exactly once');
-  assert(
-    registration.calls[0].uploader === '0x1234567890abcdef1234567890abcdef12345678',
-    'Registration records the ARCHIVIST as uploader, not the backend'
-  );
-  assert(
-    registration.calls[0].arweaveHash === okRes.body.arweaveHash,
-    'Registration is called with the arweaveHash that was just uploaded'
-  );
-
-  // ── 2. Band columns persisted ────────────────────────────────────────────
-  console.log('\n=== Banded-LSH columns ===\n');
-  const row = db.rows[0];
-  const bandsPresent = [0, 1, 2, 3].every((i) => typeof row[`simHashBand${i}`] === 'number');
-  assert(bandsPresent, 'All four simHashBand* columns are written');
-  assert(typeof row.simHash === 'string', 'simHash is persisted alongside its bands');
-
-  // ── 3. AES roundtrip ─────────────────────────────────────────────────────
-  console.log('\n=== Encryption roundtrip ===\n');
-  // The key is recovered from the sealed envelope the fake Lit captured — the
-  // controller zeroes its own copy, which is exactly the behaviour we want.
-  const envelope = JSON.parse(lit.lastMessage);
-  const recoveredKey = Buffer.from(envelope.k, 'base64');
-  const decipher = crypto.createDecipheriv(
-    'aes-256-gcm',
-    recoveredKey,
-    Buffer.from(tagValue('Encryption-IV'), 'base64')
-  );
-  decipher.setAuthTag(Buffer.from(tagValue('Encryption-Auth-Tag'), 'base64'));
-  const decrypted = Buffer.concat([decipher.update(irys.lastCiphertext), decipher.final()]);
-
-  assert(decrypted.equals(pdf), 'Stored ciphertext decrypts back to the original PDF byte-for-byte');
-  assert(!irys.lastCiphertext.equals(pdf), 'What Arweave received is not the plaintext');
-  assert(
-    row.encryptionIv === tagValue('Encryption-IV') &&
-      row.encryptionAuthTag === tagValue('Encryption-Auth-Tag'),
-    'Postgres IV/authTag match the Arweave tags'
-  );
-
-  // ── 4. Envelope binding ──────────────────────────────────────────────────
-  console.log('\n=== Key/hash binding ===\n');
-  assert(
-    envelope.arweaveHash === okRes.body.arweaveHash,
-    'Sealed envelope is bound to the returned arweaveHash'
-  );
-  assert(envelope.v === 1, 'Envelope carries a version field');
-  assert(recoveredKey.length === 32, 'Sealed key is 32 bytes');
-
-  // ── 10. Hash encoding ────────────────────────────────────────────────────
-  console.log('\n=== arweaveHash encoding ===\n');
-  const hash = okRes.body.arweaveHash;
-  assert(/^[A-Za-z0-9_-]{43}$/.test(hash), `arweaveHash is 43-char base64url (got "${hash}")`);
-  assert(!hash.startsWith('BASE58_'), 'arweaveHash is NOT the SDK base58 tx.id');
-
-  // ── 11. Receipt mismatch is caught, not persisted ────────────────────────
-  // This is the guard that turns the base58/base64url trap from a silent
-  // corruption into a loud failure. If the derived hash and the node's id ever
-  // diverge, the sealed key names a different object than the one stored.
-  console.log('\n=== Receipt id mismatch guard ===\n');
-  resetState();
-  irys.receiptIdOverride = 'BASE58_ThisIsTheWrongEncodingEntirely00000';
-  const mismatchRes = await runUpload(mockReq(pdf));
-
-  assert(
-    mismatchRes.statusCode === 502,
-    `Receipt/derived hash mismatch is rejected (got ${mismatchRes.statusCode})`
-  );
-  assert(db.rows.length === 0, 'No row persisted when the stored id disagrees with the sealed hash');
-
-  // Sanity: the guard is not simply always-on — the happy path still passes it.
-  resetState();
-  const guardOkRes = await runUpload(mockReq(pdf));
-  assert(guardOkRes.statusCode === 201, 'Matching receipt id still passes the guard');
-
-  // ── 5. Lit failure ───────────────────────────────────────────────────────
-  console.log('\n=== Failure: Lit unavailable ===\n');
-  resetState();
-  lit.fail = true;
-  const litRes = await runUpload(mockReq(pdf));
-
-  assert(litRes.statusCode === 502, `Lit failure returns 502 (got ${litRes.statusCode})`);
-  assert(litRes.body.reason === 'lit_unavailable', 'Reason is lit_unavailable');
-  assert(irys.committed === 0, 'No Arweave push — nothing was paid for');
-  assert(db.rows.length === 0, 'No Postgres row written');
-
-  // ── 6. Irys push failure ─────────────────────────────────────────────────
-  console.log('\n=== Failure: Arweave push ===\n');
-  resetState();
-  irys.fail = 'commit';
-  const irysRes = await runUpload(mockReq(pdf));
-
-  assert(irysRes.statusCode === 502, `Irys failure returns 502 (got ${irysRes.statusCode})`);
-  assert(irysRes.body.reason === 'arweave_upload_failed', 'Reason is arweave_upload_failed');
-  assert(db.rows.length === 0, 'No Postgres row written');
-
-  // ── 7. Postgres failure after a paid push ────────────────────────────────
-  console.log('\n=== Failure: index write after paid upload ===\n');
-  resetState();
-  db.failCreate = true;
-
-  const errorLines = [];
-  const realError = console.error;
-  console.error = (...args) => errorLines.push(args.join(' '));
-  const orphanRes = await runUpload(mockReq(pdf));
-  console.error = realError;
-
-  assert(orphanRes.statusCode === 500, `Post-push DB failure returns 500 (got ${orphanRes.statusCode})`);
-  assert(Boolean(orphanRes.body.arweaveHash), 'Response still carries the arweaveHash for recovery');
-  assert(irys.committed === 1, 'The Arweave push did happen (this is the lossy case)');
-  const orphanLog = errorLines.find((l) => l.includes('[ORPHAN]'));
-  assert(Boolean(orphanLog), 'An [ORPHAN] line was logged');
-  assert(
-    Boolean(orphanLog && orphanLog.includes(orphanRes.body.arweaveHash)),
-    'The [ORPHAN] log contains the arweaveHash needed to rebuild the row'
-  );
-
-  // ── 8. Exact duplicate short-circuits before any spend ───────────────────
-  console.log('\n=== Deduplication: exact duplicate ===\n');
-  resetState();
-  const { computeSha256 } = require('../services/dedup.service');
-  db.rows.push({
-    arweaveHash: 'PreExistingHash0000000000000000000000000000',
-    title: 'Already Archived',
-    sha256Hash: computeSha256(pdf),
-    simHash: '0000000000000000',
+  // --- Fake Postgres -------------------------------------------------------
+  const db = { rows: [], failCreate: null };
+  const match = (r, where) => Object.entries(where).every(([k, v]) => r[k] === v);
+  stub('../config/db', {
+    upload: {
+      findUnique: async ({ where }) => db.rows.find((r) => match(r, where)) || null,
+      findMany: async () => db.rows,
+      create: async ({ data }) => {
+        if (db.failCreate) throw db.failCreate;
+        db.rows.push({ ...data });
+        return data;
+      },
+      update: async ({ where, data }) => {
+        const r = db.rows.find((x) => match(x, where));
+        if (!r) throw new Error('not found');
+        Object.assign(r, data);
+        return r;
+      },
+      updateMany: async ({ where, data }) => {
+        const rows = db.rows.filter((r) => match(r, where));
+        rows.forEach((r) => Object.assign(r, data));
+        return { count: rows.length };
+      },
+    },
+    $connect: async () => {},
+    $disconnect: async () => {},
   });
 
-  const dupRes = await runUpload(mockReq(pdf));
-  assert(dupRes.statusCode === 409, `Exact duplicate returns 409 (got ${dupRes.statusCode})`);
-  assert(dupRes.body.reason === 'exact_duplicate', 'Reason is exact_duplicate');
-  assert(lit.calls === 0, 'Lit was never called — no key sealed for a duplicate');
-  assert(irys.prepared === 0 && irys.committed === 0, 'Irys was never touched — nothing spent');
+  // Load-bearing: the real service signs real Base Sepolia transactions (an
+  // earlier run wrote six junk hashes into the registry for good).
+  const registration = { calls: [] };
+  stub('../services/registration.service', {
+    registerOnChain: async (...args) => {
+      registration.calls.push(args);
+      return { registered: true, txHash: `0x${'d'.repeat(64)}` };
+    },
+    preflight: async () => ({ ready: true }),
+  });
 
-  // ── 9. Near-duplicate persists with its flag ─────────────────────────────
-  console.log('\n=== Deduplication: near-duplicate flag ===\n');
-  resetState();
-  // The minimal test PDF has no extractable text, so its SimHash is all zeros
-  // and the near-dup path short-circuits. Drive the controller directly with a
-  // validation result that reports a near match; the distance maths itself is
-  // covered by securityAndDedup.test.js.
+  // --- Fake Lit ------------------------------------------------------------
+  const lit = { calls: 0, fail: false, lastMessage: null };
+  stub('../config/lit', {
+    LIT_PKP_ID: 'pkp_test_0001',
+    LIT_API_KEY: 'test-key',
+    LIT_API_URL: 'https://api.test.invalid/core/v1',
+    disconnectLit: async () => {},
+    litApiCall: async (_endpoint, body) => {
+      lit.calls++;
+      if (lit.fail) throw new Error('simulated Lit outage');
+      lit.lastMessage = body.js_params.message;
+      return {
+        has_error: false,
+        response: JSON.stringify({
+          ciphertext: 'SEALED::' + crypto.createHash('sha256').update(lit.lastMessage).digest('hex'),
+          dataToEncryptHash: 'dth_' + crypto.randomBytes(8).toString('hex'),
+        }),
+      };
+    },
+  });
+
+  const realValidation = require('../services/validation.service');
+  let validateOverride = null;
+  stub('../services/validation.service', {
+    ...realValidation,
+    validateUpload: async (file, body) => (validateOverride ? validateOverride(file, body) : realValidation.validateUpload(file, body)),
+  });
+
+  const cfg = require('../config/arweave');
+  const { createUpload, retryRegistration } = require('../controller/upload.controller');
+  const spool = require('../services/spool.service');
+
+  // --- Fixtures ------------------------------------------------------------
+  function makePdf(extra = '') {
+    return Buffer.from(
+      [
+        '%PDF-1.4',
+        '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj',
+        '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj',
+        '3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj',
+        extra,
+        'xref',
+        '0 4',
+        '0000000000 65535 f ',
+        '0000000009 00000 n ',
+        '0000000058 00000 n ',
+        '0000000115 00000 n ',
+        'trailer<</Size 4/Root 1 0 R>>',
+        'startxref',
+        '190',
+        '%%EOF',
+      ].join('\n'),
+      'latin1'
+    );
+  }
+  const METADATA = {
+    title: 'On the Origin of Species',
+    author: 'Charles Darwin',
+    category: 'science',
+    description: 'A foundational work of evolutionary biology, published 1859.',
+  };
+  const ARCHIVIST = '0x1234567890abcdef1234567890abcdef12345678';
+  const mockReq = (pdf, metadata = METADATA) => ({
+    file: { originalname: 'book.pdf', mimetype: 'application/pdf', size: pdf.length, buffer: Buffer.from(pdf) },
+    body: { ...metadata },
+    walletAddress: ARCHIVIST,
+  });
+  const mockRes = () => {
+    const res = { statusCode: null, body: null };
+    res.status = (c) => ((res.statusCode = c), res);
+    res.json = (b) => ((res.body = b), res);
+    return res;
+  };
+  async function run(handler, req) {
+    const res = mockRes();
+    let nextErr = null;
+    await handler(req, res, (e) => (nextErr = e));
+    if (nextErr) throw nextErr;
+    return res;
+  }
+  const upload = (req) => run(createUpload, req);
+  const headerPosts = () => net.callsTo(/^POST \/tx$/).length;
+  const spoolFiles = () => (fs.existsSync(SPOOL) ? fs.readdirSync(SPOOL) : []);
+  function reset() {
+    db.rows = [];
+    db.failCreate = null;
+    lit.calls = 0;
+    lit.fail = false;
+    lit.lastMessage = null;
+    registration.calls = [];
+    validateOverride = null;
+    net.calls = [];
+    net.price = '13530674461';
+    net.balance = '3000000000000';
+    for (const n of net.nodes.values()) Object.assign(n, { up: true, postTxMode: 200 });
+    fs.rmSync(SPOOL, { recursive: true, force: true });
+    cfg._reset();
+  }
+  const quiet = async (fn) => {
+    const e = console.error;
+    const w = console.warn;
+    console.error = () => {};
+    console.warn = () => {};
+    try {
+      return await fn();
+    } finally {
+      console.error = e;
+      console.warn = w;
+    }
+  };
+
+  const pdf = makePdf();
+
+  // ── Happy path ───────────────────────────────────────────────────────────
+  console.log('\n=== Happy path: 202 pending_confirmation ===\n');
+  reset();
+  const ok = await upload(mockReq(pdf));
+  const row = db.rows[0];
+  const hash = ok.body && ok.body.arweaveHash;
+  assert(ok.statusCode === 202, `Returns 202 Accepted (got ${ok.statusCode})`);
+  assert(ok.body.status === 'pending_confirmation' && row.status === 'pending_confirmation', 'Response and row are pending_confirmation');
+  assert(row.storageProvider === 'arweave-l1', 'Row is marked storageProvider = arweave-l1');
+  assert(registration.calls.length === 0, 'No on-chain registration in the request: it waits for confirmed storage');
+  assert(Boolean(ok.body.litEncryptedKeyId), 'Response carries litEncryptedKeyId');
+  assert(ok.body.storage.headerAcceptedBy === 3, 'The signed header was accepted by all 3 nodes');
+  // Proves the counter the "nothing posted" checks below rely on actually counts.
+  assert(headerPosts() === 3, `headerPosts() sees the 3 posts (got ${headerPosts()}), so a 0 later is meaningful`);
+  assert(ok.body.storage.confirmationsRequired === 16 && ok.body.storage.copiesRequired === 2, 'Response states the 16 confirmations / 2 copies rule');
+  assert(row.arweaveReward === '13530674461', 'Row records the exact signed fee (D7)');
+  assert(Number.isSafeInteger(row.arweaveAnchorHeight), 'Row records the anchor block height (the drop deadline)');
+  assert(row.arweaveTxPostedAt instanceof Date, 'Row records when the header was posted');
+  assert([0, 1, 2, 3].every((i) => typeof row[`simHashBand${i}`] === 'number'), 'All four simHashBand* columns are written');
+  assert(typeof row.arweaveHashTopic === 'string' && row.arweaveHashTopic.startsWith('0x'), 'arweaveHashTopic is written (event listener join key)');
+
+  console.log('\n=== The id, the header, and the envelope ===\n');
+  const header = row.arweaveUploaderState.header;
+  const sigHash = crypto.createHash('sha256').update(Buffer.from(header.signature, 'base64url')).digest('base64url');
+  assert(/^[A-Za-z0-9_-]{43}$/.test(hash), `arweaveHash is 43-char base64url (got "${hash}")`);
+  assert(sigHash === hash && header.id === hash, 'arweaveHash = base64url(sha256(signature)) = header.id (Q1)');
+  assert(header.data === '', 'The saved header carries no data (chunks are sent separately, Q2)');
+  assert(await Arweave.init({}).transactions.verify(new (require('arweave/node/lib/transaction').default)(header)), 'The saved header verifies against its signature');
+  assert(header.owner && !JSON.stringify(row.arweaveUploaderState).includes(jwk.d), 'Saved state holds the public key only, never the private key');
+  const posted = net.txs.get(hash);
+  assert(Boolean(posted) && posted.header.data_root === header.data_root, 'The network received this exact header');
+
+  console.log('\n=== Spool and encryption roundtrip ===\n');
+  const spooled = await spool.read(hash);
+  const tags = Object.fromEntries(header.tags.map((t) => [Buffer.from(t.name, 'base64url').toString(), Buffer.from(t.value, 'base64url').toString()]));
+  const envelope = JSON.parse(lit.lastMessage);
+  const key = Buffer.from(envelope.k, 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(tags['Encryption-IV'], 'base64'));
+  decipher.setAuthTag(Buffer.from(tags['Encryption-Auth-Tag'], 'base64'));
+  const plain = Buffer.concat([decipher.update(spooled), decipher.final()]);
+  assert(plain.equals(pdf), 'Spooled ciphertext decrypts back to the original PDF byte for byte');
+  assert(!spooled.equals(pdf), 'The spool holds ciphertext, never the plaintext');
+  const tx = new (require('arweave/node/lib/transaction').default)({ ...header, data: new Uint8Array(0) });
+  await tx.prepareChunks(spooled);
+  assert(tx.data_root === header.data_root, 'The spool is exactly the data that was signed (data_root matches)');
+  assert(row.encryptionIv === tags['Encryption-IV'] && row.encryptionAuthTag === tags['Encryption-Auth-Tag'], 'Postgres IV/authTag match the Arweave tags');
+  assert(envelope.arweaveHash === hash && envelope.v === 1 && key.length === 32, 'Sealed envelope is bound to the arweaveHash (KEY-BINDING.md)');
+  assert(tags['App-Name'] === 'Alexandria' && tags.Uploader === ARCHIVIST, 'Tags name the app and the archivist');
+
+  // ── Nothing posted (nothing payable) on any pre-post failure ─────────────
+  console.log('\n=== Failures before posting cost nothing ===\n');
+  reset();
+  lit.fail = true;
+  let r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 502 && r.body.reason === 'lit_unavailable', `Lit failure → 502 lit_unavailable (got ${r.statusCode})`);
+  assert(headerPosts() === 0 && db.rows.length === 0 && spoolFiles().length === 0, 'Lit failure: no header posted, no row, no spool');
+
+  reset();
+  for (const n of net.nodes.values()) n.up = false;
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 503 && r.body.reason === 'arweave_unavailable', `No reachable node → 503 arweave_unavailable (got ${r.statusCode} ${r.body.reason})`);
+  assert(lit.calls === 0 && db.rows.length === 0, 'Nodes down: Lit never called, nothing persisted');
+
+  reset();
+  net.price = String(4n * 10n ** 12n); // 4 AR > the 3 AR cap
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 503 && r.body.reason === 'arweave_price_above_cap', `Fee above ARWEAVE_MAX_REWARD_AR → 503 (got ${r.body.reason})`);
+  assert(headerPosts() === 0 && lit.calls === 0, 'Fee above cap: nothing sealed or posted');
+
+  reset();
+  net.balance = '1000';
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 503 && r.body.reason === 'storage_wallet_low', `Balance below the fee → 503 storage_wallet_low (got ${r.body.reason})`);
+  assert(lit.calls === 0 && headerPosts() === 0 && db.rows.length === 0, 'Wallet low: checked before sealing; nothing sealed, posted, or stored');
+
+  // Review 2026-10-12 #5: fees already signed into unmined headers are owed.
+  reset();
+  const prismaUpload = require('../config/db').upload;
+  const findManyAll = prismaUpload.findMany;
+  let committedWhere = null;
+  // This fake's findMany ignores `where`; filter here so the test checks the
+  // query, not just the arithmetic.
+  prismaUpload.findMany = async (args) => {
+    if (args && args.where && 'arweaveBlockHeight' in args.where) {
+      committedWhere = args.where;
+      return db.rows.filter((row) => Object.entries(args.where).every(([k, v]) => (v === null ? row[k] == null : row[k] === v)));
+    }
+    return findManyAll(args);
+  };
+  net.balance = '20000000000'; // 0.02 AR: covers one 0.0135 AR upload, not two
+  const owed = { storageProvider: 'arweave-l1', status: 'pending_confirmation', arweaveReward: '13530674461' };
+  db.rows.push({ ...owed, arweaveHash: 'owed-not-mined' });
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 503 && r.body.reason === 'storage_wallet_low', `A second upload the balance covers only before counting the first's unmined fee → storage_wallet_low (got ${r.statusCode} ${r.body.reason})`);
+  assert(lit.calls === 0 && headerPosts() === 0, 'Refused before sealing or posting');
+  assert(
+    committedWhere && committedWhere.status === 'pending_confirmation' && committedWhere.arweaveBlockHeight === null && committedWhere.storageProvider === 'arweave-l1',
+    'Only posted-but-unmined direct-path uploads count as owed'
+  );
+  reset();
+  net.balance = '20000000000';
+  db.rows.push({ ...owed, arweaveHash: 'already-mined', arweaveBlockHeight: 2_020_000 }); // fee already deducted
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 202, `A mined upload's fee is already out of the balance, so it is not counted again (got ${r.statusCode} ${r.body.reason})`);
+  prismaUpload.findMany = findManyAll;
+
+  // Review 2026-10-12 #6: only transient failures tell the user to retry.
+  const { storageUnavailable } = require('../controller/upload.controller');
+  const { StorageError } = require('../controller/arweave');
+  const fakeRes = () => ({ statusCode: 0, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } });
+  let sr = storageUnavailable(fakeRes(), new StorageError('bad_tx_id', 'id mismatch'));
+  assert(sr.statusCode === 500 && sr.body.reason === 'bad_tx_id' && !/retry/.test(sr.body.message), 'A StorageError keeps its own code (bad_tx_id), is a 500, and does not say "retry"');
+  sr = storageUnavailable(fakeRes(), new Error('No Arweave wallet at /x'));
+  assert(sr.statusCode === 503 && sr.body.reason === 'storage_not_configured' && !/retry/.test(sr.body.message), 'Missing wallet → storage_not_configured, without "retry"');
+  sr = storageUnavailable(fakeRes(), Object.assign(new Error('nodes down'), { code: 'arweave_unavailable' }));
+  assert(sr.body.reason === 'arweave_unavailable' && /retry/.test(sr.body.message), 'arweave_unavailable still says to retry');
+
+  reset();
+  db.failCreate = new Error('simulated Neon outage');
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 500 && r.body.reason === 'index_write_failed', `DB failure → 500 index_write_failed (got ${r.statusCode})`);
+  assert(headerPosts() === 0, 'DB failure: header NOT posted, so it can never be mined and paid for');
+  assert(spoolFiles().length === 0, 'DB failure: the spooled ciphertext is removed');
+
+  reset();
+  db.failCreate = Object.assign(new Error('Unique constraint failed on sha256Hash'), { code: 'P2002' });
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 409 && r.body.reason === 'exact_duplicate', 'A concurrent duplicate losing the insert race → 409, nothing posted');
+
+  // ── Header refused everywhere is not a failure ───────────────────────────
+  console.log('\n=== Header refused by every node ===\n');
+  reset();
+  for (const n of net.nodes.values()) n.postTxMode = 500;
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 202 && r.body.storage.headerAcceptedBy === 0, 'Still 202: a node may have accepted and lost the reply; the worker re-posts');
+  assert(db.rows.length === 1 && spoolFiles().length === 1, 'Row and spool are kept for the worker');
+
+  // ── Dedup ────────────────────────────────────────────────────────────────
+  console.log('\n=== Deduplication ===\n');
+  reset();
+  const { computeSha256 } = require('../services/dedup.service');
+  db.rows.push({ arweaveHash: 'PreExistingHash0000000000000000000000000000', title: 'Already Archived', sha256Hash: computeSha256(pdf), simHash: '0000000000000000' });
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 409 && r.body.reason === 'exact_duplicate', 'Exact duplicate → 409');
+  assert(lit.calls === 0 && headerPosts() === 0 && net.callsTo(/tx_anchor/).length === 0, 'Exact duplicate: Lit and Arweave never touched');
+
+  reset();
   validateOverride = async () => ({
     valid: true,
     pageCount: 1,
     metadata: { ...METADATA },
     sha256Hash: crypto.randomBytes(32).toString('hex'),
     simHash: 'ffffffffffffffff',
-    simHashBands: {
-      simHashBand0: 65535,
-      simHashBand1: 65535,
-      simHashBand2: 65535,
-      simHashBand3: 65535,
-    },
+    simHashBands: { simHashBand0: 65535, simHashBand1: 65535, simHashBand2: 65535, simHashBand3: 65535 },
     isNearDuplicate: true,
-    // Ranked closest-first by checkNearDuplicate; the controller persists the head.
-    nearDuplicateMatches: [
-      { arweaveHash: 'NeighbourHash000000000000000000000000000000', title: 'A Close Match', distance: 2, similarity: 96.9 },
-      { arweaveHash: 'FartherHash00000000000000000000000000000000', title: 'A Looser Match', distance: 3, similarity: 95.3 },
-    ],
+    nearDuplicateMatches: [{ arweaveHash: 'NeighbourHash000000000000000000000000000000', title: 'A Close Match', distance: 2, similarity: 96.9 }],
     clamavSkipped: true,
     clamavStatus: 'unavailable',
     textWordCount: 4200,
     textlessPageCount: 0,
   });
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 202 && r.body.isNearDuplicate === true, 'Near-duplicate is accepted and flagged');
+  assert(db.rows[0].nearDuplicateOf === 'NeighbourHash000000000000000000000000000000' && db.rows[0].nearDuplicateDistance === 2, 'Row records the closest match and its distance');
+  assert(db.rows[0].clamavStatus === 'unavailable' && db.rows[0].textWordCount === 4200, 'Audit fields are recorded');
 
-  const nearRes = await runUpload(mockReq(pdf));
-  assert(nearRes.statusCode === 201, 'Near-duplicate is accepted, not rejected');
-  assert(nearRes.body.isNearDuplicate === true, 'Response flags the near-duplicate');
-  assert(db.rows[0].isNearDuplicate === true, 'Row persists isNearDuplicate = true');
-  assert(
-    db.rows[0].nearDuplicateOf === 'NeighbourHash000000000000000000000000000000',
-    'Row records which upload it resembles'
-  );
-  assert(db.rows[0].nearDuplicateDistance === 2, 'Row records how close that match was, in bits');
+  // ── Tags fit Arweave's 2048-byte limit even for 4-byte UTF-8 ─────────────
+  console.log('\n=== Tag byte budget ===\n');
+  reset();
+  const wide = '𝔄'.repeat(200); // 4 bytes each: 800 bytes per field before capping
+  validateOverride = async () => ({
+    valid: true,
+    pageCount: 1,
+    metadata: { title: wide, author: wide, category: wide, description: 'd' },
+    sha256Hash: crypto.randomBytes(32).toString('hex'),
+    simHash: '0000000000000000',
+    simHashBands: { simHashBand0: 0, simHashBand1: 0, simHashBand2: 0, simHashBand3: 0 },
+    isNearDuplicate: false,
+    nearDuplicateMatches: [],
+  });
+  r = await upload(mockReq(pdf));
+  const wideHeader = db.rows[0] && db.rows[0].arweaveUploaderState.header;
+  const tagBytes = wideHeader
+    ? wideHeader.tags.reduce((n, t) => n + Buffer.from(t.name, 'base64url').length + Buffer.from(t.value, 'base64url').length, 0)
+    : Infinity;
+  assert(r.statusCode === 202 && tagBytes <= 2048, `Tags stay within 2048 bytes with 4-byte characters (${tagBytes} bytes)`);
+  const wideTitle = wideHeader && Buffer.from(wideHeader.tags.find((t) => Buffer.from(t.name, 'base64url').toString() === 'Title').value, 'base64url').toString();
+  assert(wideTitle && !wideTitle.includes('�'), 'Truncation never splits a UTF-8 character');
 
-  // The audit trail the librarian queue reads. The plaintext PDF is gone once
-  // this request returns, so anything not written here is unrecoverable.
-  assert(db.rows[0].clamavStatus === 'unavailable', 'Row records that the virus scanner was not running');
-  assert(db.rows[0].textWordCount === 4200, 'Row records how many words the fingerprint was built from');
-  assert(db.rows[0].textlessPageCount === 0, 'Row records how many pages carry no text');
+  // ── Anchor height fallback ───────────────────────────────────────────────
+  console.log('\n=== Anchor height ===\n');
+  reset();
+  const realGet = net.anchors.get.bind(net.anchors);
+  net.anchors.get = (k) => realGet(k);
+  r = await upload(mockReq(pdf));
+  assert(db.rows[0].arweaveAnchorHeight === net.height, 'Anchor height is the anchor block\'s own height');
 
-  // ── On-chain registration failure ────────────────────────────────────────
-  // By the time registration runs, the Arweave bytes are paid for and permanent.
-  // A chain failure must therefore never turn a successful upload into an error.
-  console.log('\n=== Registration failure is non-fatal ===\n');
-  resetState();
-  registration.result = {
-    registered: false,
-    reason: 'not_authorized',
-    message: 'backend is not an authorized caller',
-    txHash: null,
-  };
+  // ── Registration retry is refused until storage is confirmed ─────────────
+  console.log('\n=== Registration retry gating ===\n');
+  reset();
+  r = await upload(mockReq(pdf));
+  const pendingHash = r.body.arweaveHash;
+  const retry = await run(retryRegistration, { params: { arweaveHash: pendingHash } });
+  assert(retry.statusCode === 409 && retry.body.error === 'storage_not_confirmed', 'Registration of a pending_confirmation upload → 409 storage_not_confirmed');
+  assert(registration.calls.length === 0, 'No registration attempted for unconfirmed storage');
+  db.rows[0].status = 'storage_failed';
+  const retry2 = await run(retryRegistration, { params: { arweaveHash: pendingHash } });
+  assert(retry2.statusCode === 409 && /upload the file again/i.test(retry2.body.message), 'storage_failed → 409 telling the archivist to re-upload');
 
-  const unregRes = await runUpload(mockReq(pdf));
-  assert(unregRes.statusCode === 201, 'A registration failure still returns 201 — the upload did succeed');
-  assert(unregRes.body.status === 'pending_stake', 'A failed registration leaves the row at pending_stake');
-  assert(
-    unregRes.body.registration.reason === 'not_authorized',
-    'The response names why registration did not happen'
-  );
-  assert(db.rows.length === 1, 'The upload is still indexed despite the chain failure');
-  assert(
-    Boolean(unregRes.body.arweaveHash),
-    'The arweaveHash is still returned, so registration can be retried later'
-  );
-  registration.result = null;
+  // ── Plaintext is zeroed ──────────────────────────────────────────────────
+  console.log('\n=== Plaintext handling ===\n');
+  reset();
+  const req = mockReq(pdf);
+  const original = req.file.buffer;
+  await upload(req);
+  assert(req.file.buffer === null && original.every((b) => b === 0), 'The plaintext PDF buffer is zeroed and dropped');
 
-  // ── Guard: tests must never sign a real transaction ──────────────────────
-  // This is the regression test for an actual incident — running this suite
-  // with a live BACKEND_PRIVATE_KEY wrote six junk hashes into AlexandriaLibrary
-  // permanently, because registerUpload has no delete.
+  // ── Guard: tests never sign a real chain transaction ─────────────────────
   console.log('\n=== Chain-write guard ===\n');
   const realChainConfig = require('../config/blockchain');
-  assert(
-    realChainConfig.chainWritesBlocked() !== null,
-    'config/blockchain refuses to sign from a test entrypoint'
-  );
-  assert(
-    realChainConfig.getSigner() === null,
-    'getSigner() returns null under a test entrypoint even with a real key present'
-  );
+  assert(realChainConfig.chainWritesBlocked() !== null, 'config/blockchain refuses to sign from a test entrypoint');
+  assert(realChainConfig.getSigner() === null, 'getSigner() returns null under a test entrypoint');
 
-  // ── Summary ──────────────────────────────────────────────────────────────
-  console.log(`\n${'='.repeat(50)}`);
-  console.log(`RESULT: ${failed === 0 ? 'ALL PASSED ✓' : 'SOME FAILED ✗'}`);
-  console.log(`  Passed: ${passed}`);
-  console.log(`  Failed: ${failed}`);
-  console.log(`${'='.repeat(50)}\n`);
-
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.log(`\n${'='.repeat(50)}\nRESULT: ${failed === 0 ? 'ALL PASSED ✓' : 'SOME FAILED ✗'}\n  Passed: ${passed}\n  Failed: ${failed}\n${'='.repeat(50)}\n`);
   process.exit(failed === 0 ? 0 : 1);
 })().catch((err) => {
   console.error('\nTest harness crashed:', err);

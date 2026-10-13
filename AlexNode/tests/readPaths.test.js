@@ -4,8 +4,8 @@
 //
 // Postgres is replaced with a small in-memory query engine that implements the
 // subset of Prisma this code uses (findUnique/count/findMany with where, select,
-// orderBy, skip, take, and array-form $transaction). Irys and Lit are stubbed
-// only to keep their SDKs off the require path — neither read endpoint calls them.
+// orderBy, skip, take, and array-form $transaction). Lit is stubbed only to keep
+// it off the require path — neither read endpoint calls it.
 //
 // Tests:
 //   1-6.   getUpload: shape, 404, malformed-hash rejection, pending_stake visibility
@@ -49,9 +49,7 @@ function stub(relativePath, exports) {
   return exports;
 }
 
-// Neither read path touches storage or Lit; these exist so requiring the upload
-// controller doesn't drag the Irys SDK into the process.
-stub('../config/irys', { getIrys: async () => ({}), IRYS_GATEWAY_URL: 'https://gateway.test.invalid' });
+// Neither read path touches Lit; this keeps it from being configured for real.
 stub('../config/lit', {
   LIT_PKP_ID: 'pkp_test_0001',
   LIT_API_KEY: 'test-key',

@@ -18,3 +18,9 @@ Thumbs.db
 
 # Practice / sandbox
 sandbox/
+
+# Arweave storage wallet (JWK private key) and Phase 0 spike runs
+.arweave-wallet*.json
+.arweave-spike/
+.arweave-spool/
+.arweave-peers.json
