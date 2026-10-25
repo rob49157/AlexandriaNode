@@ -55,6 +55,72 @@ async function isLibrarianReviewAllowed(arweaveHash, address) {
   }
 }
 
+// Indexed statuses of a book that registerUpload() has not recorded on-chain yet.
+// Postgres knows its uploader, but the Action reads the uploader from the chain,
+// gets a revert, and denies, so letting these through would spend a Lit credit on
+// a certain refusal.
+const NOT_REGISTERED_STATUSES = new Set(['pending_confirmation', 'pending_stake', 'storage_failed']);
+
+const STAKE_REQUIRED_MESSAGE =
+  'Stake this book to open it. Archivists can read their own uploads once they have staked them.';
+
+/** Why a book cannot be opened yet, in words its archivist can act on. */
+function notRegisteredMessage(status) {
+  return status === 'storage_failed'
+    ? 'This book was never stored on Arweave, so it cannot be opened. Upload it again.'
+    : `This book is not registered on-chain yet (status: ${status}). It can be opened once storage and registration finish.`;
+}
+
+/**
+ * May this wallet read this book? The same three doors the decryption Lit Action
+ * opens — uploader, active rental, librarian review — checked against live chain
+ * state. Shared by decrypt-params and the unlock relay; the Action re-checks all
+ * of it inside the TEE, so this is never the last word.
+ *
+ * @param {{ arweaveHash: string, uploader: string|null, status: string }} row  the indexed upload
+ * @param {string} address
+ * @returns {Promise<{ allowed: boolean, grantedVia?: string, unavailable?: boolean, notRegistered?: boolean,
+ *   stakeRequired?: boolean, rental: object|null }>}
+ *   unavailable   — the Rent contract is paused, so permission cannot be read
+ *   notRegistered — not on-chain yet, so the Action would refuse everyone
+ *   stakeRequired — the uploader asked, but has not staked the book
+ * @throws {ChainError} when the chain cannot be read at all
+ */
+async function checkReadAccess(row, address) {
+  // Before the uploader door: that door trusts Postgres, the Action trusts the chain.
+  if (NOT_REGISTERED_STATUSES.has(row.status)) {
+    return { allowed: false, notRegistered: true, rental: null };
+  }
+
+  // The uploader door opens only for an archivist who staked the book. Registration
+  // is automatic, so without this anyone could upload a PDF, never stake, and open
+  // "their" book on Alexandria's Lit credit. stake() records the staker, and the
+  // record outlives unstake() and slashing, so approved books stay readable.
+  // The uploader cannot rent their own book or review it either, so a refusal
+  // here is final.
+  if (row.uploader && row.uploader.toLowerCase() === address.toLowerCase()) {
+    const stake = await getStakeStatus(row.arweaveHash);
+    if (stake.staked && stake.staker && stake.staker.toLowerCase() === address.toLowerCase()) {
+      return { allowed: true, grantedVia: 'uploader', rental: null };
+    }
+    return { allowed: false, stakeRequired: true, rental: null };
+  }
+
+  const rental = await isRentalActive(row.arweaveHash, address);
+  if (rental.available === false) return { allowed: false, unavailable: true, rental };
+  if (rental.active) return { allowed: true, grantedVia: 'rental', rental };
+
+  // A book in its challenge window is not rentable — Rent.rentBook() requires
+  // Approved status — so a librarian who has to read it before challenging
+  // cannot buy access even in good faith. Mirrors the preconditions of
+  // AlexandriaStake.challengeUpload(), and closes when the window does.
+  if (await isLibrarianReviewAllowed(row.arweaveHash, address)) {
+    return { allowed: true, grantedVia: 'librarian_review', rental };
+  }
+
+  return { allowed: false, rental };
+}
+
 /**
  * Validate the two path params every route here takes.
  * @returns {{ arweaveHash: string, address: string }|null} null after responding
@@ -149,9 +215,9 @@ async function getRentalStatus(req, res, next) {
 // Lit Action is the real gate — it would not be acceptable if this route ever
 // returned a usable key.
 //
-// The fix, when it is worth building: require a signed SIWE-style message over
-// a server-issued nonce and recover the address from the signature instead of
-// reading it from the URL. That is the same upgrade auth.middleware.js needs.
+// The signed step is the next one: POST /api/rental/unlock (unlock.controller.js)
+// recovers the reader's address from an EIP-4361 signature, and the Lit Action
+// does the same inside the TEE. This route only hands out what that step needs.
 //
 // ⚠️ Archivists cannot rent their own books — Rent.rentBook() rejects
 // `getUploader(hash) == msg.sender` outright. So the uploader is allowed through
@@ -182,46 +248,38 @@ async function getDecryptParams(req, res, next) {
       });
     }
 
-    const requester = params.address.toLowerCase();
-    const isUploader = row.uploader && row.uploader.toLowerCase() === requester;
+    const access = await checkReadAccess(row, params.address);
 
-    let rental = null;
-    let librarianReview = false;
-    if (!isUploader) {
-      rental = await isRentalActive(params.arweaveHash, params.address);
+    if (access.notRegistered) {
+      return res.status(409).json({ error: 'not_registered', message: notRegisteredMessage(row.status) });
+    }
 
-      if (rental.available === false) {
-        return res.status(503).json({
-          error: 'rent_contract_paused',
-          message: 'Rental permission cannot be checked right now — the Rent contract is paused.',
-        });
-      }
+    if (access.stakeRequired) {
+      return res.status(403).json({ error: 'stake_required', message: STAKE_REQUIRED_MESSAGE });
+    }
 
-      if (!rental.active) {
-        // A book in its challenge window is not rentable — Rent.rentBook()
-        // requires Approved status — so a librarian who has to read it before
-        // challenging cannot buy access even in good faith. Mirrors the
-        // preconditions of AlexandriaStake.challengeUpload(), and closes when
-        // the window does. The Lit Action re-checks all of it in the TEE.
-        librarianReview = await isLibrarianReviewAllowed(params.arweaveHash, params.address);
+    if (access.unavailable) {
+      return res.status(503).json({
+        error: 'rent_contract_paused',
+        message: 'Rental permission cannot be checked right now — the Rent contract is paused.',
+      });
+    }
 
-        if (!librarianReview) {
-          return res.status(403).json({
-            error: 'no_active_rental',
-            message: rental.blacklisted
-              ? 'This address is blacklisted from renting.'
-              : 'No active rental for this address. Rent the book on-chain first.',
-            expiry: rental.expiry,
-          });
-        }
-      }
+    if (!access.allowed) {
+      return res.status(403).json({
+        error: 'no_active_rental',
+        message: access.rental.blacklisted
+          ? 'This address is blacklisted from renting.'
+          : 'No active rental for this address. Rent the book on-chain first.',
+        expiry: access.rental.expiry,
+      });
     }
 
     return res.json({
       arweaveHash: row.arweaveHash,
       status: row.status,
-      grantedVia: isUploader ? 'uploader' : librarianReview ? 'librarian_review' : 'rental',
-      expiry: rental ? rental.expiry : null,
+      grantedVia: access.grantedVia,
+      expiry: access.rental ? access.rental.expiry : null,
       // The sealed envelope { v, k, arweaveHash } and Lit's integrity hash for
       // it. Handed to the Lit Action, never opened here — the backend is not in
       // the decryption path and holds nothing that could open it.
@@ -263,4 +321,13 @@ async function getBookRentalInfo(req, res, next) {
   }
 }
 
-module.exports = { getRentalStatus, getDecryptParams, getBookRentalInfo, handleChainError, readParams };
+module.exports = {
+  getRentalStatus,
+  getDecryptParams,
+  getBookRentalInfo,
+  checkReadAccess,
+  notRegisteredMessage,
+  STAKE_REQUIRED_MESSAGE,
+  handleChainError,
+  readParams,
+};

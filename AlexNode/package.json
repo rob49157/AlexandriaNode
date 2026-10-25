@@ -12,6 +12,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:db": "node tests/uploadDb.test.js",
     "test:librarian": "node tests/librarianQueue.test.js",
+    "test:unlock": "node tests/unlockRelay.test.js",
+    "test:seal": "node tests/litSeal.test.js",
     "benchmark:pdf": "node scripts/benchmark-pdf.js",
     "prisma:migrate": "prisma migrate dev"
   },

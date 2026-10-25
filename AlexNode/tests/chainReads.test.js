@@ -829,11 +829,44 @@ async function testControllers() {
 
   // The archivist can never rent their own book — rentBook() forbids it — so
   // the uploader must be let through explicitly or they lose their own upload.
+  // But only once they have staked it: registration is automatic, and an
+  // unstaked uploader door would let anyone upload a PDF and read on our credit.
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: ARCHIVIST });
+  assert(
+    r.res.statusCode === 403 && r.res.body.error === 'stake_required' && r.res.body.litEncryptedKeyId === undefined,
+    'an uploader who never staked the book is refused with stake_required, and gets no key material'
+  );
+
+  const archivistStake = { staker: ARCHIVIST, amount: (100n * 10n ** 18n).toString(), timestamp: 1_760_000_000, active: true };
+  chain.stakes.set(HASH_A, archivistStake);
   r = await call(getDecryptParams, { arweaveHash: HASH_A, address: ARCHIVIST });
   assert(
     r.res.statusCode === 200 && r.res.body.grantedVia === 'uploader',
-    'the uploader is granted their own book without a rental'
+    'the uploader is granted their own staked book without a rental'
   );
+
+  // unstake() only clears `active`; the staker record stays, so an approved
+  // book stays readable by the archivist who staked it.
+  chain.stakes.set(HASH_A, { ...archivistStake, active: false });
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: ARCHIVIST });
+  assert(
+    r.res.statusCode === 200 && r.res.body.grantedVia === 'uploader',
+    'the uploader still opens their book after unstaking'
+  );
+  chain.stakes.delete(HASH_A);
+
+  // The decryption Action reads the uploader from the chain, so before
+  // registerUpload() it refuses even the archivist. Say so here, before the
+  // reader is asked to sign anything.
+  for (const unregistered of ['pending_confirmation', 'pending_stake', 'storage_failed']) {
+    db.uploads = [makeUploadRow({ status: unregistered })];
+    r = await call(getDecryptParams, { arweaveHash: HASH_A, address: ARCHIVIST });
+    assert(
+      r.res.statusCode === 409 && r.res.body.error === 'not_registered' && r.res.body.litEncryptedKeyId === undefined,
+      `decrypt params for a ${unregistered} book is a 409 not_registered, with no key material`
+    );
+  }
+  db.uploads = [makeUploadRow({ status: 'approved' })];
 
   // --- stake status -------------------------------------------------------
   reset();

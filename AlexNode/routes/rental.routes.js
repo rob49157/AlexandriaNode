@@ -5,6 +5,7 @@ const {
   getDecryptParams,
   getBookRentalInfo,
 } = require('../controller/rental.controller');
+const { unlockKey } = require('../controller/unlock.controller');
 
 const router = express.Router();
 
@@ -23,5 +24,11 @@ router.get('/rental/book/:arweaveHash', getBookRentalInfo);
 // unauthenticated, and the real check happens inside the Lit Action against the
 // arweaveHash sealed in the ciphertext. See the comment on getDecryptParams.
 router.get('/rental/decrypt-params/:arweaveHash/:address', getDecryptParams);
+
+// POST /api/rental/unlock/:arweaveHash
+// Relays a reader's signed (EIP-4361) unlock request to the decryption Lit Action.
+// Answers with the book key wrapped to the reader's session key — never a usable
+// key. See controller/unlock.controller.js and KEY-BINDING.md R3/R4.
+router.post('/rental/unlock/:arweaveHash', unlockKey);
 
 module.exports = router;
