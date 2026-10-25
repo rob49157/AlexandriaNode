@@ -26,6 +26,7 @@ This service handles:
 - **Arweave Storage:** Sign and post encrypted PDFs to Arweave L1 nodes; a background worker confirms them, copies them to 2 independent nodes and verifies both (`services/storage.service.js`)
 - **Postgres Indexing:** Maintain searchable off-chain index of all uploads (title, author, category, arweaveHash, status)
 - **Event Listening:** Monitor on-chain events (uploads, rentals, challenges) and sync to Postgres (read-only, no writes)
+- **Unlock Relay:** Check a reader's signed unlock request and forward it to the decryption Lit Action (`POST /api/rental/unlock/:arweaveHash`). The answer is the book key wrapped to the reader's browser, which the backend cannot open (KEY-BINDING.md R3/R4)
 
 **Critical:** The backend NEVER stores unencrypted PDFs or raw symmetric keys long-term. It generates keys, encrypts, delegates to Lit/Arweave, then discards sensitive material.
 
@@ -36,7 +37,11 @@ The smart contracts (in `AlexandriaSmartContract` repo) define the on-chain logi
 ### Complete Upload Flow
 ```
 === BACKEND (file processing + storage) ===
-1. Frontend sends PDF + metadata + wallet address to backend
+1. Frontend sends PDF + metadata + wallet address to backend, with the wallet's
+   EIP-4361 signature over the PDF's SHA-256 (services/uploadAuth.service.js)
+   → backend checks the signature, then the upload limits: at most 3 uploads
+     waiting for a stake per wallet, 10 per 24 h, and the shared 24 h storage
+     budget (services/uploadQuota.service.js). Refusals cost nothing.
 2. Backend runs Layer 1 validation: file size, type, magic bytes, parseability
 3. Backend runs Layer 2 validation: ClamAV virus scan, embedded JS/attachment detection (in-process)
 4. Backend runs Layer 3 validation: SHA-256 dedup, SimHash near-dedup (in-process)
@@ -217,7 +222,12 @@ The backend uses **two-layer envelope encryption** via the Lit Chipotle v3 REST 
 1. **Layer 1 (Local):** Generate a random AES-256 symmetric key, encrypt the PDF with AES-256-GCM
 2. **Layer 2 (Lit TEE):** Encrypt the 32-byte symmetric key via `POST /core/v1/lit_action` using a PKP (Programmable Key Pair) inside a Trusted Execution Environment
 
-Access control is enforced at **decryption time** by Lit Actions — immutable JavaScript pinned to IPFS that runs inside the TEE. The decryption Lit Action lives in the frontend (`AlexandriaFrontEnd/Alexandria-Front-end/src/services/litAction.js`) and calls `Rent.sol.isRentalActive(arweaveHash, userAddress)` with the hash read from inside the sealed envelope before releasing the symmetric key. The backend is never in the decryption path.
+Access control is enforced at **decryption time** by Lit Actions — immutable JavaScript pinned to IPFS that runs inside the TEE. The decryption Lit Action lives in the frontend (`AlexandriaFrontEnd/Alexandria-Front-end/src/services/litAction.js`). It:
+1. Recovers the reader's wallet from an EIP-4361 message they signed (never from a parameter).
+2. Unseals the envelope and gates on the `arweaveHash` read from inside it: rental, uploader, or librarian review, with two RPC providers required to agree.
+3. Releases the key only **wrapped to a per-read RSA key the reader's browser holds**.
+
+The backend relays that request (`POST /api/rental/unlock/:arweaveHash`) so the Lit key stays off the browser and calls can be rate-limited. It only ever sees the wrapped key, so it can never read a book. See **KEY-BINDING.md**, R3–R5.
 
 The old JSON-based `accessControlConditions` are deprecated (Datil network shut down Feb 2026).
 
@@ -310,6 +320,7 @@ AlexNode/
 │   ├── arweave-wallet-setup.js # Storage wallet: generate | status (address check, balance, prices)
 │   ├── smoke-test.js           # Live end-to-end test on Arweave mainnet (+ --full: HTTP → Base Sepolia)
 │   ├── verify-upload.js        # Cross-check one book across Arweave, chain, Postgres, listener
+│   ├── lit-group-probe.mjs     # One-off (needs the Lit ACCOUNT key): does group 1's seal open in the decrypt group?
 │   └── arweave-spike.js        # Phase 0 measurements on mainnet (records raw node responses)
 │
 ├── config/
@@ -321,7 +332,7 @@ AlexNode/
 ├── routes/
 │   ├── upload.routes.js        # POST /upload, GET /upload/:hash
 │   ├── search.routes.js        # GET /search?q=...
-│   ├── rental.routes.js        # GET /rental/status, /rental/book, /rental/decrypt-params
+│   ├── rental.routes.js        # GET /rental/status, /rental/book, /rental/decrypt-params; POST /rental/unlock/:hash
 │   ├── stake.routes.js         # GET /stake/status/:hash
 │   ├── chain.routes.js         # GET /chain/status (event listener health)
 │   └── storage.routes.js       # GET /storage/status, /storage/:hash, /storage/:hash/data
@@ -329,7 +340,8 @@ AlexNode/
 ├── controller/                 # singular
 │   ├── upload.controller.js    # Upload orchestration + public read projection
 │   ├── search.controller.js    # Postgres search queries
-│   ├── rental.controller.js    # Rental status + rental-gated decrypt params
+│   ├── rental.controller.js    # Rental status + rental-gated decrypt params + shared checkReadAccess
+│   ├── unlock.controller.js    # Unlock relay: pre-check, rate limit, CID pin, forward, wrapped key only
 │   ├── stake.controller.js     # Stake status queries
 │   ├── chain.controller.js     # Listener health
 │   ├── arweave.js              # Arweave L1: sign, post header, push chunks, verify, proof-checked reads
@@ -344,6 +356,11 @@ AlexNode/
 │   ├── dedup.service.js        # Layer 3 SHA-256 + banded-LSH near-dup lookup
 │   ├── storage.service.js      # Storage worker: pending_confirmation → stored → registered
 │   ├── spool.service.js        # Ciphertext waiting for its chunks to be sent (atomic, ciphertext only)
+│   ├── walletMessage.service.js # Strict EIP-4361 parse/build shared by unlock and upload signatures
+│   ├── uploadAuth.service.js   # The archivist's signature over the exact PDF (POST /upload)
+│   ├── uploadQuota.service.js  # Upload limits: waiting-for-stake, per-24h, shared storage budget
+│   ├── unlockAuth.service.js   # EIP-4361 unlock message: strict parse + everything the Action checks but the chain
+│   ├── unlockRateLimit.service.js # Per-wallet, hourly + daily limits, and the Lit credit reserve
 │   └── simhash.service.js      # 64-bit SimHash fingerprinting
 │
 ├── prisma/
@@ -364,6 +381,7 @@ AlexNode/
     ├── securityAndDedup.test.js # Layer 2 + Layer 3
     ├── readPaths.test.js       # GET /upload/:hash + /search
     ├── chainReads.test.js      # On-chain reads + event listener
+    ├── unlockRelay.test.js     # Unlock relay: refusals before spend, rate limits, wrapped-key-only answers
     ├── encryption.manual.js    # Hits the live Lit API — run manually
     └── keyBinding.demo.js      # Runnable exploit demo for KEY-BINDING.md
 ```
@@ -408,9 +426,25 @@ ARWEAVE_MAX_REWARD_AR=3             # fee cap per upload
 STORAGE_WORKER_ENABLED=true
 
 # Lit Protocol — Chipotle v3 REST API
-LIT_API_KEY=                        # from dashboard.chipotle.litprotocol.com
+LIT_API_KEY=                        # upload key — seals keys in group 1. Never the account key
 LIT_PKP_ID=                         # PKP wallet ID minted via dashboard or API
 LIT_API_URL=https://api.chipotle.litprotocol.com/core/v1
+
+# Reader unlocks (POST /api/rental/unlock/:arweaveHash) — both blank = the route answers 503
+LIT_READER_API_KEY=                 # executes in the decrypt group ONLY; no manage rights
+LIT_DECRYPT_ACTION_CID=             # registered decrypt Action CID; any other code is refused
+UNLOCK_ALLOWED_DOMAINS=localhost:5173   # must match UNLOCK_ALLOWED_DOMAINS in the Action
+UNLOCK_RATE_PER_WALLET=3            # per wallet per UNLOCK_RATE_WINDOW_MINUTES (~1 cent each);
+                                    # well below the hourly ceiling, since any uploader has access
+UNLOCK_RATE_WINDOW_MINUTES=10
+UNLOCK_RATE_GLOBAL_PER_HOUR=60
+UNLOCK_RATE_GLOBAL_PER_DAY=300      # ~$3/day, the most reads can spend unattended
+UNLOCK_MIN_CREDIT_CENTS=100         # below this Lit credit, unlocks stop (and warn) so uploads can seal
+
+# Upload limits (services/uploadQuota.service.js) — Alexandria pays storage up front
+UPLOAD_MAX_AWAITING_STAKE=3         # per wallet: uploads stored/being stored with no stake yet
+UPLOAD_MAX_PER_WALLET_PER_DAY=10    # per wallet, any 24 h
+UPLOAD_DAILY_BUDGET_AR=3            # storage fees in any 24 h, all wallets; ≥ ARWEAVE_MAX_REWARD_AR
 
 # AI Validation Service
 VALIDATION_SERVICE_URL=http://localhost:8000
@@ -424,14 +458,30 @@ MAX_FILE_SIZE_MB=150
 ### Upload
 ```
 POST /api/upload
-  - Body: multipart/form-data (PDF file + metadata + walletAddress)
-  - Auth: None (wallet address included as metadata, real proof of ownership is on-chain staking)
-  - Flow: validate → encrypt → sign → seal → spool → index (status: pending_confirmation) → post header
+  - Body: multipart/form-data (PDF file + metadata + walletAddress + authMessage + authSignature)
+  - Auth: the wallet signs an EIP-4361 message ("Upload one book to Alexandria.")
+    naming urn:alexandria:pdf:sha256:<hex of the exact PDF>, valid ≤ 30 min (checked
+    once the whole file has arrived), on an allowed domain (UNLOCK_ALLOWED_DOMAINS).
+    The signer must be walletAddress. Multipart turns the message's LF into CRLF in
+    transit; the controller turns it back before verifying.
+    401/400 auth_missing | auth_wrong_file | auth_wallet_mismatch | auth_expired | auth_domain …
+  - Limits, before any work (services/uploadQuota.service.js):
+      429 too_many_awaiting_stake: UPLOAD_MAX_AWAITING_STAKE (3) uploads stored or
+          being stored with no stake yet; staking one frees its slot
+      429 daily_upload_limit: UPLOAD_MAX_PER_WALLET_PER_DAY (10) in any 24 h
+      503 upload_budget_exhausted: UPLOAD_DAILY_BUDGET_AR of storage fees in any
+          24 h, all wallets together; checked early and again once the fee is signed
+  - Flow: verify signature → limits → validate → encrypt → sign → balance + budget → seal → spool → index (status: pending_confirmation) → post header
   - Returns: 202 { arweaveHash, litEncryptedKeyId, status: "pending_confirmation", storage }
   - The storage worker then stores it (≈25–40 min) and registers it on-chain; the
     frontend polls GET /api/storage/:arweaveHash and lets the archivist stake once
     status is "pending"
   - 503 storage_wallet_low | arweave_unavailable | arweave_price_above_cap: nothing stored or paid
+
+GET /api/upload/quota/:address
+  - What the upload page shows before a file is picked: { canUpload, reason, message,
+    awaitingStake: { count, max, books: [{ arweaveHash, title, status }] },
+    last24h: { count, max }, budget: { usedAr, limitAr, percentUsed, exhausted } }
 
 GET /api/upload/:arweaveHash
   - Returns: Upload metadata (title, author, status, uploader, timestamp)
@@ -483,11 +533,39 @@ GET /api/rental/decrypt-params/:arweaveHash/:address
     a wallet holding a valid rental. Acceptable only because everything served is
     inert: the key is sealed in a Lit PKP envelope released solely by the Lit
     Action in the TEE, and the IV + auth tag are already public in the Arweave
-    tags. This check is defense in depth. If this route ever returns a usable
-    key, it must first require a signed SIWE-style message.
+    tags. This check is defense in depth. The signed step is the next route.
   - ⚠️ The uploader is allowed through without a rental, because Rent.rentBook()
     forbids archivists from renting their own books. The decryption Lit Action
-    needs the same carve-out or archivists cannot open their own uploads.
+    has the same carve-out. Both require the uploader to have STAKED the book
+    (stakes(hash).staker == address), or registration — which is automatic —
+    would let anyone upload a PDF and read on Alexandria's credit:
+    403 stake_required otherwise. The staker record survives unstake().
+  - 409 not_registered while the book is pending_confirmation, pending_stake or
+    storage_failed: the Action reads the uploader from the chain, so it refuses
+    everyone until registerUpload() has run.
+
+POST /api/rental/unlock/:arweaveHash
+  - Body: { code, authMessage, authSignature, sessionPublicKey }
+    authMessage is EIP-4361, signed by the reader. It names their wallet,
+    sha256(sealed key), sha256(session public key), the allowed domain, chain
+    84532, and a window of at most 10 minutes.
+  - Refused here, before any Lit credit is spent:
+      - anything the Action would refuse (format, domain, chain, wrong book,
+        swapped or weak session key, bad or borrowed signature, expired)
+      - no access (403)
+      - book not registered on-chain yet (409 not_registered)
+      - Rent paused (503)
+      - code whose CID ≠ LIT_DECRYPT_ACTION_CID (400 action_not_permitted)
+      - rate limits (429 + Retry-After): per proven wallet (3 per 10 min), and
+        60 per hour + 300 per day across all wallets
+      - Lit credit below UNLOCK_MIN_CREDIT_CENTS (503 unlock_budget_low, logged
+        as a warning), so reads never spend the credit uploads need
+  - Forwards to Lit with LIT_READER_API_KEY and X-Privacy-Mode. The sealed key
+    always comes from Postgres, never from the request.
+  - Returns: { wrappedKey, grantedVia }, the AES key RSA-OAEP-wrapped to the
+    session key. A response carrying a plain key is refused (502), never relayed.
+    Request and response bodies are never logged.
+  - 503 unlock_not_configured until LIT_READER_API_KEY + LIT_DECRYPT_ACTION_CID are set.
 ```
 
 ### Stake Status
@@ -714,8 +792,14 @@ await postHeader(prepared.header);                       // paid once mined
   for Arweave bytes only) and `BACKEND_PRIVATE_KEY` (calls `library.registerUpload()`
   only). Neither can move $ALEX or stake. Do not merge them into one wallet, and
   never give either contract ownership.
+- Two Lit usage keys, also separate: `LIT_API_KEY` seals at upload (group 1) and
+  `LIT_READER_API_KEY` relays unlocks (decrypt group only). Neither may be the
+  account key, and neither ever reaches the frontend bundle. The backend can
+  never unseal a book: the reader key runs only the reviewed decrypt Action,
+  which answers with a key wrapped to the reader's browser. (⚠️ Until step D of
+  KEY-BINDING.md removes `Any` from group 1, the upload key can still unseal.)
 - The spool (`ARWEAVE_SPOOL_DIR`) holds AES-GCM ciphertext only, deleted once the book is verified stored
-- Upload requests include wallet address as metadata (not cryptographic auth — on-chain staking is the real proof of ownership)
+- Uploads are signed by the archivist's wallet over the exact PDF (EIP-4361, services/uploadAuth.service.js), so per-wallet upload limits apply to a proven wallet. On-chain staking remains the proof of ownership that matters for the library.
 - File uploads validated for size, type, and content before processing
 
 ### Storage Wallet Funding Model
@@ -810,7 +894,9 @@ eventless block on every restart.
   resolution, and blacklisting are all either user-signed or `onlyOwner`.
 - Store unencrypted PDFs or symmetric keys
 - Handle staking, registration, or rental payments (all done by frontend/user wallet)
-- Make access control decisions (Lit Protocol reads Rent.sol directly)
+- Make access control decisions. Lit Protocol reads Rent.sol directly. The unlock
+  relay pre-checks the same rules only to avoid spending credits on doomed requests.
+- Hold a usable book key. The unlock relay only ever sees keys wrapped to a reader's browser
 - Run NLP/ML content analysis itself (delegates to separate Python FastAPI service for OCR and content quality)
 - Manage user wallets or private keys (users sign all transactions in their browser)
 
@@ -825,7 +911,7 @@ The current architecture is **intentionally centralized for the PoC**. The backe
 
 ### What's Already Decentralized (PoC)
 - **Storage:** Arweave is permanent and permissionless — once uploaded, no one can delete or censor content
-- **Access control:** Lit Protocol reads on-chain state directly — the backend is not in the decryption path
+- **Access control:** Lit Protocol reads on-chain state directly. The backend relays unlock requests but cannot read the keys they return
 - **Payments & staking:** All on-chain, user-signed from their own wallets, no intermediary
 - **Rentals:** Frontend talks directly to smart contracts
 

@@ -13,8 +13,11 @@
 //
 // Returns { encryptedPdf, iv, authTag, encryptedSymmetricKey, dataToEncryptHash }
 //   • encryptedPdf + iv + authTag  → stored on Arweave (direct L1, controller/arweave.js)
-//   • encryptedSymmetricKey + dataToEncryptHash → persisted to Postgres
-//     (dataToEncryptHash is the "litEncryptedKeyId" referenced elsewhere)
+//   • encryptedSymmetricKey        → Postgres litEncryptedKeyId: the sealed envelope
+//   • dataToEncryptHash            → Postgres litDataToEncryptHash: sha256 of the
+//     SEALED envelope, the same value a reader signs in the unlock message
+//     (urn:alexandria:sealed-key:sha256:…). Never a hash of the plaintext envelope,
+//     which contains the book key.
 //
 // ─── Why the sealed payload is an envelope, not a bare key ───────────────────
 // The decryption Lit Action must gate on Rent.isRentalActive(arweaveHash, user).
@@ -137,15 +140,16 @@ async function sealKey(symmetricKey, arweaveHash) {
     throw new Error(`Lit Action encryption failed: ${litResponse.logs || litResponse.response}`);
   }
 
+  // Chipotle's Encrypt returns the ciphertext alone: a hex string, measured live
+  // 2026-10-17 (KEY-BINDING.md, T1). The object shapes are tolerated in case the
+  // API ever wraps it.
   let encryptedSymmetricKey;
-  let dataToEncryptHash;
 
   if (typeof litResponse.response === 'string') {
     try {
       const parsed = JSON.parse(litResponse.response);
       if (typeof parsed === 'object' && parsed !== null) {
         encryptedSymmetricKey = parsed.ciphertext || parsed.encryptedSymmetricKey || litResponse.response;
-        dataToEncryptHash = parsed.dataToEncryptHash;
       } else {
         encryptedSymmetricKey = parsed;
       }
@@ -154,21 +158,18 @@ async function sealKey(symmetricKey, arweaveHash) {
     }
   } else if (typeof litResponse.response === 'object' && litResponse.response !== null) {
     encryptedSymmetricKey = litResponse.response.ciphertext || litResponse.response.encryptedSymmetricKey;
-    dataToEncryptHash = litResponse.response.dataToEncryptHash;
   }
 
-  if (!dataToEncryptHash) {
-    // Fall back to hashing the sealed envelope, not the raw key — this value is
-    // persisted to Postgres as litEncryptedKeyId, and a digest of secret key
-    // material has no business living in the database.
-    dataToEncryptHash = crypto.createHash('sha256').update(envelope).digest('hex');
+  if (typeof encryptedSymmetricKey !== 'string' || !encryptedSymmetricKey) {
+    throw new Error('Lit encryption returned no ciphertext.');
   }
 
-  if (!encryptedSymmetricKey || !dataToEncryptHash) {
-    throw new Error(
-      `Lit encryption returned incomplete result: ciphertext=${!!encryptedSymmetricKey} hash=${!!dataToEncryptHash}`
-    );
-  }
+  // A fingerprint of the SEALED envelope. It is public ciphertext, so its hash
+  // reveals nothing, and it is exactly the sealed-key hash a reader signs to
+  // unlock this book. This used to hash the plaintext envelope — a digest of the
+  // book key — so any dataToEncryptHash Lit might return (a Datil-era field that
+  // hashed the plaintext) is deliberately ignored too.
+  const dataToEncryptHash = crypto.createHash('sha256').update(encryptedSymmetricKey, 'utf8').digest('hex');
 
   return { encryptedSymmetricKey, dataToEncryptHash };
 }
@@ -221,7 +222,7 @@ function aesEncryptPdf(pdfBuffer) {
  *   iv: string,                      // base64-encoded 12-byte IV
  *   authTag: string,                 // base64-encoded 16-byte auth tag
  *   encryptedSymmetricKey: string,   // Lit-encrypted key (opaque string)
- *   dataToEncryptHash: string        // integrity hash from Lit (= litEncryptedKeyId)
+ *   dataToEncryptHash: string        // sha256 hex of encryptedSymmetricKey (= litDataToEncryptHash)
  * }>}
  */
 async function encryptPdf(pdfBuffer, arweaveHash) {
@@ -267,4 +268,6 @@ module.exports = {
   encryptPdf,
   encryptForRental,
   ENVELOPE_VERSION,
+  // For scripts/lit-new-account.mjs, which registers this exact source's CID.
+  LIT_ENCRYPT_ACTION_CODE,
 };

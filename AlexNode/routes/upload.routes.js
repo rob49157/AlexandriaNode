@@ -7,6 +7,7 @@ const {
   getUpload,
   retryRegistration,
   getRegistrarStatus,
+  getUploadQuota,
 } = require('../controller/upload.controller');
 
 const router = express.Router();
@@ -19,6 +20,10 @@ router.post('/upload', uploadSinglePdf, requireWalletAddress, createUpload);
 // Declared BEFORE /upload/:arweaveHash, or Express would match "registrar" as a
 // hash and answer 400 instead.
 router.get('/upload/registrar/status', getRegistrarStatus);
+
+// GET /api/upload/quota/:address — upload limits for one wallet, and the shared
+// storage budget, for the upload page to show before a file is picked.
+router.get('/upload/quota/:address', getUploadQuota);
 
 // GET /api/upload/:arweaveHash — metadata lookup
 router.get('/upload/:arweaveHash', getUpload);
