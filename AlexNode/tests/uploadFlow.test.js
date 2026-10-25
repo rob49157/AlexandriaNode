@@ -18,6 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const Arweave = require('arweave');
+const { Wallet } = require('ethers');
 const { createFakeArweave } = require('./helpers/fakeArweaveNetwork');
 
 let passed = 0;
@@ -63,14 +64,27 @@ const SPOOL = path.join(tmp, 'spool');
 
   // --- Fake Postgres -------------------------------------------------------
   const db = { rows: [], failCreate: null };
-  const match = (r, where) => Object.entries(where).every(([k, v]) => r[k] === v);
+  // Equality, null, and the three operators the upload limits use. A where with
+  // AND/OR/NOT (dedup's near-duplicate query) still returns every row, as before.
+  const matches = (value, cond) => {
+    if (cond === null) return value == null;
+    if (cond && typeof cond === 'object' && !(cond instanceof Date)) {
+      if ('in' in cond) return cond.in.includes(value);
+      if ('not' in cond) return value !== cond.not;
+      if ('gte' in cond) return value instanceof Date && value >= cond.gte;
+    }
+    return value === cond;
+  };
+  const match = (r, where = {}) => Object.entries(where).every(([k, v]) => matches(r[k], v));
+  const compound = (where) => where && ['AND', 'OR', 'NOT'].some((k) => k in where);
   stub('../config/db', {
     upload: {
       findUnique: async ({ where }) => db.rows.find((r) => match(r, where)) || null,
-      findMany: async () => db.rows,
+      findMany: async ({ where } = {}) => (compound(where) ? db.rows : db.rows.filter((r) => match(r, where))),
+      count: async ({ where } = {}) => db.rows.filter((r) => match(r, where)).length,
       create: async ({ data }) => {
         if (db.failCreate) throw db.failCreate;
-        db.rows.push({ ...data });
+        db.rows.push({ uploadTimestamp: new Date(), ...data });
         return data;
       },
       update: async ({ where, data }) => {
@@ -121,6 +135,14 @@ const SPOOL = path.join(tmp, 'spool');
     },
   });
 
+  // Which books the chain reports as staked (upload limits: a staked book frees a slot).
+  const stakes = new Set();
+  const realChain = require('../services/blockchain.service');
+  stub('../services/blockchain.service', {
+    ...realChain,
+    getStakeStatus: async (hash) => (stakes.has(hash) ? { staked: true, active: true, staker: ARCHIVIST } : { staked: false, active: false, challenge: null }),
+  });
+
   const realValidation = require('../services/validation.service');
   let validateOverride = null;
   stub('../services/validation.service', {
@@ -129,7 +151,8 @@ const SPOOL = path.join(tmp, 'spool');
   });
 
   const cfg = require('../config/arweave');
-  const { createUpload, retryRegistration } = require('../controller/upload.controller');
+  const { createUpload, retryRegistration, getUploadQuota } = require('../controller/upload.controller');
+  const { buildUploadMessage } = require('../services/uploadAuth.service');
   const spool = require('../services/spool.service');
 
   // --- Fixtures ------------------------------------------------------------
@@ -161,10 +184,28 @@ const SPOOL = path.join(tmp, 'spool');
     category: 'science',
     description: 'A foundational work of evolutionary biology, published 1859.',
   };
-  const ARCHIVIST = '0x1234567890abcdef1234567890abcdef12345678';
-  const mockReq = (pdf, metadata = METADATA) => ({
+  // A real wallet: every upload is signed by it, as the frontend does.
+  const ARCHIVIST_WALLET = Wallet.createRandom();
+  // requireWalletAddress stores the claimed address lower-case.
+  const ARCHIVIST = ARCHIVIST_WALLET.address.toLowerCase();
+  const iso = (seconds) => new Date(seconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const nowSeconds = () => Math.floor(Date.now() / 1000);
+  // The signed message: by default the archivist, for this exact file, for 10 minutes.
+  function signUpload(pdf, { signer = ARCHIVIST_WALLET, named = signer.address, file = pdf, domain = 'localhost:5173', issuedAt = nowSeconds() - 10, expiresAt = nowSeconds() + 590 } = {}) {
+    const authMessage = buildUploadMessage({
+      domain,
+      uri: `http://${domain}`,
+      address: named,
+      nonce: 'abcdEFGH12345678',
+      issuedAt: iso(issuedAt),
+      expirationTime: iso(expiresAt),
+      pdfHash: crypto.createHash('sha256').update(file).digest('hex'),
+    });
+    return { authMessage, authSignature: signer.signMessageSync(authMessage) };
+  }
+  const mockReq = (pdf, metadata = METADATA, auth = signUpload(pdf)) => ({
     file: { originalname: 'book.pdf', mimetype: 'application/pdf', size: pdf.length, buffer: Buffer.from(pdf) },
-    body: { ...metadata },
+    body: { ...metadata, ...auth },
     walletAddress: ARCHIVIST,
   });
   const mockRes = () => {
@@ -191,6 +232,10 @@ const SPOOL = path.join(tmp, 'spool');
     lit.lastMessage = null;
     registration.calls = [];
     validateOverride = null;
+    stakes.clear();
+    delete process.env.UPLOAD_MAX_AWAITING_STAKE;
+    delete process.env.UPLOAD_MAX_PER_WALLET_PER_DAY;
+    delete process.env.UPLOAD_DAILY_BUDGET_AR;
     net.calls = [];
     net.price = '13530674461';
     net.balance = '3000000000000';
@@ -421,6 +466,150 @@ const SPOOL = path.join(tmp, 'spool');
   db.rows[0].status = 'storage_failed';
   const retry2 = await run(retryRegistration, { params: { arweaveHash: pendingHash } });
   assert(retry2.statusCode === 409 && /upload the file again/i.test(retry2.body.message), 'storage_failed → 409 telling the archivist to re-upload');
+
+  // ── Signed uploads ───────────────────────────────────────────────────────
+  // walletAddress is only a claim; every per-wallet limit depends on the wallet
+  // proving it, for this exact file. A refusal here costs nothing at all: no
+  // validation, no Arweave anchor fetch, no Lit call.
+  console.log('\n=== Signed uploads ===\n');
+  const untouched = () => lit.calls === 0 && headerPosts() === 0 && net.callsTo(/tx_anchor/).length === 0 && spoolFiles().length === 0;
+  const STRANGER = Wallet.createRandom();
+
+  reset();
+  r = await upload(mockReq(pdf, METADATA, {}));
+  assert(r.statusCode === 401 && r.body.reason === 'auth_missing' && db.rows.length === 0 && untouched(), 'An unsigned upload → 401 auth_missing; nothing touched');
+
+  // What a browser actually sends: multipart/form-data turns each "\n" in a text
+  // field into "\r\n" (measured: fetch + FormData through multer). Without
+  // undoing that, every real upload fails while every test above passes.
+  reset();
+  const signed = signUpload(pdf);
+  r = await upload(mockReq(pdf, METADATA, { ...signed, authMessage: signed.authMessage.replace(/\n/g, '\r\n') }));
+  assert(r.statusCode === 202, `A signed message that arrives with CRLF line breaks, as multipart sends it → 202 (got ${r.statusCode} ${r.body.reason})`);
+
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { file: makePdf('% a different book') })));
+  assert(r.statusCode === 400 && r.body.reason === 'auth_wrong_file' && untouched(), 'A signature for a different file → 400 auth_wrong_file');
+
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { signer: STRANGER })));
+  assert(r.statusCode === 401 && r.body.reason === 'auth_wallet_mismatch' && untouched(), 'Signed by another wallet than walletAddress names → 401 auth_wallet_mismatch');
+
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { signer: STRANGER, named: ARCHIVIST_WALLET.address })));
+  assert(r.statusCode === 401 && r.body.reason === 'auth_wallet_mismatch' && untouched(), "A message naming the archivist, signed by someone else → 401");
+
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { issuedAt: nowSeconds() - 700, expiresAt: nowSeconds() - 100 })));
+  assert(r.statusCode === 401 && r.body.reason === 'auth_expired' && untouched(), 'An expired signature → 401 auth_expired');
+
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { domain: 'alexandria-library.example' })));
+  assert(r.statusCode === 400 && r.body.reason === 'auth_domain' && untouched(), 'Signed on another site → 400 auth_domain');
+
+  // The signature is checked once the whole file has arrived, so an upload's
+  // window covers a slow transfer: up to 30 minutes (unlocks keep 10).
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { issuedAt: nowSeconds() - 1200, expiresAt: nowSeconds() + 300 })));
+  assert(r.statusCode === 202, `A 25-minute window, signed 20 minutes ago → 202 (got ${r.statusCode} ${r.body.reason})`);
+  reset();
+  r = await upload(mockReq(pdf, METADATA, signUpload(pdf, { issuedAt: nowSeconds() - 10, expiresAt: nowSeconds() + 2400 })));
+  assert(r.statusCode === 400 && r.body.reason === 'auth_window_too_long' && untouched(), 'A window longer than 30 minutes → 400 auth_window_too_long');
+
+  // ── Upload limits ────────────────────────────────────────────────────────
+  console.log('\n=== Upload limits ===\n');
+  const DAY_MS = 24 * 60 * 60_000;
+  // Older than 24 hours by default, so only the rule under test applies.
+  const prior = (n, status, extra = {}) => ({
+    arweaveHash: `Prior${n}`.padEnd(43, '0'),
+    title: `Book ${n}`,
+    uploader: ARCHIVIST,
+    status,
+    storageProvider: 'arweave-l1',
+    arweaveReward: '0',
+    uploadTimestamp: new Date(Date.now() - 2 * DAY_MS),
+    ...extra,
+  });
+
+  reset();
+  db.rows.push(prior(1, 'pending_confirmation'), prior(2, 'pending_stake'), prior(3, 'pending'));
+  r = await upload(mockReq(pdf));
+  assert(
+    r.statusCode === 429 && r.body.reason === 'too_many_awaiting_stake' && r.body.awaitingStake.length === 3 && db.rows.length === 3 && untouched(),
+    'Three uploads waiting for a stake (storing, stored, registered-unstaked) → 429 too_many_awaiting_stake; nothing spent'
+  );
+  assert(/Stake one of them/.test(r.body.message), 'The refusal tells the archivist how to free a slot');
+
+  stakes.add(prior(3).arweaveHash);
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 202, `Staking one of them frees a slot → 202 (got ${r.statusCode} ${r.body.reason})`);
+
+  reset();
+  db.rows.push(prior(1, 'storage_failed'), prior(2, 'approved'), prior(3, 'rejected'), prior(4, 'pending_stake', { uploader: STRANGER.address.toLowerCase() }), prior(5, 'pending_stake', { uploader: STRANGER.address.toLowerCase() }), prior(6, 'pending_stake', { uploader: STRANGER.address.toLowerCase() }));
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 202, `Failed, approved and rejected uploads hold no slot, and another wallet's waiting uploads do not count → 202 (got ${r.statusCode} ${r.body.reason})`);
+
+  reset();
+  process.env.UPLOAD_MAX_PER_WALLET_PER_DAY = '2';
+  const recent = { uploadTimestamp: new Date(Date.now() - 60_000) };
+  db.rows.push(prior(1, 'approved', recent), prior(2, 'approved', recent));
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 429 && r.body.reason === 'daily_upload_limit' && untouched(), 'Two uploads in the last 24 h with a limit of 2 → 429 daily_upload_limit; nothing spent');
+  db.rows[1].status = 'storage_failed';
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 202, `A failed upload (never paid for) does not count towards the daily limit → 202 (got ${r.statusCode} ${r.body.reason})`);
+
+  reset();
+  process.env.UPLOAD_MAX_PER_WALLET_PER_DAY = '1';
+  db.rows.push(prior(1, 'approved'));
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 202, `An upload older than 24 h does not count → 202 (got ${r.statusCode} ${r.body.reason})`);
+
+  // The shared budget: the only limit new wallets cannot get around.
+  const otherWallet = { uploader: STRANGER.address.toLowerCase(), uploadTimestamp: new Date(Date.now() - 60_000) };
+  reset();
+  process.env.UPLOAD_DAILY_BUDGET_AR = '0.01';
+  db.rows.push(prior(1, 'approved', { ...otherWallet, arweaveReward: '10000000000' })); // 0.01 AR spent
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 503 && r.body.reason === 'upload_budget_exhausted' && untouched(), 'Budget already used up → 503 upload_budget_exhausted before any work; nothing spent');
+
+  reset();
+  process.env.UPLOAD_DAILY_BUDGET_AR = '0.02';
+  db.rows.push(prior(1, 'approved', { ...otherWallet, arweaveReward: '10000000000' })); // 0.01 of 0.02 AR spent; this one costs 0.0135
+  r = await quiet(() => upload(mockReq(pdf)));
+  assert(r.statusCode === 503 && r.body.reason === 'upload_budget_exhausted', `Room left, but not for this fee → 503 once the fee is known (got ${r.statusCode} ${r.body.reason})`);
+  assert(lit.calls === 0 && headerPosts() === 0 && db.rows.length === 1 && spoolFiles().length === 0, 'Refused after signing but before sealing, spooling, persisting or posting');
+
+  reset();
+  process.env.UPLOAD_DAILY_BUDGET_AR = '0.02';
+  db.rows.push(
+    prior(1, 'approved', { uploader: STRANGER.address.toLowerCase(), arweaveReward: '10000000000' }), // older than 24 h
+    prior(2, 'storage_failed', { ...otherWallet, arweaveReward: '10000000000' }) // never mined, never paid
+  );
+  r = await upload(mockReq(pdf));
+  assert(r.statusCode === 202, `Fees older than 24 h, and fees of uploads that were never mined, do not count → 202 (got ${r.statusCode} ${r.body.reason})`);
+
+  // ── What the upload page shows ───────────────────────────────────────────
+  console.log('\n=== Quota endpoint ===\n');
+  reset();
+  r = await run(getUploadQuota, { params: { address: 'not-an-address' } });
+  assert(r.statusCode === 400 && r.body.error === 'invalid_address', 'A malformed address → 400');
+
+  reset();
+  process.env.UPLOAD_DAILY_BUDGET_AR = '0.04';
+  db.rows.push(prior(1, 'pending_stake'), prior(2, 'pending', recent), prior(3, 'approved', { ...otherWallet, arweaveReward: '10000000000' }));
+  r = await run(getUploadQuota, { params: { address: ARCHIVIST_WALLET.address } });
+  // statusCode null: res.status() never called, which Express sends as 200.
+  assert(
+    r.statusCode === null && r.body.canUpload === true && r.body.awaitingStake.count === 2 && r.body.awaitingStake.max === 3 &&
+      r.body.awaitingStake.books.map((b) => b.title).join() === 'Book 1,Book 2' && r.body.last24h.count === 1 && r.body.last24h.max === 10,
+    'Shows the uploads waiting for a stake (with titles) and the last-24-hour count'
+  );
+  assert(r.body.budget.usedAr === '0.01' && r.body.budget.limitAr === '0.04' && r.body.budget.percentUsed === 25 && r.body.budget.exhausted === false, 'Shows how much of the shared budget is used');
+
+  db.rows.push(prior(4, 'pending_confirmation'));
+  r = await run(getUploadQuota, { params: { address: ARCHIVIST_WALLET.address } });
+  assert(r.body.canUpload === false && r.body.reason === 'too_many_awaiting_stake' && /Stake one of them/.test(r.body.message), 'At the limit: canUpload false, with the reason and what to do');
 
   // ── Plaintext is zeroed ──────────────────────────────────────────────────
   console.log('\n=== Plaintext handling ===\n');

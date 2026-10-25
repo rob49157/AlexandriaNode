@@ -5,7 +5,19 @@ const arweaveConfig = require('../config/arweave');
 const spool = require('../services/spool.service');
 const { topicForHash } = require('../config/blockchain');
 const { registerOnChain, preflight } = require('../services/registration.service');
+const { verifyUploadRequest } = require('../services/uploadAuth.service');
+const { checkWalletQuota, checkStorageBudget, quotaFor, BUDGET_MESSAGE } = require('../services/uploadQuota.service');
+const { isValidWalletAddress } = require('../middleware/auth.middleware');
 const prisma = require('../config/db');
+
+function budgetExhausted(res) {
+  return res.status(503).json({
+    valid: false,
+    stage: 'storage',
+    reason: 'upload_budget_exhausted',
+    message: BUDGET_MESSAGE,
+  });
+}
 
 // Storage failures before anything is spent: name the cause, because each needs
 // a different person to act (an operator, the treasury, or just a retry). Only
@@ -60,7 +72,10 @@ async function committedRewardWinston() {
 // Validation: Layer 1 (file basics) → Layer 2 (security) → Layer 3 (dedup) → Layer 5 (metadata).
 // (Layer 4, AI content analysis, is a separate service and not wired up yet.)
 //
-// Then: encrypt → sign → check balance → seal → spool → persist → post header → 202.
+// First: the wallet's signature over this exact file, then the upload limits
+// (services/uploadQuota.service.js), so a refused upload costs no validation work.
+//
+// Then: encrypt → sign → check balance and budget → seal → spool → persist → post header → 202.
 // The storage worker (services/storage.service.js) finishes the job: chunks,
 // confirmations, verified copies, then pending_stake and registration.
 //
@@ -68,10 +83,12 @@ async function committedRewardWinston() {
 // Everything that can fail cheaply fails BEFORE the one step that can cost money
 // (a posted header that gets mined):
 //
+//   signature, limits  4xx/503, nothing spent
 //   validate           4xx, nothing spent
 //   AES encrypt        local
 //   sign Arweave tx    local, free — but yields the arweaveHash (Q1)
 //   balance check      the wallet must cover the signed fee, or nothing happens
+//   budget check       so must what is left of the 24-hour storage budget
 //   seal key           network; failing here still costs nothing
 //   spool ciphertext   chunks go out later and must be the same bytes
 //   persist row        status pending_confirmation, with the signed header
@@ -92,6 +109,41 @@ async function createUpload(req, res, next) {
       });
     }
 
+    // --- Who is uploading ------------------------------------------------
+    // walletAddress is only a claim until the wallet signs for this exact file.
+    // Every per-wallet limit below depends on it.
+    //
+    // multipart/form-data rewrites every line break in a text field as CRLF (the
+    // HTML standard's encoding algorithm; measured with fetch + FormData through
+    // multer: "\n" arrives as "\r\n"). The wallet signed LF text, so turn the
+    // pairs back into what was signed. Safe: a message really signed with CRLF
+    // now fails verification, and a lone CR is still refused by the parser.
+    const rawMessage = req.body && req.body.authMessage;
+    const auth = verifyUploadRequest({
+      authMessage: typeof rawMessage === 'string' ? rawMessage.replace(/\r\n/g, '\n') : rawMessage,
+      authSignature: req.body && req.body.authSignature,
+      fileBuffer: req.file.buffer,
+      walletAddress: req.walletAddress,
+    });
+    if (!auth.ok) {
+      return res.status(auth.status).json({ valid: false, stage: 'auth', reason: auth.error, message: auth.message });
+    }
+
+    // --- Upload limits, before any work is done --------------------------
+    const quota = await checkWalletQuota(req.walletAddress);
+    if (!quota.ok) {
+      return res.status(quota.status).json({
+        valid: false,
+        stage: 'quota',
+        reason: quota.reason,
+        message: quota.message,
+        awaitingStake: quota.awaiting,
+      });
+    }
+    // The exact fee is known only after signing below; this refuses early when
+    // there is no room left at all.
+    if (!(await checkStorageBudget(0n)).ok) return budgetExhausted(res);
+
     // Layers 1 + 2 + 3 + 5. Returns the first failing check, or a success
     // object with sanitized metadata, page count, hashes, and dedup flags.
     const result = await validateUpload(req.file, req.body);
@@ -106,9 +158,7 @@ async function createUpload(req, res, next) {
     // symmetricKey is live from here until it is zeroed below.
     const { ciphertext, iv, authTag, symmetricKey } = aesEncryptPdf(req.file.buffer);
 
-    // The plaintext PDF has served its purpose. Drop it as early as possible —
-    // CLAUDE.md forbids unencrypted PDFs living any longer than necessary, and
-    // this also releases the larger of the two buffers before the network waits.
+    
     req.file.buffer.fill(0);
     req.file.buffer = null;
 
@@ -160,6 +210,17 @@ async function createUpload(req, res, next) {
       } catch (err) {
         console.error('[upload] storage wallet balance check failed:', err.message);
         return storageUnavailable(res, err);
+      }
+
+      // --- ...and so must the 24-hour storage budget -----------------------
+      const budget = await checkStorageBudget(prepared.reward);
+      if (!budget.ok) {
+        console.warn(
+          `[upload] daily storage budget: ${arweaveConfig.winstonToAr(budget.spentWinston)} of ` +
+            `${arweaveConfig.winstonToAr(budget.budgetWinston)} AR used; this upload needs ` +
+            `${arweaveConfig.winstonToAr(prepared.reward)} AR. Refused before anything was sealed or posted.`
+        );
+        return budgetExhausted(res);
       }
 
       // --- Seal the key, bound to that hash (Layer 2 of the envelope) -----
@@ -497,6 +558,22 @@ async function retryRegistration(req, res, next) {
   }
 }
 
+// GET /api/upload/quota/:address
+// What the upload page shows before the archivist picks a file: uploads waiting
+// for a stake, uploads in the last 24 hours, and how much of the shared storage
+// budget is used. Public: titles and uploaders are public in search anyway.
+async function getUploadQuota(req, res, next) {
+  try {
+    const { address } = req.params;
+    if (!isValidWalletAddress(address)) {
+      return res.status(400).json({ error: 'invalid_address', message: 'address must be a valid Ethereum address.' });
+    }
+    return res.json(await quotaFor(address));
+  } catch (err) {
+    return next(err);
+  }
+}
+
 // GET /api/upload/registrar/status
 // Whether the backend can register uploads on-chain at all, and if not, exactly
 // who has to do what about it.
@@ -514,6 +591,7 @@ module.exports = {
   getUpload,
   retryRegistration,
   getRegistrarStatus,
+  getUploadQuota,
   toPublicUpload,
   PUBLIC_UPLOAD_SELECT,
   storageUnavailable,

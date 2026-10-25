@@ -51,8 +51,9 @@ model Upload {
   // decryption Lit Action — lose it and the file is unrecoverable, so it is
   // persisted rather than merely referenced.
   litEncryptedKeyId String
-  // Lit's integrity hash for the sealed payload; the decrypt call needs it
-  // alongside the ciphertext above.
+  // sha256 hex of litEncryptedKeyId (the SEALED envelope) — the value a reader
+  // signs in the unlock message. Never a hash of the plaintext envelope, which
+  // contains the book key (migration 20261017120000_hash_sealed_envelope).
   litDataToEncryptHash String?
   onChainTxHash     String?  // Transaction hash of on-chain registration (optional initially)
 
