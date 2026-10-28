@@ -179,3 +179,20 @@ model SyncState {
   lastProcessedBlock Int
   updatedAt          DateTime @updatedAt
 }
+
+// Off-chain, wallet-signed independent librarian votes for an on-chain
+// challenge. The deployed contract still restricts resolveChallenge() to its
+// owner; this table records a three-reviewer consensus recommendation.
+model ChallengeReview {
+  id            Int      @id @default(autoincrement())
+  arweaveHash   String
+  librarian     String
+  vote          String   // "uphold" (challenge valid) | "dismiss" (challenge invalid)
+  rationale     String
+  signedMessage String
+  signature     String
+  reviewedAt    DateTime @default(now())
+
+  @@unique([arweaveHash, librarian])
+  @@index([arweaveHash])
+}

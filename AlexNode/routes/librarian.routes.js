@@ -1,6 +1,10 @@
 const express = require('express');
 
-const { getReviewQueue } = require('../controller/librarian.controller');
+const {
+	getReviewQueue,
+	getChallengeReviews,
+	submitChallengeReview,
+} = require('../controller/librarian.controller');
 
 const router = express.Router();
 
@@ -8,5 +12,7 @@ const router = express.Router();
 // Books that are registered, actively staked, unchallenged and still inside the
 // challenge window — i.e. the ones stake.challengeUpload() will accept.
 router.get('/librarian/review-queue', getReviewQueue);
+router.get('/librarian/challenges', getChallengeReviews);
+router.post('/librarian/challenges/:arweaveHash/reviews', submitChallengeReview);
 
 module.exports = router;

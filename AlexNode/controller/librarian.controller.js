@@ -25,11 +25,17 @@
 
 const prisma = require('../config/db');
 const { isValidWalletAddress } = require('../middleware/auth.middleware');
-const { getStakeStatus } = require('../services/blockchain.service');
+const { getStakeStatus, isActiveLibrarian } = require('../services/blockchain.service');
 const { toPublicUpload, PUBLIC_UPLOAD_SELECT } = require('./upload.controller');
 const { handleChainError } = require('./rental.controller');
 const { parsePositiveInt, MAX_LIMIT } = require('./search.controller');
 const { NEAR_DUPLICATE_THRESHOLD } = require('../services/dedup.service');
+const {
+  REVIEW_COUNT,
+  verifyChallengeReview,
+  summarizeReviews,
+  isStoredChallengeReviewValid,
+} = require('../services/challengeReview.service');
 
 // Only registered-and-pending books are ever candidates. "pending_stake" has no
 // stake to challenge, and approved/rejected/challenged are all past the window.
@@ -269,8 +275,181 @@ async function getReviewQueue(req, res, next) {
   }
 }
 
+// GET /api/librarian/challenges?librarian=0x…
+// Pending on-chain challenges with independent-review progress. Vote directions
+// stay hidden until all three reviews are in, preventing early votes from
+// influencing the remaining librarians.
+async function getChallengeReviews(req, res, next) {
+  try {
+    const { librarian } = req.query;
+    if (librarian !== undefined && !isValidWalletAddress(librarian)) {
+      return badRequest(res, 'invalid_wallet_address', 'librarian must be a valid Ethereum address.');
+    }
+    const librarianAddr = librarian ? librarian.toLowerCase() : null;
+
+    const rows = await prisma.upload.findMany({
+      where: { status: 'challenged' },
+      select: {
+        ...QUEUE_SELECT,
+        uploader: true,
+      },
+      orderBy: { uploadTimestamp: 'desc' },
+      take: MAX_LIMIT,
+    });
+    const chainResults = await settleInChunks(rows, (row) => getStakeStatus(row.arweaveHash));
+    const candidates = [];
+    let unavailable = 0;
+    rows.forEach((row, i) => {
+      const result = chainResults[i];
+      if (result.status === 'rejected') {
+        unavailable++;
+        return;
+      }
+      const challenge = result.value.challenge;
+      if (!challenge || challenge.resolved) return;
+      candidates.push({ row, challenge, staker: result.value.staker ?? null });
+    });
+
+    const hashes = candidates.map(({ row }) => row.arweaveHash);
+    const reviews = hashes.length
+      ? await prisma.challengeReview.findMany({
+          where: { arweaveHash: { in: hashes } },
+          orderBy: { reviewedAt: 'asc' },
+          select: { arweaveHash: true, librarian: true, vote: true, rationale: true, reviewedAt: true },
+        })
+      : [];
+    const byHash = new Map();
+    for (const review of reviews) {
+      const list = byHash.get(review.arweaveHash) || [];
+      list.push(review);
+      byHash.set(review.arweaveHash, list);
+    }
+
+    const queue = candidates.map(({ row, challenge, staker }) => {
+      // Re-verify signed ballot contents at read time. The database is an index,
+      // not a trusted authority that may rewrite a wallet's decision.
+      const allReviews = (byHash.get(row.arweaveHash) || []).filter(isStoredChallengeReviewValid);
+      const ownReview = librarianAddr
+        ? allReviews.find((review) => review.librarian.toLowerCase() === librarianAddr) || null
+        : null;
+      const summary = summarizeReviews(allReviews);
+      const revealed = summary.submitted === REVIEW_COUNT;
+      return {
+        ...toPublicUpload(row),
+        challenger: challenge.challenger,
+        staker,
+        challengeReason: challenge.reason,
+        challengedAt: challenge.challengedAt,
+        challengePeriodEnds: challenge.challengePeriodEnds,
+        review: {
+          ...summary,
+          ownVote: ownReview ? { vote: ownReview.vote, rationale: ownReview.rationale, reviewedAt: ownReview.reviewedAt } : null,
+          ballots: revealed
+            ? allReviews.map(({ librarian: reviewer, vote, rationale, reviewedAt }) => ({ reviewer, vote, rationale, reviewedAt }))
+            : null,
+          ownerResolution: 'awaiting_owner',
+        },
+      };
+    });
+
+    return res.json({ queue, total: queue.length, unavailable, requiredReviews: REVIEW_COUNT });
+  } catch (err) {
+    return handleChainError(err, res, next);
+  }
+}
+
+// POST /api/librarian/challenges/:arweaveHash/reviews
+// Body: { librarian, vote, rationale, timestamp, signature }
+async function submitChallengeReview(req, res, next) {
+  const { arweaveHash } = req.params;
+  if (!/^[A-Za-z0-9_-]{43}$/.test(arweaveHash)) {
+    return badRequest(res, 'invalid_hash', 'arweaveHash must be a 43-character base64url transaction ID.');
+  }
+
+  try {
+    const { librarian, vote, rationale, timestamp, signature } = req.body || {};
+    if (!isValidWalletAddress(librarian)) {
+      return badRequest(res, 'invalid_wallet_address', 'librarian must be a valid Ethereum address.');
+    }
+    const verified = verifyChallengeReview({ arweaveHash, librarian, vote, rationale, timestamp, signature });
+    if (!verified.ok) {
+      return res.status(verified.status).json({ error: verified.error, message: verified.message });
+    }
+
+    const row = await prisma.upload.findUnique({
+      where: { arweaveHash },
+      select: { arweaveHash: true, status: true, uploader: true },
+    });
+    if (!row || row.status !== 'challenged') {
+      return res.status(404).json({ error: 'challenge_not_found', message: 'No pending challenge exists for this book.' });
+    }
+
+    const [librarianStatus, stake] = await Promise.all([
+      isActiveLibrarian(verified.librarian),
+      getStakeStatus(arweaveHash),
+    ]);
+    if (!librarianStatus.active) {
+      return res.status(403).json({ error: 'not_active_librarian', message: 'Only active librarians may review challenges.' });
+    }
+    if (!stake.challenge || stake.challenge.resolved) {
+      return res.status(409).json({ error: 'challenge_resolved', message: 'This challenge is already resolved on-chain.' });
+    }
+    if ([stake.challenge.challenger, stake.staker, row.uploader].some((address) => address && address.toLowerCase() === verified.librarian)) {
+      return res.status(403).json({ error: 'conflicted_reviewer', message: 'The challenger and the book’s uploader/staker cannot review this challenge.' });
+    }
+
+    let submitResult;
+    try {
+      submitResult = await prisma.$transaction(async (tx) => {
+        // Lock the upload row, not just the review rows (which do not exist yet),
+        // so concurrent fourth-vote requests serialize before checking the cap.
+        await tx.$queryRaw`SELECT "arweaveHash" FROM "Upload" WHERE "arweaveHash" = ${arweaveHash} FOR UPDATE`;
+        const existing = await tx.challengeReview.findUnique({
+          where: { arweaveHash_librarian: { arweaveHash, librarian: verified.librarian } },
+          select: { id: true },
+        });
+        if (existing) return 'already_submitted';
+
+        const total = await tx.challengeReview.count({ where: { arweaveHash } });
+        if (total >= REVIEW_COUNT) return 'reviews_complete';
+
+        await tx.challengeReview.create({
+          data: {
+            arweaveHash,
+            librarian: verified.librarian,
+            vote: verified.vote,
+            rationale: verified.rationale,
+            signedMessage: verified.message,
+            signature: verified.signature,
+          },
+        });
+        return 'created';
+      });
+    } catch (err) {
+      if (err && err.code === 'P2002') submitResult = 'already_submitted';
+      else throw err;
+    }
+    if (submitResult === 'already_submitted') {
+      return res.status(409).json({ error: 'review_already_submitted', message: 'Each librarian may submit one immutable review per challenge.' });
+    }
+    if (submitResult === 'reviews_complete') {
+      return res.status(409).json({ error: 'reviews_complete', message: 'Three librarian reviews have already been submitted.' });
+    }
+
+    const reviews = await prisma.challengeReview.findMany({
+      where: { arweaveHash },
+      select: { vote: true },
+    });
+    return res.status(201).json({ review: summarizeReviews(reviews), message: 'Your signed review was recorded.' });
+  } catch (err) {
+    return handleChainError(err, res, next);
+  }
+}
+
 module.exports = {
   getReviewQueue,
+  getChallengeReviews,
+  submitChallengeReview,
   isChallengeable,
   buildAudit,
   QUEUE_STATUS,

@@ -10,10 +10,12 @@
     "start": "node index.js",
     "dev": "node --watch index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
+    "test:clamav": "node tests/clamav.test.js",
     "test:db": "node tests/uploadDb.test.js",
     "test:librarian": "node tests/librarianQueue.test.js",
     "test:unlock": "node tests/unlockRelay.test.js",
     "test:seal": "node tests/litSeal.test.js",
+    "test:challenge-review": "node tests/challengeReview.test.js",
     "benchmark:pdf": "node scripts/benchmark-pdf.js",
     "prisma:migrate": "prisma migrate dev"
   },
