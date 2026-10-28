@@ -12,8 +12,8 @@
 //   /SubmitForm, /ImportData — unsanitized remote data submission
 //   /Encrypt                — password-protected PDFs that hide content from inspection
 //
-// ClamAV virus scanning is optional — connects to clamd if available,
-// falls back gracefully in dev mode.
+// ClamAV is required by default in production. Development can explicitly run
+// without clamd, but that state is recorded as skipped and is never called clean.
 
 // --- Standard reject shape (matches validation.service.js) ---
 function reject(reason, message, httpStatus = 400) {
@@ -123,17 +123,58 @@ function checkEncrypted(pdfBuffer) {
 
 const net = require('net');
 
-const CLAMAV_HOST = process.env.CLAMAV_HOST || '127.0.0.1';
-const CLAMAV_PORT = parseInt(process.env.CLAMAV_PORT, 10) || 3310;
-const CLAMAV_TIMEOUT = parseInt(process.env.CLAMAV_TIMEOUT, 10) || 30000;
+function getClamAVConfig() {
+  const port = Number.parseInt(process.env.CLAMAV_PORT || '3310', 10);
+  const timeout = Number.parseInt(process.env.CLAMAV_TIMEOUT || '30000', 10);
+  return {
+    host: process.env.CLAMAV_HOST || '127.0.0.1',
+    port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : 3310,
+    timeout: Number.isInteger(timeout) && timeout > 0 ? timeout : 30000,
+    required: process.env.CLAMAV_REQUIRED === 'true' ||
+      (process.env.NODE_ENV === 'production' && process.env.CLAMAV_REQUIRED !== 'false'),
+  };
+}
+
+function clamavFailure(reason, message, required) {
+  if (required) {
+    return reject(reason, message, 503);
+  }
+  console.warn(`[SecurityScan] ${message} ClamAV is optional in this environment; scan skipped.`);
+  return { valid: true, skipped: true, skipReason: reason };
+}
 
 // Scan a buffer for viruses using ClamAV daemon (clamd).
 async function scanWithClamAV(buffer) {
+  const config = getClamAVConfig();
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let response = '';
+    let settled = false;
 
-    socket.setTimeout(CLAMAV_TIMEOUT);
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+
+    const handleResponse = (rawResponse) => {
+      const trimmed = rawResponse.replace(/[\0\r\n]+$/, '').trim();
+      if (/\bFOUND$/.test(trimmed)) {
+        const virusName = trimmed.replace(/^stream:\s*/, '').replace(/\s*FOUND$/, '');
+        finish(reject('virus_detected', `ClamAV detected malware: ${virusName}.`));
+      } else if (/^stream:\s*OK$/i.test(trimmed)) {
+        finish({ valid: true });
+      } else {
+        finish(clamavFailure(
+          'clamav_error',
+          `ClamAV returned an invalid or error response (${trimmed || 'empty response'}).`,
+          config.required
+        ));
+      }
+    };
+
+    socket.setTimeout(config.timeout);
 
     socket.on('connect', () => {
       // ClamAV INSTREAM protocol:
@@ -154,38 +195,44 @@ async function scanWithClamAV(buffer) {
 
       // Terminator
       socket.write(Buffer.alloc(4, 0));
+      // Half-close our side after the INSTREAM terminator. clamd may keep the
+      // connection open, so completion is driven by its NUL-terminated reply.
+      socket.end();
     });
 
     socket.on('data', (data) => {
       response += data.toString();
+      const terminator = response.search(/[\0\r\n]/);
+      if (terminator !== -1) handleResponse(response.slice(0, terminator));
     });
 
     socket.on('end', () => {
-      socket.destroy();
-      // ClamAV response: "stream: OK" or "stream: <virusname> FOUND"
-      const trimmed = response.trim();
-      if (trimmed.includes('FOUND')) {
-        const virusName = trimmed.replace(/^stream:\s*/, '').replace(/\s*FOUND$/, '');
-        resolve(reject('virus_detected', `ClamAV detected malware: ${virusName}.`));
-      } else {
-        resolve({ valid: true });
-      }
+      if (!settled) handleResponse(response);
     });
 
     socket.on('error', (err) => {
-      socket.destroy();
-      // ClamAV not running — log warning and skip (structural scan is still active)
-      console.warn(`[SecurityScan] ClamAV daemon not available (${err.code || err.message}). Structural scan still active.`);
-      resolve({ valid: true, skipped: true, skipReason: 'clamav_unavailable' });
+      finish(clamavFailure(
+        'clamav_unavailable',
+        `ClamAV daemon is unavailable (${err.code || err.message}).`,
+        config.required
+      ));
     });
 
     socket.on('timeout', () => {
-      socket.destroy();
-      console.warn('[SecurityScan] ClamAV scan timed out. Structural scan still active.');
-      resolve({ valid: true, skipped: true, skipReason: 'clamav_timeout' });
+      finish(clamavFailure('clamav_timeout', 'ClamAV scan timed out.', config.required));
     });
 
-    socket.connect(CLAMAV_PORT, CLAMAV_HOST);
+    socket.on('close', () => {
+      if (!settled) {
+        finish(clamavFailure(
+          'clamav_error',
+          `ClamAV closed the connection without a complete response (${response.trim() || 'empty response'}).`,
+          config.required
+        ));
+      }
+    });
+
+    socket.connect(config.port, config.host);
   });
 }
 
@@ -195,6 +242,7 @@ async function scanWithClamAV(buffer) {
 const CLAMAV_STATUS = {
   clamav_unavailable: 'unavailable',
   clamav_timeout: 'timeout',
+  clamav_error: 'error',
 };
 
 // Run the full Layer 2 security scan pipeline:
@@ -208,7 +256,7 @@ async function validateLayer2(pdfBuffer) {
   const encryptResult = checkEncrypted(pdfBuffer);
   if (!encryptResult.valid) return encryptResult;
 
-  // 3. ClamAV virus scan (optional, network I/O)
+  // 3. ClamAV virus scan (network I/O; required in production by default)
   const clamResult = await scanWithClamAV(pdfBuffer);
   if (!clamResult.valid) return clamResult;
 
