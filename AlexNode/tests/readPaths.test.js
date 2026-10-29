@@ -13,6 +13,7 @@
 //  12-19.  search: q matching, category/status filters, ordering, defaults
 //  20-26.  search: pagination arithmetic and parameter validation
 //  27-30.  search: projection, transaction use, unknown params
+//  31-44.  search: inReview (staked pending books + review end), delisting, price
 
 require('dotenv').config();
 
@@ -66,8 +67,12 @@ stub('../config/lit', {
 
 const db = { rows: [], calls: [] };
 
-// Prisma filter subset: scalar equality, { contains, mode }, and OR arrays.
+// Prisma filter subset: scalar equality, { contains, mode }, { not }, and OR/AND arrays.
 function matchesCondition(value, condition) {
+  if (condition !== null && typeof condition === 'object' && 'not' in condition) {
+    // Prisma's { not: null } means IS NOT NULL; an absent column reads as null.
+    return condition.not === null ? value !== null && value !== undefined : value !== condition.not;
+  }
   if (condition !== null && typeof condition === 'object' && 'contains' in condition) {
     const haystack = String(value ?? '');
     const needle = String(condition.contains);
@@ -81,6 +86,7 @@ function matchesCondition(value, condition) {
 function matchesWhere(row, where = {}) {
   return Object.entries(where).every(([key, condition]) => {
     if (key === 'OR') return condition.some((clause) => matchesWhere(row, clause));
+    if (key === 'AND') return condition.every((clause) => matchesWhere(row, clause));
     return matchesCondition(row[key], condition);
   });
 }
@@ -153,6 +159,10 @@ function hash(seed) {
 const HASH_APPROVED = hash('meditations');
 const HASH_PENDING_STAKE = hash('pendingstake');
 const HASH_MISSING = hash('nosuchbook');
+const HASH_IN_REVIEW = hash('republic');
+
+// 5 ALEX per day in atomic units (18 decimals).
+const PRICE_5_ALEX = '5000000000000000000';
 
 function makeRow(overrides) {
   return {
@@ -166,6 +176,10 @@ function makeRow(overrides) {
     status: 'approved',
     fileSize: 1024,
     pageCount: 10,
+    // Catalogue columns, as the migration creates them.
+    stakedAt: null,
+    pricePerDay: null,
+    delisted: false,
     // Everything below this line must never appear in a response.
     sha256Hash: 'a'.repeat(64),
     simHash: 'ffffffffffffffff',
@@ -194,6 +208,7 @@ function seed() {
       status: 'approved',
       uploadTimestamp: new Date('2026-03-01T00:00:00Z'),
       pageCount: 254,
+      pricePerDay: PRICE_5_ALEX,
     }),
     makeRow({
       arweaveHash: hash('origin'),
@@ -234,6 +249,35 @@ function seed() {
       category: 'history',
       status: 'challenged',
       uploadTimestamp: new Date('2026-06-02T00:00:00Z'),
+    }),
+    // Registered and staked: inside its challenge window, so "in review".
+    makeRow({
+      arweaveHash: HASH_IN_REVIEW,
+      title: 'The Republic',
+      author: 'Plato',
+      category: 'philosophy',
+      status: 'pending',
+      stakedAt: new Date('2026-06-03T00:00:00Z'),
+      uploadTimestamp: new Date('2026-06-03T00:00:00Z'),
+    }),
+    // Registered but never staked: no window running, so not in review.
+    makeRow({
+      arweaveHash: hash('unstaked'),
+      title: 'An Unstaked Treatise',
+      author: 'Plato',
+      category: 'philosophy',
+      status: 'pending',
+      uploadTimestamp: new Date('2026-06-04T00:00:00Z'),
+    }),
+    // Approved, then taken down with Rent.delistBook().
+    makeRow({
+      arweaveHash: hash('withdrawn'),
+      title: 'A Withdrawn Volume',
+      author: 'Charles Darwin',
+      category: 'science',
+      status: 'approved',
+      delisted: true,
+      uploadTimestamp: new Date('2026-06-05T00:00:00Z'),
     }),
   ];
   db.calls = [];
@@ -520,6 +564,91 @@ async function run() {
     assert(
       JSON.stringify(countCall.args.where) === JSON.stringify(many.args.where),
       'count and findMany use an identical where clause'
+    );
+  }
+
+  // --- Books in review, delisting, price ----------------------------------
+  console.log('\nBooks in review, delisting, price');
+  seed();
+
+  {
+    const { res } = await callSearch({ inReview: 'true' });
+    const titles = res.body.results.map((r) => r.title);
+    assert(res.statusCode === 200 && res.body.total === 5, 'inReview=true lists the 4 approved books plus the staked pending one');
+    assert(titles.includes('The Republic'), 'a staked pending book is listed');
+    assert(!titles.includes('An Unstaked Treatise'), 'an unstaked pending book is not (no review is running)');
+    assert(
+      !titles.includes('An Unfinished Upload') && !titles.includes('A Disputed Book'),
+      'pending_stake and challenged stay out'
+    );
+  }
+
+  {
+    const { res } = await callSearch({ inReview: 'true' });
+    const republic = res.body.results.find((r) => r.title === 'The Republic');
+    assert(
+      republic && republic.reviewEndsAt === '2026-06-17T00:00:00.000Z',
+      'reviewEndsAt is the stake time plus the 14-day challenge period'
+    );
+    assert(
+      res.body.results.filter((r) => r.status === 'approved').every((r) => r.reviewEndsAt === null),
+      'approved books carry no reviewEndsAt'
+    );
+  }
+
+  {
+    const { res } = await callSearch({ inReview: 'true', q: 'plato' });
+    assert(
+      res.body.total === 1 && res.body.results[0].title === 'The Republic',
+      'inReview and q combine: the q OR group does not override the status OR group'
+    );
+  }
+
+  {
+    const { res } = await callSearch({ inReview: 'true', category: 'philosophy' });
+    assert(res.body.total === 3, 'inReview and category combine');
+  }
+
+  {
+    const { res } = await callSearch({ inReview: 'true' });
+    assert(res.body.query.inReview === true && res.body.query.status === null, 'echoed query reports inReview and no single status');
+    const { res: def } = await callSearch({ inReview: 'false' });
+    assert(def.body.total === 4 && def.body.query.status === 'approved', 'inReview=false is the default approved-only search');
+  }
+
+  {
+    const { res } = await callSearch({ inReview: 'yes' });
+    assert(res.statusCode === 400 && res.body.error === 'invalid_in_review', 'inReview other than true/false rejected');
+    const { res: both } = await callSearch({ inReview: 'true', status: 'approved' });
+    assert(both.statusCode === 400 && both.body.error === 'conflicting_filters', 'inReview with status rejected');
+  }
+
+  {
+    const { res } = await callSearch({ q: 'withdrawn', status: 'approved' });
+    assert(res.body.total === 0, 'a delisted book is left out even when its status is asked for');
+    const { res: darwin } = await callSearch({ q: 'darwin', inReview: 'true' });
+    assert(darwin.body.total === 1, 'a delisted book is left out of inReview too');
+  }
+
+  {
+    const { res } = await callSearch({ q: 'meditations' });
+    const book = res.body.results[0];
+    assert(
+      book.pricePerDay === PRICE_5_ALEX && book.pricePerDayAlex === '5.0',
+      'a set price comes back in atomic units and in ALEX'
+    );
+    const { res: res2 } = await callSearch({ q: 'leviathan' });
+    assert(
+      res2.body.results[0].pricePerDay === null && res2.body.results[0].pricePerDayAlex === null,
+      'an unset price is null, not 0'
+    );
+  }
+
+  {
+    const { res } = await callGetUpload(HASH_IN_REVIEW);
+    assert(
+      res.statusCode === 200 && res.body.reviewEndsAt === '2026-06-17T00:00:00.000Z' && res.body.delisted === false,
+      'GET /api/upload/:hash carries reviewEndsAt and delisted too'
     );
   }
 

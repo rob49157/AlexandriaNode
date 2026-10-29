@@ -57,6 +57,19 @@ model Upload {
   litDataToEncryptHash String?
   onChainTxHash     String?  // Transaction hash of on-chain registration (optional initially)
 
+  // ─── Catalogue, kept in step by services/eventListener.service.js ──────────
+  // When the archivist staked, from the Staked event's block: stake() records
+  // block.timestamp, and the 14-day challenge window runs from it. Null = not
+  // staked, so no review is running; search lists a pending book only once set.
+  stakedAt          DateTime?
+  // Per-day rental price in atomic ALEX (18 decimals), from BookPriceSet. A
+  // String for the same reason as arweaveReward: it exceeds Int and is money.
+  // Null until set, which Rent.setBookPrice() only allows on an approved book.
+  pricePerDay       String?
+  // Rent.delistBook() is owner-only and has no undo: a delisted book can never
+  // be rented again, so search leaves it out.
+  delisted          Boolean  @default(false)
+
   // AES-256-GCM decryption parameters. Also written to the Arweave tags, which
   // are the authoritative copy — these exist so the read path can serve them
   // without a gateway round-trip. Without them the ciphertext is unrecoverable.

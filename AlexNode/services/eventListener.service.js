@@ -1,7 +1,8 @@
 // On-chain event listener — mirrors Alexandria contract events into Postgres.
 //
-// Strictly read-only. It watches logs and moves the `status` column on Upload;
-// it never sends a transaction. The chain remains the source of truth, and this
+// Strictly read-only. It watches logs and moves the `status` column on Upload,
+// plus the catalogue columns search shows (stakedAt, pricePerDay, delisted); it
+// never sends a transaction. The chain remains the source of truth, and this
 // index is a cache that must be reconstructable by replaying from the deployment
 // block — which is exactly what a cold start does.
 //
@@ -43,7 +44,7 @@ const {
   START_BLOCK,
   POLL_INTERVAL_MS,
 } = require('../config/blockchain');
-const { UPLOAD_STATUS } = require('./blockchain.service');
+const { UPLOAD_STATUS, getStakeStatus } = require('./blockchain.service');
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -271,6 +272,35 @@ async function applyStatus(event, arweaveHash) {
 }
 
 /**
+ * Keep the catalogue columns in step with stake and rent events. These are
+ * facts about the book rather than its status, which stays the library's alone
+ * (see applyStatus). Events arrive oldest-first, so the newest one wins on replay.
+ *
+ * @param {Date|undefined} blockTime timestamp of the event's block, if it was fetched
+ */
+async function applyCatalogue(event, arweaveHash, blockTime) {
+  if (!arweaveHash) return;
+
+  let data = null;
+  if (event.contract === 'stake' && event.eventName === 'Staked') {
+    // stake() stores block.timestamp, and the challenge window runs from it. If
+    // the block time could not be fetched, ask the contract: a review countdown
+    // started from "now" would be wrong by however long the stake is old.
+    const stakedAt = blockTime ?? (await getStakeStatus(arweaveHash)).stakeTime;
+    if (!stakedAt) return;
+    data = { stakedAt: new Date(stakedAt) };
+  } else if (event.contract === 'rent' && event.eventName === 'BookPriceSet') {
+    data = { pricePerDay: event.args.price };
+  } else if (event.contract === 'rent' && event.eventName === 'BookDelisted') {
+    data = { delisted: true };
+  }
+  if (!data) return;
+
+  const { count } = await prisma.upload.updateMany({ where: { arweaveHash }, data });
+  if (count) console.log(`[events] ${arweaveHash} ${event.eventName} → ${Object.keys(data).join(', ')}`);
+}
+
+/**
  * Store a batch of events and apply their status effects, oldest first.
  */
 async function persist(events, blockTimes) {
@@ -282,7 +312,8 @@ async function persist(events, blockTimes) {
 
   for (const event of ordered) {
     const arweaveHash = event.arweaveHashTopic ? resolved.get(event.arweaveHashTopic) ?? null : null;
-    const timestamp = blockTimes.get(event.blockNumber) ?? new Date();
+    const blockTime = blockTimes.get(event.blockNumber);
+    const timestamp = blockTime ?? new Date();
 
     const data = {
       eventName: event.eventName,
@@ -310,6 +341,7 @@ async function persist(events, blockTimes) {
     });
 
     await applyStatus(event, arweaveHash);
+    await applyCatalogue(event, arweaveHash, blockTime);
   }
 }
 
