@@ -16,6 +16,7 @@
 //   1-10.  decodeLog: real encoding, indexed-string handling, arg serialization
 //  11-17.  resolveHashes: topic → hash via the index, and via getUploaderHashes
 //  18-26.  persist: status transitions, no downgrades, idempotent replay
+//  26a-g.  persist: catalogue columns from Staked, BookPriceSet, BookDelisted
 //  27-32.  syncRange / cursor handling
 //  33-41.  blockchain.service: revert vs. network failure translation
 //  42-53.  rental + stake + chain controllers
@@ -646,6 +647,61 @@ async function testPersist() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 26a-g. persist + catalogue columns
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function testCatalogue() {
+  section('persist — catalogue columns from stake and rent events');
+  const ALEX = 10n ** 18n;
+
+  reset();
+  db.uploads = [makeUploadRow({ status: 'pending' })];
+  const blockTime = new Date('2026-10-24T14:49:38Z');
+  const staked = listener.decodeLog(makeLog('stake', 'Staked', [HASH_A, ARCHIVIST, 100n * ALEX], { blockNumber: 42_800_001 }));
+  await listener.persist([staked], new Map([[staked.blockNumber, blockTime]]));
+  assert(db.uploads[0].stakedAt.getTime() === blockTime.getTime(), 'Staked sets stakedAt to the block time');
+  assert(db.uploads[0].status === 'pending', 'Staked leaves status alone: the library owns it');
+
+  // No block time: the contract's own stake timestamp, never "now".
+  reset();
+  db.uploads = [makeUploadRow({ status: 'pending' })];
+  chain.stakes.set(HASH_A, { staker: ARCHIVIST, amount: (100n * ALEX).toString(), timestamp: 1_761_317_378, active: true });
+  const stakedNoTime = listener.decodeLog(makeLog('stake', 'Staked', [HASH_A, ARCHIVIST, 100n * ALEX]));
+  await listener.persist([stakedNoTime], new Map());
+  assert(
+    db.uploads[0].stakedAt.toISOString() === new Date(1_761_317_378 * 1000).toISOString(),
+    'without a block time, stakedAt comes from stake.getStakeStatus'
+  );
+
+  // Two prices handed over out of order: the newest block wins.
+  reset();
+  db.uploads = [makeUploadRow({ status: 'approved' })];
+  const older = listener.decodeLog(makeLog('rent', 'BookPriceSet', [HASH_A, 3n * ALEX], { blockNumber: 42_800_005 }));
+  const newer = listener.decodeLog(makeLog('rent', 'BookPriceSet', [HASH_A, 7n * ALEX], { blockNumber: 42_800_009 }));
+  await listener.persist([newer, older], new Map());
+  assert(db.uploads[0].pricePerDay === (7n * ALEX).toString(), 'BookPriceSet stores atomic units as a string, newest wins');
+
+  // Replaying the same price log changes nothing.
+  await listener.persist([newer], new Map());
+  assert(db.uploads[0].pricePerDay === (7n * ALEX).toString(), 'replaying BookPriceSet is a no-op');
+
+  const delisted = listener.decodeLog(makeLog('rent', 'BookDelisted', [HASH_A]));
+  await listener.persist([delisted], new Map());
+  assert(db.uploads[0].delisted === true, 'BookDelisted marks the book delisted');
+  assert(db.uploads[0].status === 'approved', 'BookDelisted leaves status alone');
+
+  // A log for a book this backend does not know touches no row.
+  reset();
+  db.uploads = [makeUploadRow({ status: 'approved' })];
+  const stranger = listener.decodeLog(makeLog('rent', 'BookPriceSet', [HASH_B, 1n * ALEX]));
+  await listener.persist([stranger], new Map());
+  assert(
+    db.uploads[0].pricePerDay === undefined && !db.calls.some((c) => c.op === 'upload.updateMany'),
+    'an event for an unknown book updates nothing'
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 27-32. syncRange + cursor
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1048,6 +1104,7 @@ async function main() {
   await testDecoding();
   await testResolution();
   await testPersist();
+  await testCatalogue();
   await testSync();
   await testChainService();
   await testControllers();

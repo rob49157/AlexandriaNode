@@ -21,6 +21,15 @@ const SEARCH_STATUSES = ['approved', 'pending', 'pending_stake', 'challenged', '
 // stake-and-challenge window yet, so it is opt-in via ?status=.
 const DEFAULT_STATUS = 'approved';
 
+// ?inReview=true adds the books still inside their 14-day challenge window to
+// the approved ones: browsable, not yet rentable (Rent.rentBook() requires
+// Approved). Only a STAKED pending book counts: an unstaked one has no window
+// running and may never get one.
+const IN_REVIEW_OR_APPROVED = [
+  { status: 'approved' },
+  { status: 'pending', stakedAt: { not: null } },
+];
+
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
 
@@ -46,13 +55,14 @@ function parsePositiveInt(raw, fallback) {
   return n;
 }
 
-// GET /api/search?q=&category=&status=&page=&limit=
+// GET /api/search?q=&category=&status=&inReview=&page=&limit=
 //
 // `q` matches title OR author, case-insensitively, anywhere in the field.
 // Omitting it browses the whole (filtered) catalogue newest-first.
+// Delisted books never appear: Rent.delistBook() is a permanent takedown.
 async function search(req, res, next) {
   try {
-    const { q, category, status } = req.query;
+    const { q, category, status, inReview } = req.query;
 
     // --- Validate the filters ---------------------------------------------
     const query = typeof q === 'string' ? q.trim() : '';
@@ -68,6 +78,14 @@ async function search(req, res, next) {
       return badRequest(res, 'invalid_status', `status must be one of: ${SEARCH_STATUSES.join(', ')}.`);
     }
 
+    if (inReview !== undefined && inReview !== 'true' && inReview !== 'false') {
+      return badRequest(res, 'invalid_in_review', 'inReview must be true or false.');
+    }
+    const withInReview = inReview === 'true';
+    if (withInReview && status !== undefined) {
+      return badRequest(res, 'conflicting_filters', 'inReview already chooses the statuses; drop status.');
+    }
+
     const page = parsePositiveInt(req.query.page, 1);
     if (page === null) {
       return badRequest(res, 'invalid_page', 'page must be a positive integer.');
@@ -79,17 +97,30 @@ async function search(req, res, next) {
     }
 
     // --- Build the where clause -------------------------------------------
-    const where = { status: status || DEFAULT_STATUS };
+    const where = { delisted: false };
+    // Each entry is one OR group. Both inReview and q need one, and a where has
+    // a single OR key, so the groups are ANDed together.
+    const anyOf = [];
+
+    if (withInReview) {
+      anyOf.push(IN_REVIEW_OR_APPROVED);
+    } else {
+      where.status = status || DEFAULT_STATUS;
+    }
 
     if (category !== undefined) {
       where.category = category;
     }
 
     if (query) {
-      where.OR = [
+      anyOf.push([
         { title: { contains: query, mode: 'insensitive' } },
         { author: { contains: query, mode: 'insensitive' } },
-      ];
+      ]);
+    }
+
+    if (anyOf.length) {
+      where.AND = anyOf.map((clauses) => ({ OR: clauses }));
     }
 
     // --- Query -------------------------------------------------------------
@@ -113,7 +144,12 @@ async function search(req, res, next) {
       total,
       totalPages: Math.ceil(total / limit),
       hasMore: page * limit < total,
-      query: { q: query || null, category: category || null, status: where.status },
+      query: {
+        q: query || null,
+        category: category || null,
+        status: withInReview ? null : where.status,
+        inReview: withInReview,
+      },
     });
   } catch (err) {
     return next(err);

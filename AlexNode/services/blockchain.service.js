@@ -23,9 +23,12 @@ const { getContracts } = require('../config/blockchain');
 // that appears on-chain and in UploadStatusChanged events.
 const UPLOAD_STATUS = ['pending', 'challenged', 'approved', 'rejected'];
 
-// Mirrors AlexandriaStake.CHALLENGE_PERIOD (14 days). Read from the contract at
-// runtime rather than trusted from here — this is only the fallback.
-const FALLBACK_CHALLENGE_PERIOD = 14 * 24 * 60 * 60;
+// Mirrors AlexandriaStake.CHALLENGE_PERIOD (14 days). getStakeStatus reads it from
+// the contract and uses this only as the fallback. Search uses it directly to
+// say when a review ends without a chain call per row. That is safe because the
+// contract declares it `constant`: it can only change with a redeploy, which
+// means re-running scripts/sync-abis.js and reviewing the diff anyway.
+const CHALLENGE_PERIOD_SECONDS = 14 * 24 * 60 * 60;
 
 /**
  * Error type for chain failures that should not be mistaken for "no data".
@@ -175,7 +178,7 @@ async function getStakeStatus(arweaveHash) {
     read(() => stake.getStakeStatus(arweaveHash), { label: 'stake.getStakeStatus' }),
     read(() => stake.challenges(arweaveHash), { label: 'stake.challenges' }),
     read(() => stake.CHALLENGE_PERIOD(), {
-      fallback: BigInt(FALLBACK_CHALLENGE_PERIOD),
+      fallback: BigInt(CHALLENGE_PERIOD_SECONDS),
       label: 'stake.CHALLENGE_PERIOD',
     }),
   ]);
@@ -309,6 +312,7 @@ async function getBookRental(arweaveHash) {
 module.exports = {
   ChainError,
   UPLOAD_STATUS,
+  CHALLENGE_PERIOD_SECONDS,
   getUploadOnChain,
   getUploadStatusOnChain,
   getUploaderHashes,
