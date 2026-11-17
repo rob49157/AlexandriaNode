@@ -24,11 +24,21 @@ function badRequest(res, reason, message) {
 /**
  * May this wallet open a book as a librarian reviewing it?
  *
- * Three on-chain facts, all of which AlexandriaStake.challengeUpload() requires
- * too: the caller is an active librarian, the book has an active stake, and the
- * 14-day window has not closed. The book's own uploader is excluded because the
- * uploader carve-out has already answered for them, and a librarian cannot
- * challenge their own upload in any case.
+ * The caller is an active librarian and the book has an active stake, then one
+ * of two cases, the same two the decryption Lit Action opens (invariant 9):
+ *
+ *   not challenged — the 14-day window is still open, as
+ *                    AlexandriaStake.challengeUpload() requires.
+ *   challenged     — the challenge is not resolved, and its own 14-day review
+ *                    period (CHALLENGE_PERIOD from the challenge, not from the
+ *                    stake) is still running. The three independent reviewers
+ *                    must read what they vote on; voting closes at the same time.
+ *
+ * A challenge on record means the library status is Challenged: challengeUpload()
+ * writes both, and resolveChallenge() marks it resolved as it moves the status on.
+ *
+ * The book's own uploader is excluded because the uploader carve-out has already
+ * answered for them, and a librarian cannot challenge their own upload in any case.
  *
  * Fails closed: an unreadable chain denies review rather than granting it.
  *
@@ -42,14 +52,11 @@ async function isLibrarianReviewAllowed(arweaveHash, address) {
     if (!librarian.active) return false;
 
     const stake = await getStakeStatus(arweaveHash);
+    if (!stake.staked || !stake.active || !stake.staker) return false;
+    if (stake.staker.toLowerCase() === address.toLowerCase()) return false;
 
-    return Boolean(
-      stake.staked &&
-        stake.active &&
-        !stake.challengePeriodOver &&
-        stake.staker &&
-        stake.staker.toLowerCase() !== address.toLowerCase()
-    );
+    if (stake.challenge) return stake.challenge.resolved === false && stake.challenge.reviewOver === false;
+    return stake.challengePeriodOver === false;
   } catch (err) {
     return false;
   }
@@ -110,10 +117,10 @@ async function checkReadAccess(row, address) {
   if (rental.available === false) return { allowed: false, unavailable: true, rental };
   if (rental.active) return { allowed: true, grantedVia: 'rental', rental };
 
-  // A book in its challenge window is not rentable — Rent.rentBook() requires
-  // Approved status — so a librarian who has to read it before challenging
-  // cannot buy access even in good faith. Mirrors the preconditions of
-  // AlexandriaStake.challengeUpload(), and closes when the window does.
+  // A book that is not Approved is not rentable — Rent.rentBook() requires it —
+  // so a librarian who has to read it before challenging, or to review a
+  // challenge, cannot buy access even in good faith. Open while the book is
+  // challengeable, and for 14 days after a challenge while it is unresolved.
   if (await isLibrarianReviewAllowed(row.arweaveHash, address)) {
     return { allowed: true, grantedVia: 'librarian_review', rental };
   }
@@ -327,6 +334,7 @@ module.exports = {
   getBookRentalInfo,
   checkReadAccess,
   notRegisteredMessage,
+  NOT_REGISTERED_STATUSES,
   STAKE_REQUIRED_MESSAGE,
   handleChainError,
   readParams,

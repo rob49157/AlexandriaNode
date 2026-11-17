@@ -41,12 +41,21 @@ const prisma = {
   $transaction: async (callback) => callback(prisma),
 };
 stub('../config/db', prisma);
+// The challenge's own 14-day review period. A test flips `over` to close it.
+const reviewPeriod = { over: false };
 stub('../services/blockchain.service', {
   getStakeStatus: async () => ({
     staked: true,
     active: true,
     staker: ARCHIVIST.address,
-    challenge: { challenger: CHALLENGER.address, reason: 'Potentially abusive content', challengedAt: new Date().toISOString(), resolved: false },
+    challenge: {
+      challenger: CHALLENGER.address,
+      reason: 'Potentially abusive content',
+      challengedAt: new Date().toISOString(),
+      resolved: false,
+      reviewEndsAt: new Date(Date.now() + (reviewPeriod.over ? -1 : 1) * 86400000).toISOString(),
+      reviewOver: reviewPeriod.over,
+    },
     challengePeriodEnds: new Date(Date.now() + 86400000).toISOString(),
   }),
   isActiveLibrarian: async (address) => ({ active: [...REVIEWERS, CHALLENGER].some((wallet) => wallet.address.toLowerCase() === address.toLowerCase()) }),
@@ -102,6 +111,43 @@ async function run() {
   assert.equal(first.body.review.submitted, 1, 'progress counts distinct reviews');
   assert.equal(first.body.review.votes, null, 'vote directions stay blind before all three reviews');
 
+  // The `librarian` query parameter is unsigned, so this is what ANYONE gets by
+  // naming the first reviewer's wallet — which is public on-chain.
+  const peek = await invoke(getChallengeReviews, { query: { librarian: REVIEWERS[0].address } });
+  const early = peek.body.queue[0].review;
+  assert.deepEqual(
+    Object.keys(early.ownVote).sort(),
+    ['reviewedAt', 'submitted'],
+    'before the reveal, naming a reviewer shows only that they voted'
+  );
+  assert.equal(early.ownVote.vote, undefined, 'never the direction of their vote');
+  assert.equal(early.ownVote.rationale, undefined, 'nor its rationale, which would give the direction away');
+  assert.equal(early.ballots, null, 'no ballots are listed before the reveal');
+  assert.equal(early.consensus, null, 'and there is no consensus yet');
+  const notVoted = await invoke(getChallengeReviews, { query: { librarian: REVIEWERS[1].address } });
+  assert.equal(notVoted.body.queue[0].review.ownVote, null, 'a librarian who has not voted has no ownVote');
+
+  // The review period ends with one vote in. Voting closes, and the votes cast
+  // decide: nobody is left to influence, so they are revealed.
+  reviewPeriod.over = true;
+  const late = await invoke(submitChallengeReview, await signedRequest(REVIEWERS[1], 'dismiss', 'Arriving after the review period ended.'));
+  assert.equal(late.statusCode, 409, 'no vote is accepted after the 14-day review period');
+  assert.equal(late.body.error, 'review_closed', 'and the refusal says why');
+  const closed = (await invoke(getChallengeReviews, { query: { librarian: REVIEWERS[0].address } })).body.queue[0];
+  assert.equal(closed.review.closed, true, 'a closed case stays listed, marked closed, for the owner to resolve');
+  assert.ok(closed.reviewEndsAt, 'each case carries its review deadline');
+  assert.equal(closed.review.consensus, 'uphold', 'after the deadline the majority of the votes cast decides');
+  assert.deepEqual(closed.review.votes, { uphold: 1, dismiss: 0 }, 'and the tally of the votes cast is revealed');
+  assert.equal(closed.review.ballots.length, 1, 'with their signed rationales');
+  assert.equal(closed.review.ownVote.vote, 'uphold', 'and a reviewer sees their own vote again');
+  reviewPeriod.over = false;
+
+  const closedSummary = (votesCast) => summarizeReviews(votesCast.map((vote) => ({ vote })), { closed: true });
+  assert.equal(closedSummary(['uphold', 'dismiss']).consensus, 'dismiss', 'a tie at the deadline dismisses the challenge');
+  assert.equal(closedSummary([]).consensus, 'dismiss', 'no vote at all by the deadline dismisses the challenge');
+  assert.equal(closedSummary(['uphold', 'uphold']).consensus, 'uphold', 'two upholds of two cast uphold it');
+  assert.equal(closedSummary(['uphold', 'dismiss', 'dismiss']).consensus, 'dismiss', 'three votes still decide 2 of 3');
+
   const duplicate = await invoke(submitChallengeReview, await signedRequest(REVIEWERS[0], 'dismiss', 'A different rationale for this vote.'));
   assert.equal(duplicate.statusCode, 409, 'a librarian cannot change or duplicate an immutable vote');
 
@@ -132,7 +178,7 @@ async function run() {
   const fourth = await invoke(submitChallengeReview, await signedRequest(REVIEWERS[3], 'dismiss', 'This should not be accepted as vote four.'));
   assert.equal(fourth.statusCode, 409, 'an eligible fourth librarian cannot add a vote after consensus');
 
-  console.log('Challenge review tests passed (signature expiry, blind voting, distinct active reviewers, immutable votes, 2-of-3 consensus).');
+  console.log('Challenge review tests passed (signature expiry, blind voting, distinct active reviewers, immutable votes, 2-of-3 consensus, 14-day review deadline).');
 }
 
 run().catch((error) => {

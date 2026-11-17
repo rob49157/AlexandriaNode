@@ -276,9 +276,13 @@ async function getReviewQueue(req, res, next) {
 }
 
 // GET /api/librarian/challenges?librarian=0x…
-// Pending on-chain challenges with independent-review progress. Vote directions
-// stay hidden until all three reviews are in, preventing early votes from
-// influencing the remaining librarians.
+// Unresolved on-chain challenges with independent-review progress. Each gets 14
+// days of review from the challenge (`reviewEndsAt`). Vote directions stay
+// hidden until all three reviews are in or the review period ends, preventing
+// early votes from influencing the remaining librarians — including the
+// caller's own: before the reveal, `review.ownVote` is `{ submitted: true,
+// reviewedAt }` and nothing more. A closed case stays listed, decided by the
+// votes cast, until the owner resolves it on-chain.
 async function getChallengeReviews(req, res, next) {
   try {
     const { librarian } = req.query;
@@ -332,18 +336,31 @@ async function getChallengeReviews(req, res, next) {
       const ownReview = librarianAddr
         ? allReviews.find((review) => review.librarian.toLowerCase() === librarianAddr) || null
         : null;
-      const summary = summarizeReviews(allReviews);
-      const revealed = summary.submitted === REVIEW_COUNT;
+      // The review period: 14 days from the challenge. After it no vote can be
+      // added, so the votes cast are final, revealed, and decide the case.
+      const reviewClosed = challenge.reviewOver === true;
+      const summary = summarizeReviews(allReviews, { closed: reviewClosed });
+      const revealed = summary.submitted === REVIEW_COUNT || reviewClosed;
+      // `librarian` is an unsigned query parameter, so anyone can pass any
+      // wallet. Before the reveal it may only learn THAT the wallet voted, never
+      // how: the set of active librarians is public on-chain, and naming each one
+      // in turn would otherwise unblind every vote.
+      let ownVote = null;
+      if (ownReview) {
+        ownVote = revealed
+          ? { vote: ownReview.vote, rationale: ownReview.rationale, reviewedAt: ownReview.reviewedAt }
+          : { submitted: true, reviewedAt: ownReview.reviewedAt };
+      }
       return {
         ...toPublicUpload(row),
         challenger: challenge.challenger,
         staker,
         challengeReason: challenge.reason,
         challengedAt: challenge.challengedAt,
-        challengePeriodEnds: challenge.challengePeriodEnds,
+        reviewEndsAt: challenge.reviewEndsAt,
         review: {
           ...summary,
-          ownVote: ownReview ? { vote: ownReview.vote, rationale: ownReview.rationale, reviewedAt: ownReview.reviewedAt } : null,
+          ownVote,
           ballots: revealed
             ? allReviews.map(({ librarian: reviewer, vote, rationale, reviewedAt }) => ({ reviewer, vote, rationale, reviewedAt }))
             : null,
@@ -393,6 +410,11 @@ async function submitChallengeReview(req, res, next) {
     }
     if (!stake.challenge || stake.challenge.resolved) {
       return res.status(409).json({ error: 'challenge_resolved', message: 'This challenge is already resolved on-chain.' });
+    }
+    // Votes close with the review period, the same deadline the Lit Action puts
+    // on reading the book: nobody can vote on what they can no longer open.
+    if (stake.challenge.reviewOver !== false) {
+      return res.status(409).json({ error: 'review_closed', message: 'The 14-day review period for this challenge has ended.' });
     }
     if ([stake.challenge.challenger, stake.staker, row.uploader].some((address) => address && address.toLowerCase() === verified.librarian)) {
       return res.status(403).json({ error: 'conflicted_reviewer', message: 'The challenger and the book’s uploader/staker cannot review this challenge.' });
@@ -456,4 +478,5 @@ module.exports = {
   DEFAULT_LIMIT,
   CHUNK_SIZE,
   MOSTLY_TEXTLESS_RATIO,
+  settleInChunks,
 };

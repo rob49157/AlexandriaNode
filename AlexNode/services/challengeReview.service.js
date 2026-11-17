@@ -52,20 +52,36 @@ function verifyChallengeReview({ arweaveHash, vote, rationale, timestamp, signat
   return { ok: true, librarian: signer.toLowerCase(), vote, rationale: cleanRationale, message, signature };
 }
 
-function summarizeReviews(reviews) {
+/**
+ * Progress and, once decided, the recommendation for one challenge.
+ *
+ * Decided when all three reviews are in (2 of 3 wins), or when the challenge's
+ * 14-day review period has ended (`closed`) — then the majority of the votes
+ * actually cast wins, and a tie or no vote at all dismisses the challenge: it is
+ * the challenge that has to be made out, and the archivist should not wait on
+ * reviewers who never came. Until decided, directions stay blind.
+ *
+ * @param {{ vote: string }[]} reviews  oldest first
+ * @param {{ closed?: boolean }} [options]
+ */
+function summarizeReviews(reviews, { closed = false } = {}) {
   const countedReviews = reviews.slice(0, REVIEW_COUNT);
   const summary = {
     submitted: countedReviews.length,
     required: REVIEW_COUNT,
+    closed,
     consensus: null,
     votes: null,
   };
-  if (countedReviews.length < REVIEW_COUNT) return summary;
+  if (countedReviews.length < REVIEW_COUNT && !closed) return summary;
 
   const uphold = countedReviews.filter((review) => review.vote === 'uphold').length;
   const dismiss = countedReviews.length - uphold;
   summary.votes = { uphold, dismiss };
-  summary.consensus = uphold >= CONSENSUS_COUNT ? 'uphold' : 'dismiss';
+  summary.consensus =
+    countedReviews.length === REVIEW_COUNT
+      ? uphold >= CONSENSUS_COUNT ? 'uphold' : 'dismiss'
+      : uphold > dismiss ? 'uphold' : 'dismiss';
   return summary;
 }
 

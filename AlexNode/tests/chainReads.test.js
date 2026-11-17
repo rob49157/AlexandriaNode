@@ -815,6 +815,23 @@ async function testChainService() {
   const staked = await chainService.getStakeStatus(HASH_A);
   assert(staked.stakeAmount === '100000000000000000000', 'stake amounts stay exact as strings');
   assert(staked.stakeAmountAlex === '100.0', 'stake amounts are also formatted in whole ALEX');
+  assert(staked.challenge === null, 'an unchallenged stake reports no challenge');
+
+  // A challenge gets 14 days of review counted from the challenge, not the stake.
+  const nowSec = Math.floor(Date.now() / 1000);
+  chain.challenges.set(HASH_A, { challenger: LIBRARIAN, timestamp: nowSec - 3 * 86_400, resolved: false, reason: 'r' });
+  const fresh = (await chainService.getStakeStatus(HASH_A)).challenge;
+  assert(
+    fresh.reviewOver === false &&
+      fresh.reviewEndsAt === new Date((nowSec + 11 * 86_400) * 1000).toISOString(),
+    'a challenge three days old has eleven days of review left, even though the stake window closed long ago'
+  );
+  chain.challenges.set(HASH_A, { challenger: LIBRARIAN, timestamp: nowSec - 15 * 86_400, resolved: false, reason: 'r' });
+  assert(
+    (await chainService.getStakeStatus(HASH_A)).challenge.reviewOver === true,
+    'fifteen days after the challenge, its review period is over'
+  );
+  chain.challenges.delete(HASH_A);
 
   // Rent paused: the view reverts, and that must not read as a plain "no".
   chain.rentPaused = true;

@@ -16,6 +16,7 @@
     "test:unlock": "node tests/unlockRelay.test.js",
     "test:seal": "node tests/litSeal.test.js",
     "test:challenge-review": "node tests/challengeReview.test.js",
+    "test:archivist": "node tests/archivistUploads.test.js",
     "benchmark:pdf": "node scripts/benchmark-pdf.js",
     "prisma:migrate": "prisma migrate dev"
   },

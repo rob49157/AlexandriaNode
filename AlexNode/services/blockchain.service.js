@@ -193,6 +193,12 @@ async function getStakeStatus(arweaveHash) {
   const challengeEndsAt = stakedAt + period;
   const challenger = challenge.challenger;
   const hasChallenge = challenger && challenger !== ethers.ZeroAddress;
+  // A challenge gets its own CHALLENGE_PERIOD of review, counted from the
+  // challenge itself: librarians may read and vote until then (the decryption
+  // Lit Action enforces the same deadline on the chain's clock).
+  // A missing timestamp makes the deadline 1970, i.e. closed: fail closed.
+  const challengedAtSeconds = hasChallenge ? toNumberSeconds(challenge.timestamp) || 0 : 0;
+  const reviewEndsAt = challengedAtSeconds + period;
 
   return {
     staked: true,
@@ -213,6 +219,8 @@ async function getStakeStatus(arweaveHash) {
           reason: challenge.reason,
           resolved: Boolean(challenge.resolved),
           challengedAt: toIsoOrNull(challenge.timestamp),
+          reviewEndsAt: toIsoOrNull(reviewEndsAt),
+          reviewOver: Math.floor(Date.now() / 1000) >= reviewEndsAt,
         }
       : null,
   };

@@ -103,7 +103,15 @@ class ChainError extends Error {
   }
 }
 
-const chain = { rentals: new Set(), paused: false, down: false, librarians: new Set(), unstaked: new Set() };
+const chain = {
+  rentals: new Set(),
+  paused: false,
+  down: false,
+  librarians: new Set(),
+  unstaked: new Set(),
+  windowClosed: new Set(), // hashes whose 14-day challenge window has passed
+  challenges: new Map(), // hash → { challenger, resolved, reviewOver }, as getStakeStatus reports it
+};
 
 stub('../services/blockchain.service', {
   ChainError,
@@ -121,7 +129,13 @@ stub('../services/blockchain.service', {
   getStakeStatus: async (hash) =>
     chain.unstaked.has(hash)
       ? { staked: false, active: false, challenge: null }
-      : { staked: true, active: true, challengePeriodOver: false, staker: ARCHIVIST.address },
+      : {
+          staked: true,
+          active: true,
+          challengePeriodOver: chain.windowClosed.has(hash),
+          staker: ARCHIVIST.address,
+          challenge: chain.challenges.get(hash) || null,
+        },
   getBookRental: async () => ({}),
   getUploadOnChain: async () => ({ registered: false }),
 });
@@ -152,6 +166,8 @@ const { buildUnlockMessage, sha256Hex } = require('../services/unlockAuth.servic
 const ARCHIVIST = Wallet.createRandom();
 const READER = Wallet.createRandom();
 const STRANGER = Wallet.createRandom();
+const LIBRARIAN = Wallet.createRandom();
+const CHALLENGER = Wallet.createRandom();
 
 const HASH = 'lNpEgp90sz5PoJZkJO0TxPM35psezksrtPsZnTOjPRc';
 const OTHER_HASH = '0Nefi7adj5CU0hIYhDsRF3XXT1LGAUwB4i0rfDjSMCA';
@@ -252,6 +268,8 @@ function reset() {
   chain.down = false;
   chain.librarians = new Set();
   chain.unstaked = new Set();
+  chain.windowClosed = new Set();
+  chain.challenges = new Map();
   rows.clear();
   rows.set(HASH, { arweaveHash: HASH, uploader: ARCHIVIST.address, status: 'pending', litEncryptedKeyId: SEALED });
   rows.set(OTHER_HASH, { arweaveHash: OTHER_HASH, uploader: ARCHIVIST.address, status: 'approved', litEncryptedKeyId: OTHER_SEALED });
@@ -526,6 +544,56 @@ async function run() {
       unstaked.res.statusCode === 403 && unstaked.res.body.error === 'stake_required' &&
         unstaked.forwarded === 0 && lit.cidCalls === 0 && lit.creditCalls === 0,
       '33b. an uploader who never staked the book gets 403 stake_required, and nothing is spent'
+    );
+  }
+
+  // The relay checks the same review door the Action opens (Action invariant 9),
+  // so a librarian it forwards is one the Action will let in, and one it would
+  // refuse costs no Lit credit.
+  section('A librarian reviewing a book');
+  {
+    const asLibrarian = async (setup) => {
+      reset();
+      chain.librarians.add(LIBRARIAN.address.toLowerCase());
+      lit.respond = async () => ({ response: { wrappedKey: WRAPPED, grantedVia: 'librarian_review' }, has_error: false });
+      setup();
+      return call(await body({ wallet: LIBRARIAN }));
+    };
+    const forwardedAsReview = ({ res, forwarded }) =>
+      res.statusCode === 200 && res.body.grantedVia === 'librarian_review' && forwarded === 1;
+    const refusedForFree = ({ res, forwarded }) =>
+      res.statusCode === 403 && res.body.error === 'no_active_rental' &&
+      forwarded === 0 && lit.cidCalls === 0 && lit.creditCalls === 0;
+
+    assert(
+      forwardedAsReview(await asLibrarian(() => {})),
+      '40. an active librarian is forwarded for a book still inside its challenge window'
+    );
+    assert(
+      refusedForFree(await asLibrarian(() => chain.windowClosed.add(HASH))),
+      '41. once an unchallenged book\'s window closes, the librarian is refused, and nothing is spent'
+    );
+    assert(
+      forwardedAsReview(await asLibrarian(() => {
+        rows.get(HASH).status = 'challenged';
+        chain.windowClosed.add(HASH);
+        chain.challenges.set(HASH, { challenger: CHALLENGER.address, resolved: false, reviewOver: false });
+      })),
+      "42. a challenged book stays open to librarians for 14 days from the challenge, past the stake's window"
+    );
+    assert(
+      refusedForFree(await asLibrarian(() => {
+        rows.get(HASH).status = 'challenged';
+        chain.challenges.set(HASH, { challenger: CHALLENGER.address, resolved: true, reviewOver: false });
+      })),
+      '43. once the challenge is resolved, the librarian is refused, and nothing is spent'
+    );
+    assert(
+      refusedForFree(await asLibrarian(() => {
+        rows.get(HASH).status = 'challenged';
+        chain.challenges.set(HASH, { challenger: CHALLENGER.address, resolved: false, reviewOver: true });
+      })),
+      '44. once its 14-day review period ends, an unresolved challenge is closed to librarians too, and nothing is spent'
     );
   }
 
