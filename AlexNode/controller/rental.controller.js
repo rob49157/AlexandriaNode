@@ -5,8 +5,10 @@
 // Action owns whether a key is ever released. See getDecryptParams below for
 // why that distinction is what makes this route safe to serve.
 
+const { ethers } = require('ethers');
 const prisma = require('../config/db');
 const { isValidArweaveHash } = require('./arweave');
+const { toPublicUpload, PUBLIC_UPLOAD_SELECT } = require('./upload.controller');
 const { isValidWalletAddress } = require('../middleware/auth.middleware');
 const {
   isRentalActive,
@@ -328,10 +330,86 @@ async function getBookRentalInfo(req, res, next) {
   }
 }
 
+// The most rentals one renter listing returns, newest first.
+const RENTER_LIMIT = 200;
+
+// GET /api/rental/renter/:address
+//
+// Every rental this wallet made, newest first, for the Reader dashboard: what
+// it is renting now and what it rented before. Read from the BookRented events
+// the listener mirrors into Postgres (services/eventListener.service.js), not
+// from the chain: Rent.sol keeps rentals[hash][renter] per book and cannot be
+// listed by renter.
+//
+// Each event's expiry is exactly what Rent.rentBook() stored, and rentBook()
+// refuses a second rental of a book while one is active, so "expiry in the
+// future" is "rented now". Informational only, like the rest of this file: the
+// Reader's decrypt-params check and the Lit Action decide access, so a
+// blacklisted renter still listed here is refused when they open the book.
+//
+// No new exposure: renter is an indexed topic of BookRented, so every wallet's
+// rentals are already public on-chain.
+async function getRenterRentals(req, res, next) {
+  const { address } = req.params;
+  if (!isValidWalletAddress(address)) {
+    return badRequest(res, 'invalid_address', 'address must be a valid Ethereum address.');
+  }
+
+  try {
+    const events = await prisma.event.findMany({
+      where: {
+        contract: 'rent',
+        eventName: 'BookRented',
+        // ethers decodes addresses checksummed, and the listener stores them as decoded.
+        args: { path: ['renter'], equals: ethers.getAddress(address) },
+      },
+      select: { arweaveHash: true, args: true, timestamp: true, transactionHash: true },
+      orderBy: [{ blockNumber: 'desc' }, { logIndex: 'desc' }],
+      take: RENTER_LIMIT,
+    });
+
+    // A book the listener could not resolve to a hash has nothing to open or link.
+    const resolved = events.filter((e) => e.arweaveHash);
+    const rows = resolved.length
+      ? await prisma.upload.findMany({
+          where: { arweaveHash: { in: [...new Set(resolved.map((e) => e.arweaveHash))] } },
+          select: PUBLIC_UPLOAD_SELECT,
+        })
+      : [];
+    const bookByHash = new Map(rows.map((row) => [row.arweaveHash, toPublicUpload(row)]));
+
+    const now = Date.now();
+    const rentals = resolved.map((e) => {
+      // uint256 seconds, stored as decimal strings (BigInt is not JSON).
+      const expiryMs = Number(e.args.expiry) * 1000;
+      return {
+        arweaveHash: e.arweaveHash,
+        book: bookByHash.get(e.arweaveHash) || null,
+        rentedAt: e.timestamp,
+        expiry: new Date(expiryMs).toISOString(),
+        durationDays: Number(e.args.duration) / 86_400,
+        active: expiryMs > now,
+        transactionHash: e.transactionHash,
+      };
+    });
+
+    return res.json({
+      address,
+      rentals,
+      activeCount: rentals.filter((r) => r.active).length,
+      total: rentals.length,
+      unresolved: events.length - resolved.length,
+    });
+  } catch (err) {
+    return handleChainError(err, res, next);
+  }
+}
+
 module.exports = {
   getRentalStatus,
   getDecryptParams,
   getBookRentalInfo,
+  getRenterRentals,
   checkReadAccess,
   notRegisteredMessage,
   NOT_REGISTERED_STATUSES,
