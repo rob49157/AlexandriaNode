@@ -203,6 +203,37 @@ async function getRentalStatus(req, res, next) {
   }
 }
 
+
+ *
+ * @param {string} arweaveHash
+ * @param {string} address     renter, any case
+ * @param {number|null} expiryUnix  Rent.rentals(hash, renter), in seconds
+ * @returns {Promise<string|null>}
+ */
+async function findRentalTxHash(arweaveHash, address, expiryUnix) {
+  if (!expiryUnix) return null;
+  try {
+    const event = await prisma.event.findFirst({
+      where: {
+        contract: 'rent',
+        eventName: 'BookRented',
+        arweaveHash,
+        AND: [
+          // As the listener stores them: the renter checksummed, uint256 as decimal strings.
+          { args: { path: ['renter'], equals: ethers.getAddress(address) } },
+          { args: { path: ['expiry'], equals: String(expiryUnix) } },
+        ],
+      },
+      select: { transactionHash: true },
+      orderBy: [{ blockNumber: 'desc' }, { logIndex: 'desc' }],
+    });
+    return event ? event.transactionHash : null;
+  } catch (err) {
+    console.warn(`[rental] rental tx lookup failed for ${arweaveHash}: ${err.message}`);
+    return null;
+  }
+}
+
 // GET /api/rental/decrypt-params/:arweaveHash/:address
 //
 // Serves the material the frontend needs to attempt decryption: the sealed
@@ -284,11 +315,18 @@ async function getDecryptParams(req, res, next) {
       });
     }
 
+    // Only the rental door has a rental transaction. BookRented is public
+    // (renter is an indexed topic), so this exposes nothing new.
+    const rentalTxHash = access.grantedVia === 'rental'
+      ? await findRentalTxHash(row.arweaveHash, params.address, access.rental.expiryUnix)
+      : null;
+
     return res.json({
       arweaveHash: row.arweaveHash,
       status: row.status,
       grantedVia: access.grantedVia,
       expiry: access.rental ? access.rental.expiry : null,
+      rentalTxHash,
       // The sealed envelope { v, k, arweaveHash } and Lit's integrity hash for
       // it. Handed to the Lit Action, never opened here — the backend is not in
       // the decryption path and holds nothing that could open it.

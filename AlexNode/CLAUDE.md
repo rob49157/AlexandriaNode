@@ -534,7 +534,13 @@ GET /api/rental/book/:arweaveHash
 
 GET /api/rental/decrypt-params/:arweaveHash/:address
   - Rental-gated. Returns: { litEncryptedKeyId, litDataToEncryptHash,
-    encryptionIv, encryptionAuthTag, grantedVia: "rental"|"uploader" }
+    encryptionIv, encryptionAuthTag, grantedVia: "rental"|"uploader"|"librarian_review",
+    expiry, rentalTxHash }
+  - rentalTxHash: the BookRented transaction of the current rental, for the
+    Reader's watermark. Looked up in the indexed events, matched on the expiry
+    Rent.sol holds now (rentBook() allows one active rental per book and renter),
+    so it is never an earlier rental's. null for the other doors, until the
+    listener has indexed the rental, or if the lookup fails: never blocks reading.
   - ⚠️ NOT the security boundary. `address` is unauthenticated, so anyone can name
     a wallet holding a valid rental. Acceptable only because everything served is
     inert: the key is sealed in a Lit PKP envelope released solely by the Lit
