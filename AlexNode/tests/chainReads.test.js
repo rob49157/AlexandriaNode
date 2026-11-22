@@ -352,6 +352,16 @@ stub('../config/db', {
       return db.events.get(key);
     },
     count: async () => db.events.size,
+    // Postgres JSON path equality on args, as decrypt-params' rental tx lookup uses it.
+    findFirst: async (args) => {
+      db.calls.push({ op: 'event.findFirst', args });
+      if (db.failEventLookup) throw new Error('connection terminated');
+      const w = args.where;
+      const argsMatch = (e) => (w.AND || []).every((c) => e.args && e.args[c.args.path[0]] === c.args.equals);
+      return [...db.events.values()]
+        .filter((e) => e.contract === w.contract && e.eventName === w.eventName && e.arweaveHash === w.arweaveHash && argsMatch(e))
+        .sort((a, b) => b.blockNumber - a.blockNumber || b.logIndex - a.logIndex)[0] ?? null;
+    },
   },
   syncState: {
     findUnique: async (args) => db.syncState.get(args.where.id) ?? null,
@@ -900,6 +910,46 @@ async function testControllers() {
     'the payload carries the sealed key plus both AES-GCM parameters'
   );
 
+  // The rental transaction the Reader prints in its watermark: the BookRented
+  // event of THIS rental, as the listener stores it (renter checksummed, uint256
+  // as decimal strings), matched on the expiry Rent.sol holds now.
+  assert(
+    r.res.body.rentalTxHash === null,
+    'a rental the listener has not indexed yet has rentalTxHash null, and still unlocks'
+  );
+  const activeExpiry = chain.rentals.get(`${HASH_A}:${READER.toLowerCase()}`);
+  const indexRental = (tx, { renter = READER, expiry, block, arweaveHash = HASH_A }) =>
+    db.events.set(`${tx}:0`, {
+      eventName: 'BookRented', contract: 'rent', arweaveHash,
+      args: { renter: ethers.getAddress(renter), expiry: String(expiry), duration: '604800' },
+      blockNumber: block, logIndex: 0, transactionHash: tx, timestamp: new Date(),
+    });
+  const TX_EARLIER = '0x' + 'a1'.repeat(32);
+  const TX_CURRENT = '0x' + 'b2'.repeat(32);
+  indexRental(TX_EARLIER, { expiry: activeExpiry - 30 * 86_400, block: 100 }); // an earlier rental of the same book
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: READER });
+  assert(
+    r.res.statusCode === 200 && r.res.body.rentalTxHash === null,
+    "while this rental is not indexed yet, an earlier rental's transaction is never named instead"
+  );
+  indexRental(TX_CURRENT, { expiry: activeExpiry, block: 200 });
+  indexRental('0x' + 'c3'.repeat(32), { renter: LIBRARIAN, expiry: activeExpiry, block: 300 }); // someone else's, same expiry
+  indexRental('0x' + 'd4'.repeat(32), { expiry: activeExpiry, block: 400, arweaveHash: HASH_B }); // another book, same expiry
+
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: READER.toLowerCase() });
+  assert(
+    r.res.statusCode === 200 && r.res.body.rentalTxHash === TX_CURRENT,
+    "decrypt params names this rental's transaction: not an earlier rental, another reader's or another book's"
+  );
+
+  db.failEventLookup = true;
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: READER });
+  db.failEventLookup = false;
+  assert(
+    r.res.statusCode === 200 && r.res.body.rentalTxHash === null && r.res.body.litEncryptedKeyId === 'SEALED_KEY_CIPHERTEXT',
+    'a failed rental tx lookup still unlocks, with rentalTxHash null: the watermark never blocks reading'
+  );
+
   // The archivist can never rent their own book — rentBook() forbids it — so
   // the uploader must be let through explicitly or they lose their own upload.
   // But only once they have staked it: registration is automatic, and an
@@ -917,6 +967,7 @@ async function testControllers() {
     r.res.statusCode === 200 && r.res.body.grantedVia === 'uploader',
     'the uploader is granted their own staked book without a rental'
   );
+  assert(r.res.body.rentalTxHash === null, 'the uploader door has no rental transaction');
 
   // unstake() only clears `active`; the staker record stays, so an approved
   // book stays readable by the archivist who staked it.
