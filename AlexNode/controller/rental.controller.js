@@ -203,6 +203,7 @@ async function getRentalStatus(req, res, next) {
   }
 }
 
+/**
 
  *
  * @param {string} arweaveHash
