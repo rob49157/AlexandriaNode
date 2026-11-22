@@ -4,6 +4,7 @@ const {
   getRentalStatus,
   getDecryptParams,
   getBookRentalInfo,
+  getRenterRentals,
 } = require('../controller/rental.controller');
 const { unlockKey } = require('../controller/unlock.controller');
 
@@ -16,6 +17,11 @@ router.get('/rental/status/:arweaveHash/:address', getRentalStatus);
 // GET /api/rental/book/:arweaveHash
 // Price, delisting, and whether the book is rentable at all.
 router.get('/rental/book/:arweaveHash', getBookRentalInfo);
+
+// GET /api/rental/renter/:address
+// Every rental this wallet made, newest first: active ones and past ones.
+// From the indexed BookRented events. Informational, not an access check.
+router.get('/rental/renter/:address', getRenterRentals);
 
 // GET /api/rental/decrypt-params/:arweaveHash/:address
 // Rental-gated. Serves the sealed key envelope + AES-GCM parameters.

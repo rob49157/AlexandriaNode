@@ -16,6 +16,7 @@
 //   1-10.  decodeLog: real encoding, indexed-string handling, arg serialization
 //  11-17.  resolveHashes: topic → hash via the index, and via getUploaderHashes
 //  18-26.  persist: status transitions, no downgrades, idempotent replay
+//  26a-g.  persist: catalogue columns from Staked, BookPriceSet, BookDelisted
 //  27-32.  syncRange / cursor handling
 //  33-41.  blockchain.service: revert vs. network failure translation
 //  42-53.  rental + stake + chain controllers
@@ -351,6 +352,16 @@ stub('../config/db', {
       return db.events.get(key);
     },
     count: async () => db.events.size,
+    // Postgres JSON path equality on args, as decrypt-params' rental tx lookup uses it.
+    findFirst: async (args) => {
+      db.calls.push({ op: 'event.findFirst', args });
+      if (db.failEventLookup) throw new Error('connection terminated');
+      const w = args.where;
+      const argsMatch = (e) => (w.AND || []).every((c) => e.args && e.args[c.args.path[0]] === c.args.equals);
+      return [...db.events.values()]
+        .filter((e) => e.contract === w.contract && e.eventName === w.eventName && e.arweaveHash === w.arweaveHash && argsMatch(e))
+        .sort((a, b) => b.blockNumber - a.blockNumber || b.logIndex - a.logIndex)[0] ?? null;
+    },
   },
   syncState: {
     findUnique: async (args) => db.syncState.get(args.where.id) ?? null,
@@ -646,6 +657,61 @@ async function testPersist() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 26a-g. persist + catalogue columns
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function testCatalogue() {
+  section('persist — catalogue columns from stake and rent events');
+  const ALEX = 10n ** 18n;
+
+  reset();
+  db.uploads = [makeUploadRow({ status: 'pending' })];
+  const blockTime = new Date('2026-10-24T14:49:38Z');
+  const staked = listener.decodeLog(makeLog('stake', 'Staked', [HASH_A, ARCHIVIST, 100n * ALEX], { blockNumber: 42_800_001 }));
+  await listener.persist([staked], new Map([[staked.blockNumber, blockTime]]));
+  assert(db.uploads[0].stakedAt.getTime() === blockTime.getTime(), 'Staked sets stakedAt to the block time');
+  assert(db.uploads[0].status === 'pending', 'Staked leaves status alone: the library owns it');
+
+  // No block time: the contract's own stake timestamp, never "now".
+  reset();
+  db.uploads = [makeUploadRow({ status: 'pending' })];
+  chain.stakes.set(HASH_A, { staker: ARCHIVIST, amount: (100n * ALEX).toString(), timestamp: 1_761_317_378, active: true });
+  const stakedNoTime = listener.decodeLog(makeLog('stake', 'Staked', [HASH_A, ARCHIVIST, 100n * ALEX]));
+  await listener.persist([stakedNoTime], new Map());
+  assert(
+    db.uploads[0].stakedAt.toISOString() === new Date(1_761_317_378 * 1000).toISOString(),
+    'without a block time, stakedAt comes from stake.getStakeStatus'
+  );
+
+  // Two prices handed over out of order: the newest block wins.
+  reset();
+  db.uploads = [makeUploadRow({ status: 'approved' })];
+  const older = listener.decodeLog(makeLog('rent', 'BookPriceSet', [HASH_A, 3n * ALEX], { blockNumber: 42_800_005 }));
+  const newer = listener.decodeLog(makeLog('rent', 'BookPriceSet', [HASH_A, 7n * ALEX], { blockNumber: 42_800_009 }));
+  await listener.persist([newer, older], new Map());
+  assert(db.uploads[0].pricePerDay === (7n * ALEX).toString(), 'BookPriceSet stores atomic units as a string, newest wins');
+
+  // Replaying the same price log changes nothing.
+  await listener.persist([newer], new Map());
+  assert(db.uploads[0].pricePerDay === (7n * ALEX).toString(), 'replaying BookPriceSet is a no-op');
+
+  const delisted = listener.decodeLog(makeLog('rent', 'BookDelisted', [HASH_A]));
+  await listener.persist([delisted], new Map());
+  assert(db.uploads[0].delisted === true, 'BookDelisted marks the book delisted');
+  assert(db.uploads[0].status === 'approved', 'BookDelisted leaves status alone');
+
+  // A log for a book this backend does not know touches no row.
+  reset();
+  db.uploads = [makeUploadRow({ status: 'approved' })];
+  const stranger = listener.decodeLog(makeLog('rent', 'BookPriceSet', [HASH_B, 1n * ALEX]));
+  await listener.persist([stranger], new Map());
+  assert(
+    db.uploads[0].pricePerDay === undefined && !db.calls.some((c) => c.op === 'upload.updateMany'),
+    'an event for an unknown book updates nothing'
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 27-32. syncRange + cursor
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -759,6 +825,23 @@ async function testChainService() {
   const staked = await chainService.getStakeStatus(HASH_A);
   assert(staked.stakeAmount === '100000000000000000000', 'stake amounts stay exact as strings');
   assert(staked.stakeAmountAlex === '100.0', 'stake amounts are also formatted in whole ALEX');
+  assert(staked.challenge === null, 'an unchallenged stake reports no challenge');
+
+  // A challenge gets 14 days of review counted from the challenge, not the stake.
+  const nowSec = Math.floor(Date.now() / 1000);
+  chain.challenges.set(HASH_A, { challenger: LIBRARIAN, timestamp: nowSec - 3 * 86_400, resolved: false, reason: 'r' });
+  const fresh = (await chainService.getStakeStatus(HASH_A)).challenge;
+  assert(
+    fresh.reviewOver === false &&
+      fresh.reviewEndsAt === new Date((nowSec + 11 * 86_400) * 1000).toISOString(),
+    'a challenge three days old has eleven days of review left, even though the stake window closed long ago'
+  );
+  chain.challenges.set(HASH_A, { challenger: LIBRARIAN, timestamp: nowSec - 15 * 86_400, resolved: false, reason: 'r' });
+  assert(
+    (await chainService.getStakeStatus(HASH_A)).challenge.reviewOver === true,
+    'fifteen days after the challenge, its review period is over'
+  );
+  chain.challenges.delete(HASH_A);
 
   // Rent paused: the view reverts, and that must not read as a plain "no".
   chain.rentPaused = true;
@@ -827,6 +910,46 @@ async function testControllers() {
     'the payload carries the sealed key plus both AES-GCM parameters'
   );
 
+  // The rental transaction the Reader prints in its watermark: the BookRented
+  // event of THIS rental, as the listener stores it (renter checksummed, uint256
+  // as decimal strings), matched on the expiry Rent.sol holds now.
+  assert(
+    r.res.body.rentalTxHash === null,
+    'a rental the listener has not indexed yet has rentalTxHash null, and still unlocks'
+  );
+  const activeExpiry = chain.rentals.get(`${HASH_A}:${READER.toLowerCase()}`);
+  const indexRental = (tx, { renter = READER, expiry, block, arweaveHash = HASH_A }) =>
+    db.events.set(`${tx}:0`, {
+      eventName: 'BookRented', contract: 'rent', arweaveHash,
+      args: { renter: ethers.getAddress(renter), expiry: String(expiry), duration: '604800' },
+      blockNumber: block, logIndex: 0, transactionHash: tx, timestamp: new Date(),
+    });
+  const TX_EARLIER = '0x' + 'a1'.repeat(32);
+  const TX_CURRENT = '0x' + 'b2'.repeat(32);
+  indexRental(TX_EARLIER, { expiry: activeExpiry - 30 * 86_400, block: 100 }); // an earlier rental of the same book
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: READER });
+  assert(
+    r.res.statusCode === 200 && r.res.body.rentalTxHash === null,
+    "while this rental is not indexed yet, an earlier rental's transaction is never named instead"
+  );
+  indexRental(TX_CURRENT, { expiry: activeExpiry, block: 200 });
+  indexRental('0x' + 'c3'.repeat(32), { renter: LIBRARIAN, expiry: activeExpiry, block: 300 }); // someone else's, same expiry
+  indexRental('0x' + 'd4'.repeat(32), { expiry: activeExpiry, block: 400, arweaveHash: HASH_B }); // another book, same expiry
+
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: READER.toLowerCase() });
+  assert(
+    r.res.statusCode === 200 && r.res.body.rentalTxHash === TX_CURRENT,
+    "decrypt params names this rental's transaction: not an earlier rental, another reader's or another book's"
+  );
+
+  db.failEventLookup = true;
+  r = await call(getDecryptParams, { arweaveHash: HASH_A, address: READER });
+  db.failEventLookup = false;
+  assert(
+    r.res.statusCode === 200 && r.res.body.rentalTxHash === null && r.res.body.litEncryptedKeyId === 'SEALED_KEY_CIPHERTEXT',
+    'a failed rental tx lookup still unlocks, with rentalTxHash null: the watermark never blocks reading'
+  );
+
   // The archivist can never rent their own book — rentBook() forbids it — so
   // the uploader must be let through explicitly or they lose their own upload.
   // But only once they have staked it: registration is automatic, and an
@@ -844,6 +967,7 @@ async function testControllers() {
     r.res.statusCode === 200 && r.res.body.grantedVia === 'uploader',
     'the uploader is granted their own staked book without a rental'
   );
+  assert(r.res.body.rentalTxHash === null, 'the uploader door has no rental transaction');
 
   // unstake() only clears `active`; the staker record stays, so an approved
   // book stays readable by the archivist who staked it.
@@ -1048,6 +1172,7 @@ async function main() {
   await testDecoding();
   await testResolution();
   await testPersist();
+  await testCatalogue();
   await testSync();
   await testChainService();
   await testControllers();

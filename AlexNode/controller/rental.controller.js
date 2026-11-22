@@ -5,8 +5,10 @@
 // Action owns whether a key is ever released. See getDecryptParams below for
 // why that distinction is what makes this route safe to serve.
 
+const { ethers } = require('ethers');
 const prisma = require('../config/db');
 const { isValidArweaveHash } = require('./arweave');
+const { toPublicUpload, PUBLIC_UPLOAD_SELECT } = require('./upload.controller');
 const { isValidWalletAddress } = require('../middleware/auth.middleware');
 const {
   isRentalActive,
@@ -24,11 +26,21 @@ function badRequest(res, reason, message) {
 /**
  * May this wallet open a book as a librarian reviewing it?
  *
- * Three on-chain facts, all of which AlexandriaStake.challengeUpload() requires
- * too: the caller is an active librarian, the book has an active stake, and the
- * 14-day window has not closed. The book's own uploader is excluded because the
- * uploader carve-out has already answered for them, and a librarian cannot
- * challenge their own upload in any case.
+ * The caller is an active librarian and the book has an active stake, then one
+ * of two cases, the same two the decryption Lit Action opens (invariant 9):
+ *
+ *   not challenged — the 14-day window is still open, as
+ *                    AlexandriaStake.challengeUpload() requires.
+ *   challenged     — the challenge is not resolved, and its own 14-day review
+ *                    period (CHALLENGE_PERIOD from the challenge, not from the
+ *                    stake) is still running. The three independent reviewers
+ *                    must read what they vote on; voting closes at the same time.
+ *
+ * A challenge on record means the library status is Challenged: challengeUpload()
+ * writes both, and resolveChallenge() marks it resolved as it moves the status on.
+ *
+ * The book's own uploader is excluded because the uploader carve-out has already
+ * answered for them, and a librarian cannot challenge their own upload in any case.
  *
  * Fails closed: an unreadable chain denies review rather than granting it.
  *
@@ -42,14 +54,11 @@ async function isLibrarianReviewAllowed(arweaveHash, address) {
     if (!librarian.active) return false;
 
     const stake = await getStakeStatus(arweaveHash);
+    if (!stake.staked || !stake.active || !stake.staker) return false;
+    if (stake.staker.toLowerCase() === address.toLowerCase()) return false;
 
-    return Boolean(
-      stake.staked &&
-        stake.active &&
-        !stake.challengePeriodOver &&
-        stake.staker &&
-        stake.staker.toLowerCase() !== address.toLowerCase()
-    );
+    if (stake.challenge) return stake.challenge.resolved === false && stake.challenge.reviewOver === false;
+    return stake.challengePeriodOver === false;
   } catch (err) {
     return false;
   }
@@ -110,10 +119,10 @@ async function checkReadAccess(row, address) {
   if (rental.available === false) return { allowed: false, unavailable: true, rental };
   if (rental.active) return { allowed: true, grantedVia: 'rental', rental };
 
-  // A book in its challenge window is not rentable — Rent.rentBook() requires
-  // Approved status — so a librarian who has to read it before challenging
-  // cannot buy access even in good faith. Mirrors the preconditions of
-  // AlexandriaStake.challengeUpload(), and closes when the window does.
+  // A book that is not Approved is not rentable — Rent.rentBook() requires it —
+  // so a librarian who has to read it before challenging, or to review a
+  // challenge, cannot buy access even in good faith. Open while the book is
+  // challengeable, and for 14 days after a challenge while it is unresolved.
   if (await isLibrarianReviewAllowed(row.arweaveHash, address)) {
     return { allowed: true, grantedVia: 'librarian_review', rental };
   }
@@ -191,6 +200,38 @@ async function getRentalStatus(req, res, next) {
     });
   } catch (err) {
     return handleChainError(err, res, next);
+  }
+}
+
+/**
+
+ *
+ * @param {string} arweaveHash
+ * @param {string} address     renter, any case
+ * @param {number|null} expiryUnix  Rent.rentals(hash, renter), in seconds
+ * @returns {Promise<string|null>}
+ */
+async function findRentalTxHash(arweaveHash, address, expiryUnix) {
+  if (!expiryUnix) return null;
+  try {
+    const event = await prisma.event.findFirst({
+      where: {
+        contract: 'rent',
+        eventName: 'BookRented',
+        arweaveHash,
+        AND: [
+          // As the listener stores them: the renter checksummed, uint256 as decimal strings.
+          { args: { path: ['renter'], equals: ethers.getAddress(address) } },
+          { args: { path: ['expiry'], equals: String(expiryUnix) } },
+        ],
+      },
+      select: { transactionHash: true },
+      orderBy: [{ blockNumber: 'desc' }, { logIndex: 'desc' }],
+    });
+    return event ? event.transactionHash : null;
+  } catch (err) {
+    console.warn(`[rental] rental tx lookup failed for ${arweaveHash}: ${err.message}`);
+    return null;
   }
 }
 
@@ -275,11 +316,18 @@ async function getDecryptParams(req, res, next) {
       });
     }
 
+    // Only the rental door has a rental transaction. BookRented is public
+    // (renter is an indexed topic), so this exposes nothing new.
+    const rentalTxHash = access.grantedVia === 'rental'
+      ? await findRentalTxHash(row.arweaveHash, params.address, access.rental.expiryUnix)
+      : null;
+
     return res.json({
       arweaveHash: row.arweaveHash,
       status: row.status,
       grantedVia: access.grantedVia,
       expiry: access.rental ? access.rental.expiry : null,
+      rentalTxHash,
       // The sealed envelope { v, k, arweaveHash } and Lit's integrity hash for
       // it. Handed to the Lit Action, never opened here — the backend is not in
       // the decryption path and holds nothing that could open it.
@@ -321,12 +369,89 @@ async function getBookRentalInfo(req, res, next) {
   }
 }
 
+// The most rentals one renter listing returns, newest first.
+const RENTER_LIMIT = 200;
+
+// GET /api/rental/renter/:address
+//
+// Every rental this wallet made, newest first, for the Reader dashboard: what
+// it is renting now and what it rented before. Read from the BookRented events
+// the listener mirrors into Postgres (services/eventListener.service.js), not
+// from the chain: Rent.sol keeps rentals[hash][renter] per book and cannot be
+// listed by renter.
+//
+// Each event's expiry is exactly what Rent.rentBook() stored, and rentBook()
+// refuses a second rental of a book while one is active, so "expiry in the
+// future" is "rented now". Informational only, like the rest of this file: the
+// Reader's decrypt-params check and the Lit Action decide access, so a
+// blacklisted renter still listed here is refused when they open the book.
+//
+// No new exposure: renter is an indexed topic of BookRented, so every wallet's
+// rentals are already public on-chain.
+async function getRenterRentals(req, res, next) {
+  const { address } = req.params;
+  if (!isValidWalletAddress(address)) {
+    return badRequest(res, 'invalid_address', 'address must be a valid Ethereum address.');
+  }
+
+  try {
+    const events = await prisma.event.findMany({
+      where: {
+        contract: 'rent',
+        eventName: 'BookRented',
+        // ethers decodes addresses checksummed, and the listener stores them as decoded.
+        args: { path: ['renter'], equals: ethers.getAddress(address) },
+      },
+      select: { arweaveHash: true, args: true, timestamp: true, transactionHash: true },
+      orderBy: [{ blockNumber: 'desc' }, { logIndex: 'desc' }],
+      take: RENTER_LIMIT,
+    });
+
+    // A book the listener could not resolve to a hash has nothing to open or link.
+    const resolved = events.filter((e) => e.arweaveHash);
+    const rows = resolved.length
+      ? await prisma.upload.findMany({
+          where: { arweaveHash: { in: [...new Set(resolved.map((e) => e.arweaveHash))] } },
+          select: PUBLIC_UPLOAD_SELECT,
+        })
+      : [];
+    const bookByHash = new Map(rows.map((row) => [row.arweaveHash, toPublicUpload(row)]));
+
+    const now = Date.now();
+    const rentals = resolved.map((e) => {
+      // uint256 seconds, stored as decimal strings (BigInt is not JSON).
+      const expiryMs = Number(e.args.expiry) * 1000;
+      return {
+        arweaveHash: e.arweaveHash,
+        book: bookByHash.get(e.arweaveHash) || null,
+        rentedAt: e.timestamp,
+        expiry: new Date(expiryMs).toISOString(),
+        durationDays: Number(e.args.duration) / 86_400,
+        active: expiryMs > now,
+        transactionHash: e.transactionHash,
+      };
+    });
+
+    return res.json({
+      address,
+      rentals,
+      activeCount: rentals.filter((r) => r.active).length,
+      total: rentals.length,
+      unresolved: events.length - resolved.length,
+    });
+  } catch (err) {
+    return handleChainError(err, res, next);
+  }
+}
+
 module.exports = {
   getRentalStatus,
   getDecryptParams,
   getBookRentalInfo,
+  getRenterRentals,
   checkReadAccess,
   notRegisteredMessage,
+  NOT_REGISTERED_STATUSES,
   STAKE_REQUIRED_MESSAGE,
   handleChainError,
   readParams,

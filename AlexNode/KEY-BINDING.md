@@ -12,7 +12,7 @@ Anyone writing or reviewing the decryption Lit Action needs to read this. The vu
 | Half | State |
 |---|---|
 | **Encrypt** — seal the hash into the key envelope | ✅ Done (`controller/litProtocol.js`). Since 2026-10-13 the hash is a direct Arweave L1 transaction id (see "Where the hash comes from"). |
-| **Decrypt** — gate on the sealed hash | ✅ Built in the frontend: `AlexandriaFrontEnd/Alexandria-Front-end/src/services/litAction.js`. **Rebuilt 2026-10-17** to the reviewed design: signed identity, session-bound release, two RPC providers, and (same day) an uploader door that needs the uploader's own stake. CID `QmQ7zqvwrHMhnKFTcmWRQuLhNR4wnrDcYGbmkycLV1eM9a`, not registered yet. Tested by `npm run test:lit-action`: 55 tests, including the negative test, #7. The backend relay is tested by `npm run test:unlock` (42 tests). Both suites were mutation-checked: planted bugs fail them. Every code-level checklist item is ticked; the live-account items are still open. |
+| **Decrypt** — gate on the sealed hash | ✅ Built in the frontend: `AlexandriaFrontEnd/Alexandria-Front-end/src/services/litAction.js`. **Rebuilt 2026-10-17** to the reviewed design: signed identity, session-bound release, two RPC providers, and (same day) an uploader door that needs the uploader's own stake. **Changed 2026-11-15:** a review door for challenged books, open for 14 days from the challenge (see "Review door for challenged books" below). New CID `QmWDjCWdssuZkzTWz1rTTNzW8PmV6EdXoZFS8MVpwRnHRE`, registered in group 2 "Alexandria decrypt" on 2026-11-15; the relay pins it once `LIT_DECRYPT_ACTION_CID` is switched from the previous `QmbyEYPoVPekP7CwYUo28gGJocbDi1YwHLep55beuUqjwi`. Tested by `npm run test:lit-action`: 67 tests, including the negative test, #7. The backend relay is tested by `npm run test:unlock` (47 tests). Both suites were mutation-checked: planted bugs fail them. Every code-level checklist item is ticked; the live-account items are still open. |
 | **Decrypt — live** | ❌ **Not working, and not safe to switch on as is.** Audited 2026-10-13: the Action is not registered, the frontend has no Lit settings, the reader's address is unauthenticated, and group 1 permits *any* action. See **[Build plan — rental decryption](#build-plan--rental-decryption)**. Re-checked live 2026-10-17: both holes reproduced, and the plan was amended (EIP-4361 message, session-bound release, backend relay, two RPC providers). See **[Review — 2026-10-17](#review--2026-10-17)**. |
 
 The decrypt half is where this can still go wrong. Every edit to the Action changes its IPFS CID and must re-pass the checklist and the negative test before `npm run lit:register`.
@@ -231,6 +231,7 @@ The negative test is the one that matters. Everything else can pass while the sy
 - [x] `pkpId` is a constant inside the Action, not trusted from `js_params`. *Test 28: every `Decrypt` used the constant, even when a `pkpId` param was passed.*
 - [x] No Lit key ships in the frontend bundle. *`VITE_LIT_*` removed; `lit.js` calls the backend relay.*
 - [x] The uploader door opens only for the wallet that staked the book: `getUploader(hash) == reader` **and** `stakes(hash).staker == reader`. *Tests 53 (never staked: denied), 54 (active stake: let in), 55 (a stake naming someone else: denied); 3, 4 and 10 run on an approved book whose stake was withdrawn, which still opens. Mirrored by the relay and decrypt-params (`stake_required`).*
+- [x] The librarian review door opens only for an **active librarian**, on a book with an **active stake**, that is either **Pending** inside its 14-day window or **Challenged** with a challenge on record (`challenges(hash).challenger ≠ 0x0`) that is **not resolved** and **less than 14 days old** (counted from the challenge). Every other status is refused, a challenge read that reverts denies, and both providers must agree. *Tests 15–23 (Pending), 56–67 (Challenged: 58 resolved, 59 no record, 63 unreadable, 64 Rejected, 65 providers disagree, 66 deadline passed, 67 lagging clock). Mirrored by the relay and decrypt-params (`isLibrarianReviewAllowed`; relay 40–44). Added 2026-11-15.*
 - [ ] No group on the account contains the `Any` action or the `0x000…` wallet (step D).
 - [ ] The reader key (`LIT_READER_API_KEY`, backend only) can execute in the decrypt group **only**, with no manage/create rights (step C).
 - [ ] A hand-written Action that calls `Lit.Actions.Decrypt` without any checks is **refused** by the live account (step E, test E5; R6 checks it early).
@@ -734,6 +735,39 @@ All new rules were mutation-checked: 20 planted bugs, each caught by the intende
   - The per-wallet rules stop honest overuse. New wallets get fresh per-wallet allowances, so only the shared budget limits a determined attacker.
   - Two uploads checked at the same instant can both pass, the same race as the wallet balance check.
   - The owner-door branch with a real stake runs only in simulation until step E.
+
+### Review door for challenged books, blind challenge votes (built 2026-11-15)
+
+**The hole.** A challenge is decided by three independent librarians (wallet-signed votes in `ChallengeReview`, a 2-of-3 recommendation the owner executes with `resolveChallenge()`). But the review door only opened for **Pending** books, and `challengeUpload()` moves the book to **Challenged**. So the reviewers could not open the book they were voting on. The relay's pre-check did not look at the status at all, so it forwarded those requests and spent a Lit credit on a certain refusal. That included a challenge already resolved, while the 14-day window was still open.
+
+**The rule now.** Action invariant 9: an active librarian, an active stake, and either Pending inside the window (unchanged) or Challenged with an unresolved challenge on record that is **less than `CHALLENGE_PERIOD` (14 days) old**. The clock starts at the challenge (`challenges(hash).timestamp`), not at the stake, so a challenge raised late in the stake's window still gets a full review. Access ends at that deadline, or earlier if `resolveChallenge()` runs. The grant is still `librarian_review`, so every page is watermarked as a review copy, and the browser still keeps a review key for one day at most (R3). After that, reopening asks for one signature.
+
+**Owner decisions (2026-11-15):**
+- The review period is 14 days from the challenge. Unbounded review "could take forever and is not fair to the people waiting".
+- At the deadline, both reading and voting close (`409 review_closed`).
+- With fewer than three votes at the deadline, the **majority of the votes cast** is the recommendation; a tie or no vote at all dismisses the challenge. Votes are revealed at the deadline, since none can be added after it.
+
+| Change | Where | Tests |
+|---|---|---|
+| Challenged branch in the review door: reads `challenges(hash)` → (challenger, timestamp, resolved, reason). Requires a non-zero challenger, `resolved === false`, and `timestamp + CHALLENGE_PERIOD > now` on the newer of the two chain clocks. Any other status is refused. | Action `readAccess` (`UPLOAD_STATUS_CHALLENGED = 1`) | Action 56–67 |
+| `getStakeStatus().challenge` gains `reviewEndsAt` and `reviewOver`, counted from the challenge. A missing timestamp reads as closed. | `services/blockchain.service.js` | chainReads (2 new) |
+| `isLibrarianReviewAllowed`: a challenge on record → allowed only while unresolved and before `reviewEndsAt`; otherwise the stake's window. A resolved or expired challenge is no longer forwarded. | `controller/rental.controller.js` (decrypt-params and relay) | relay 40–44 |
+| Voting closes at `reviewEndsAt`. A closed case stays listed (`review.closed`, `reviewEndsAt`) with its votes revealed and decided by majority of votes cast, until the owner resolves it. | `controller/librarian.controller.js`, `services/challengeReview.service.js` (`summarizeReviews(…, { closed })`); dashboard countdown and closed state in `LibrarianDashboard.jsx` | challengeReview (12 new assertions) |
+| `GET /api/librarian/challenges?librarian=` is unsigned, and returned that wallet's vote and rationale before the reveal. Anyone could name each active librarian (public on-chain) and unblind every vote. Before the reveal, `ownVote` is now `{ submitted: true, reviewedAt }`. | `controller/librarian.controller.js`; dashboard text in `LibrarianDashboard.jsx` | challengeReview (6 new assertions) |
+
+Mutation-checked: the old Action fails 56, 57 and 65; an Action that ignores `resolved` fails 58 and 65; one without the deadline fails 66 and 67; one counting the deadline from the stake fails 56, 57 and 65. The old relay gate fails 42 and 43; one ignoring `resolved` fails 43, one ignoring the deadline fails 44. The old controller fails the blind-vote assertion. Votes accepted after the deadline, a tie that upholds, and a deadline counted from the stake in `getStakeStatus` are each caught.
+
+**Still visible:** anyone can learn *whether* a wallet has voted on a challenge, but not how. Hiding that too needs a signed GET.
+
+**Rollout.** The relay forwards only code whose CID equals `LIT_DECRYPT_ACTION_CID`, so every unlock answers `400 action_not_permitted` from the moment the new frontend is served until both steps are done:
+1. ✅ **Done 2026-11-15.** Frontend: `npm run lit:register -- --register` (Lit key at the hidden prompt). This permits `QmWDjCWdssuZkzTWz1rTTNzW8PmV6EdXoZFS8MVpwRnHRE`. The previously live `QmbyEYPo…` grants strictly less, so it can stay permitted during the rollout. Group 2 "Alexandria decrypt" was listed afterwards and holds exactly:
+   - actions `0xd3f7abdc…7b8499f4` (keccak256 of `QmbyEYPo…`, old) and `0xf8045ab2…2e15d303` (keccak256 of `QmWDjC…`, new)
+   - wallet `0x371552a274c88976bfb7b13c46f0214b34fb8efe`, the PKP in `litAction.js` and `LIT_PKP_ID`
+   - no `Any`, no `0x0000…` wallet, no `QmQovTCV…` (`0xda1f01d6…c5425221`)
+2. Backend: set `LIT_DECRYPT_ACTION_CID=QmWDjCWdssuZkzTWz1rTTNzW8PmV6EdXoZFS8MVpwRnHRE` and restart.
+3. Later, once no old frontend is served: remove `QmbyEYPo…` from group 2.
+
+⚠️ **Never permit `QmQovTCV2yj4zYmXZsApfhp1pw4yZ4p4HbFRJ3xsEBKSBy`.** It was an intermediate build of this change, without the review deadline, so it is **more** permissive than the final Action. If it was registered, remove it from the decrypt group now (see the rule in `scripts/lit-register-decrypt-action.js`).
 
 ### Still to ask the owner
 

@@ -8,7 +8,9 @@ const { registerOnChain, preflight } = require('../services/registration.service
 const { verifyUploadRequest } = require('../services/uploadAuth.service');
 const { checkWalletQuota, checkStorageBudget, quotaFor, BUDGET_MESSAGE } = require('../services/uploadQuota.service');
 const { isValidWalletAddress } = require('../middleware/auth.middleware');
+const { CHALLENGE_PERIOD_SECONDS } = require('../services/blockchain.service');
 const prisma = require('../config/db');
+const { ethers } = require('ethers');
 
 function budgetExhausted(res) {
   return res.status(503).json({
@@ -398,6 +400,14 @@ async function createUpload(req, res, next) {
 //       Dedup internals. Publishing sha256Hash in particular turns this route
 //       into an oracle for "does Alexandria already hold this exact file?",
 //       which is a probe worth denying.
+
+// When a pending book's 14-day challenge window closes. Null for every other
+// status: an approved book's review is over, and an unstaked one has none running.
+function reviewEndsAt(row) {
+  if (row.status !== 'pending' || !row.stakedAt) return null;
+  return new Date(new Date(row.stakedAt).getTime() + CHALLENGE_PERIOD_SECONDS * 1000).toISOString();
+}
+
 function toPublicUpload(row) {
   return {
     arweaveHash: row.arweaveHash,
@@ -413,6 +423,11 @@ function toPublicUpload(row) {
     isNearDuplicate: Boolean(row.isNearDuplicate),
     nearDuplicateOf: row.nearDuplicateOf ?? null,
     onChainTxHash: row.onChainTxHash ?? null,
+    // Atomic units as a string, plus whole ALEX, the same pair /api/rental/book returns.
+    pricePerDay: row.pricePerDay ?? null,
+    pricePerDayAlex: row.pricePerDay ? ethers.formatUnits(row.pricePerDay, 18) : null,
+    delisted: Boolean(row.delisted),
+    reviewEndsAt: reviewEndsAt(row),
   };
 }
 
@@ -433,6 +448,9 @@ const PUBLIC_UPLOAD_SELECT = {
   isNearDuplicate: true,
   nearDuplicateOf: true,
   onChainTxHash: true,
+  pricePerDay: true,
+  delisted: true,
+  stakedAt: true,
 };
 
 // GET /api/upload/:arweaveHash

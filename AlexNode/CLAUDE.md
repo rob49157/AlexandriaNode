@@ -509,9 +509,15 @@ GET /api/storage/:arweaveHash/data
 
 ### Search
 ```
-GET /api/search?q=<query>&category=<cat>&page=<n>
-  - Searches Postgres index
-  - Returns: Paginated list of approved uploads matching query
+GET /api/search?q=<query>&category=<cat>&status=<s>&inReview=<bool>&page=<n>&limit=<n>
+  - Searches Postgres index. Approved books only by default (the only rentable state)
+  - inReview=true adds STAKED pending books, still inside their 14-day challenge
+    window: listed, not rentable yet. Not combinable with status (400)
+  - Delisted books (Rent.delistBook, permanent) never appear
+  - Each result: public metadata + pricePerDay / pricePerDayAlex (null until the
+    archivist sets one) + reviewEndsAt (stakedAt + CHALLENGE_PERIOD, pending only)
+  - stakedAt, pricePerDay and delisted are written by the event listener from
+    Staked, BookPriceSet and BookDelisted (applyCatalogue, beside applyStatus)
 ```
 
 ### Rental (live on-chain reads — `controller/rental.controller.js`)
@@ -528,7 +534,13 @@ GET /api/rental/book/:arweaveHash
 
 GET /api/rental/decrypt-params/:arweaveHash/:address
   - Rental-gated. Returns: { litEncryptedKeyId, litDataToEncryptHash,
-    encryptionIv, encryptionAuthTag, grantedVia: "rental"|"uploader" }
+    encryptionIv, encryptionAuthTag, grantedVia: "rental"|"uploader"|"librarian_review",
+    expiry, rentalTxHash }
+  - rentalTxHash: the BookRented transaction of the current rental, for the
+    Reader's watermark. Looked up in the indexed events, matched on the expiry
+    Rent.sol holds now (rentBook() allows one active rental per book and renter),
+    so it is never an earlier rental's. null for the other doors, until the
+    listener has indexed the rental, or if the lookup fails: never blocks reading.
   - ⚠️ NOT the security boundary. `address` is unauthenticated, so anyone can name
     a wallet holding a valid rental. Acceptable only because everything served is
     inert: the key is sealed in a Lit PKP envelope released solely by the Lit
